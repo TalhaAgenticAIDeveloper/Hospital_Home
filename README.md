@@ -1,6 +1,6 @@
-# Healthcare SaaS Authentication Backend
+# Healthcare SaaS Authentication & Onboarding Backend
 
-Production-grade FastAPI authentication system for a healthcare SaaS platform with role-based access control, JWT authentication with refresh token rotation, and clean architectural separation.
+Production-grade FastAPI authentication and doctor verification backend for a healthcare SaaS platform with role-based access control, JWT authentication with refresh token rotation, doctor onboarding/document verification, and SaaS Admin approval workflows.
 
 ## Tech Stack
 
@@ -15,6 +15,7 @@ Production-grade FastAPI authentication system for a healthcare SaaS platform wi
 | Argon2id | Password hashing |
 | JWT (python-jose) | Token authentication |
 | asyncpg | Async PostgreSQL driver |
+| python-multipart | File upload processing |
 | Docker | Containerization |
 
 ## Project Structure
@@ -25,30 +26,38 @@ app/
 ├── core/
 │   ├── config.py               # Pydantic Settings (env-driven)
 │   ├── database.py             # Async SQLAlchemy engine & session
+│   ├── file_upload.py          # Secure file storage and validation
 │   ├── security.py             # Argon2id hashing & JWT utilities
 │   ├── exceptions.py           # Custom HTTP exceptions
 │   └── logging.py              # Structured logging with sensitive filter
 ├── models/
-│   ├── enums.py                # UserRole, UserStatus enums
+│   ├── enums.py                # UserRole, UserStatus, DocumentType enums
 │   ├── base.py                 # TimestampMixin
 │   ├── user.py                 # User model (auth-only)
 │   ├── refresh_token.py        # Refresh token tracking
-│   └── doctor_profile.py       # Skeleton for future doctor data
+│   ├── doctor_profile.py       # Doctor professional data & review feedback
+│   └── doctor_document.py      # Uploaded document metadata
 ├── schemas/
-│   ├── auth.py                 # Request/response schemas with validation
-│   └── user.py                 # User response schemas
+│   ├── auth.py                 # Auth request/response schemas
+│   ├── user.py                 # User & /me profile schemas
+│   ├── doctor.py               # Doctor profile, documents, and status schemas
+│   └── admin.py                # Admin review & pending queues schemas
 ├── repositories/
 │   ├── user_repository.py      # User data access
-│   └── token_repository.py     # Refresh token data access
+│   ├── token_repository.py     # Refresh token data access
+│   └── doctor_repository.py    # Doctor profile & documents data access
 ├── services/
 │   ├── auth_service.py         # Auth business logic
-│   └── admin_service.py        # Admin auth business logic
+│   ├── admin_service.py        # Admin auth & doctor review logic
+│   └── doctor_service.py       # Doctor profile & document upload logic
 ├── api/
-│   ├── deps.py                 # Auth dependencies & RBAC
+│   ├── deps.py                 # Auth dependencies, doctor access & RBAC
 │   └── v1/
 │       ├── router.py           # V1 router aggregator
-│       ├── auth.py             # Public auth endpoints
-│       ├── admin_auth.py       # Admin auth endpoints
+│       ├── auth.py             # Public auth endpoints & /me
+│       ├── admin_auth.py       # Admin login endpoint
+│       ├── doctor.py           # Doctor onboarding & documents
+│       ├── admin_doctors.py    # SaaS Admin review & feedback
 │       └── health.py           # Health check endpoints
 └── scripts/
     └── create_admin.py         # CLI admin creation script
@@ -57,7 +66,8 @@ migrations/
 ├── env.py                      # Async Alembic environment
 ├── script.py.mako              # Migration template
 └── versions/
-    └── 0001_initial_auth.py    # Initial schema migration
+    ├── 0001_initial_authentication_schema.py
+    └── 0002_doctor_onboarding_fields.py
 
 tests/
 ├── conftest.py                 # Fixtures & test helpers
@@ -65,7 +75,9 @@ tests/
 ├── test_login.py               # Login endpoint tests
 ├── test_admin.py               # Admin auth tests
 ├── test_jwt.py                 # JWT handling tests
-└── test_logout.py              # Logout & token revocation tests
+├── test_logout.py              # Logout & token revocation tests
+├── test_doctor_profile.py      # Doctor profile & document upload tests
+└── test_doctor_review.py       # Admin review & feedback tests
 ```
 
 ## Quick Start
@@ -93,231 +105,127 @@ pip install -r requirements.txt
 ### 3. Environment Setup
 
 ```bash
-# Copy the example and edit with your values
 cp .env.example .env
 ```
 
-**Important**: Change `JWT_SECRET_KEY` to a cryptographically random string:
+**Important**: Set `JWT_SECRET_KEY` in `.env`:
 
 ```bash
 python -c "import secrets; print(secrets.token_urlsafe(64))"
 ```
 
-### 4. Start PostgreSQL
-
-**Option A: Docker Compose** (recommended)
+### 4. Database Setup & Migration
 
 ```bash
-docker-compose up db -d
-```
-
-**Option B: Local PostgreSQL**
-
-Create the database:
-
-```sql
-CREATE DATABASE healthcare_saas;
-```
-
-### 5. Run Database Migrations
-
-```bash
+# Apply migrations
 alembic upgrade head
 ```
 
-### 6. Create SaaS Admin
+### 5. Create Initial SaaS Admin
 
 ```bash
 python -m app.scripts.create_admin
 ```
 
-The script will prompt for email and password (hidden input).
-
-### 7. Start the Server
+### 6. Start the Server
 
 ```bash
-# Development
 uvicorn app.main:app --reload
-
-# Production
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
-### 8. Open API Documentation
+Documentation: **http://localhost:8000/docs** (Swagger UI)
 
-Visit: http://localhost:8000/docs (Swagger UI)
+---
 
-## Docker Deployment
+## Complete API Endpoints
 
-```bash
-# Start everything (PostgreSQL + FastAPI)
-docker-compose up --build
+### 🩺 Public Authentication
 
-# Run migrations
-docker-compose exec app alembic upgrade head
+| Method | Path | Description | Access |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/signup` | Register patient or doctor | Public |
+| `POST` | `/api/v1/auth/login` | Login (patient or doctor) | Public |
+| `POST` | `/api/v1/auth/refresh` | Refresh access token | Public |
+| `POST` | `/api/v1/auth/logout` | Revoke refresh token | Public |
+| `GET` | `/api/v1/auth/me` | Current user profile & doctor feedback | Authenticated |
 
-# Create admin
-docker-compose exec -it app python -m app.scripts.create_admin
+### 👨‍⚕️ Doctor Onboarding & Documents
+
+| Method | Path | Description | Access |
+|---|---|---|---|
+| `GET` | `/api/v1/doctors/profile` | Get doctor profile & documents | Doctor |
+| `PUT` | `/api/v1/doctors/profile` | Update professional details | Doctor |
+| `POST` | `/api/v1/doctors/documents` | Upload verification document (PDF/PNG/JPG) | Doctor |
+| `GET` | `/api/v1/doctors/documents` | List uploaded documents | Doctor |
+| `DELETE` | `/api/v1/doctors/documents/{id}` | Delete uploaded document | Doctor |
+| `POST` | `/api/v1/doctors/submit-application` | Submit application for admin review | Doctor |
+| `GET` | `/api/v1/doctors/status` | Check review status and feedback | Doctor |
+
+### 🛡️ SaaS Admin Authentication & Doctor Review
+
+| Method | Path | Description | Access |
+|---|---|---|---|
+| `POST` | `/api/v1/admin/auth/login` | SaaS Admin login | Public |
+| `GET` | `/api/v1/admin/doctors/pending` | List pending doctor applications | SaaS Admin |
+| `GET` | `/api/v1/admin/doctors/{id}` | View doctor details & documents | SaaS Admin |
+| `POST` | `/api/v1/admin/doctors/{id}/review` | Approve or Reject with Feedback | SaaS Admin |
+
+### 💓 Health
+
+| Method | Path | Description | Access |
+|---|---|---|---|
+| `GET` | `/health` | Liveness check | Public |
+| `GET` | `/health/ready` | Database readiness check | Public |
+
+---
+
+## Doctor Onboarding & Approval Workflow
+
+```text
+Doctor Signup
+      ↓
+Doctor updates profile (Name, Specialization, License, Experience, Qualification, Bio)
+      ↓
+Doctor uploads verification documents (Medical License, Degrees, ID Proof)
+      ↓
+Doctor submits application  (POST /api/v1/doctors/submit-application)
+      ↓
+SaaS Admin views pending queue  (GET /api/v1/admin/doctors/pending)
+      ↓
+SaaS Admin reviews details & files  (GET /api/v1/admin/doctors/{id})
+      ↓
+      ┌─────────────────────────────────┐
+      │                                 │
+   APPROVE                           REJECT (with mandatory feedback)
+      │                                 │
+      ↓                                 ↓
+ Status becomes 'active'          Status becomes 'rejected'
+ Doctor has full dashboard access   Admin feedback visible on doctor profile
+                                        │
+                                        ↓
+                                  Doctor inspects feedback,
+                                  fixes details/documents,
+                                  and re-submits application!
 ```
 
-## API Endpoints
-
-### Health
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Liveness check |
-| `GET` | `/health/ready` | Readiness check (DB connectivity) |
-
-### Public Authentication
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/auth/signup` | Register patient or doctor |
-| `POST` | `/api/v1/auth/login` | Login (patient or doctor) |
-| `POST` | `/api/v1/auth/refresh` | Refresh access token |
-| `POST` | `/api/v1/auth/logout` | Revoke refresh token |
-
-### Admin Authentication
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/v1/admin/auth/login` | SaaS Admin login |
-
-## How It Works
-
-### Signup Flow
-
-**Patient**: `POST /api/v1/auth/signup` → email validated → password validated & hashed (Argon2id) → user created with `status=active` → success response.
-
-**Doctor**: Same flow but `status=pending`. Doctor cannot login until an admin approves (changes status to `active`). An empty `doctor_profile` row is created for future professional data.
-
-**SaaS Admin**: Cannot signup via API. Created only via CLI: `python -m app.scripts.create_admin`.
-
-### Login Flow
-
-1. Client sends email + password to `POST /api/v1/auth/login`
-2. Server looks up user by email (case-insensitive)
-3. Server verifies password against Argon2id hash
-4. Server checks `status == active` and `is_active == True`
-5. Server generates access token (short-lived) + refresh token (longer-lived)
-6. Refresh token SHA-256 hash stored in `refresh_tokens` table
-7. Returns both tokens + user info (never password/hash)
-
-### JWT Architecture
-
-- **Access Token**: Short-lived (default 15 min). Contains `sub`, `role`, `type=access`, `iat`, `exp`, `jti`.
-- **Refresh Token**: Longer-lived (default 7 days). Contains `sub`, `role`, `type=refresh`, `iat`, `exp`, `jti`.
-- Tokens are signed with HS256 using `JWT_SECRET_KEY`.
-- Only SHA-256 hashes of refresh tokens are stored — never raw tokens.
-
-### Token Refresh & Rotation
-
-1. Client sends refresh token to `POST /api/v1/auth/refresh`
-2. Server validates JWT signature and expiry
-3. Server looks up token hash in DB
-4. If token is revoked → **all user tokens revoked** (theft detection)
-5. Old token revoked, new pair issued
-6. New refresh token hash stored
-
-### Doctor Status Architecture
-
-```
-Signup → status=pending → Admin reviews → status=active (can login)
-                                        → status=rejected (cannot login)
-                              Anytime   → status=suspended (cannot login)
-```
-
-Login checks: `pending → 403` | `rejected → 403` | `suspended → 403` | `active → 200`
-
-### Role-Based Access Control (RBAC)
-
-```python
-# Protect an endpoint by role
-from app.api.deps import require_role
-from app.models.enums import UserRole
-
-@router.get("/doctor-dashboard")
-async def doctor_dashboard(user = Depends(require_role(UserRole.DOCTOR))):
-    ...
-
-@router.get("/admin-panel")
-async def admin_panel(user = Depends(require_role(UserRole.SAAS_ADMIN))):
-    ...
-```
+---
 
 ## Testing
 
-### Setup Test Database
-
 ```bash
-# Create test database
-psql -U postgres -c "CREATE DATABASE healthcare_saas_test;"
-```
-
-Set `TEST_DATABASE_URL` in your `.env`:
-
-```env
-TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/healthcare_saas_test
-```
-
-### Run Tests
-
-```bash
-# All tests
+# Run all tests
 pytest -v
 
-# Specific module
-pytest tests/test_signup.py -v
-
-# With coverage
-pytest --cov=app --cov-report=term-missing
-```
-
-## Database Migrations
-
-```bash
-# Create a new migration
-alembic revision --autogenerate -m "description of changes"
-
-# Apply all migrations
-alembic upgrade head
-
-# Rollback one step
-alembic downgrade -1
-
-# View current revision
-alembic current
+# Run specific suite
+pytest tests/test_doctor_profile.py -v
+pytest tests/test_doctor_review.py -v
 ```
 
 ## Security Features
 
-- **Argon2id** password hashing (memory-hard, timing-attack resistant)
-- **JWT** with short-lived access tokens + refresh token rotation
-- **SHA-256 hashed** refresh tokens in database (defense-in-depth)
-- **Theft detection**: reuse of revoked refresh token triggers full session revocation
-- **Timing-safe** login: dummy hash on wrong email prevents user enumeration
-- **Generic error messages**: same error for wrong email and wrong password
-- **Database constraints**: unique email enforced at PostgreSQL level
-- **SQL injection protection**: SQLAlchemy parameterized queries only
-- **CORS**: environment-driven, no wildcard in production
-- **No hard-coded secrets**: all sensitive config via environment variables
-- **Sensitive field filtering** in logs: passwords, tokens, credentials never logged
-- **Non-root Docker** user in production container
-
-## Future Extensibility
-
-The architecture is designed to support:
-
-- Doctor approval/rejection workflow (change `user.status`)
-- Doctor document uploads (extend `doctor_profiles`)
-- Patient profiles (new `patient_profiles` table)
-- Appointments, medical reports, chat
-- Email verification, password reset, 2FA
-- Redis rate limiting (add middleware)
-- Audit logs (new model/service)
-- Frontend dashboards (consume these APIs)
-
-## License
-
-Proprietary — All rights reserved.
+- **Argon2id** password hashing
+- **JWT token rotation** and SHA-256 hashed database storage
+- **Rejection feedback requirement**: Admin cannot reject without giving concrete feedback
+- **Re-submission lifecycle**: Clears feedback and resets application timestamp on re-submit
+- **Strict file validation**: Content-type check, maximum 10MB file limit, UUID storage naming
+- **Role-Based Access Control (RBAC)** enforced at endpoint level

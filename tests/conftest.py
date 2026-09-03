@@ -4,7 +4,7 @@ Test fixtures for the authentication backend.
 Uses a real PostgreSQL test database for maximum fidelity.
 Set TEST_DATABASE_URL in your environment or .env file.
 
-Each test function gets a fresh database state via transaction rollback.
+Each test function gets a fresh database state.
 """
 
 import asyncio
@@ -13,6 +13,7 @@ from typing import AsyncGenerator
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -21,7 +22,10 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.config import get_settings
 from app.core.database import Base, get_db
+from app.core.security import hash_password
 from app.main import app
+from app.models.enums import UserRole, UserStatus
+from app.models.user import User
 
 settings = get_settings()
 
@@ -56,8 +60,6 @@ def event_loop():
 async def setup_database():
     """
     Create all tables before tests, drop them after.
-
-    This runs once per test session.
     """
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -72,20 +74,14 @@ async def clean_tables():
     """
     Clean all table data between tests for isolation.
 
-    Uses DELETE instead of DROP/CREATE for speed.
+    Uses DELETE in reverse FK order.
     """
     yield
     async with test_session_maker() as session:
-        # Delete in reverse FK order
-        await session.execute(
-            __import__("sqlalchemy").text("DELETE FROM doctor_profiles")
-        )
-        await session.execute(
-            __import__("sqlalchemy").text("DELETE FROM refresh_tokens")
-        )
-        await session.execute(
-            __import__("sqlalchemy").text("DELETE FROM users")
-        )
+        await session.execute(text("DELETE FROM doctor_documents"))
+        await session.execute(text("DELETE FROM doctor_profiles"))
+        await session.execute(text("DELETE FROM refresh_tokens"))
+        await session.execute(text("DELETE FROM users"))
         await session.commit()
 
 
@@ -160,3 +156,37 @@ async def create_and_login_patient(
     """Helper to create and login a patient, returning tokens."""
     await create_test_user(client, email=email, password=password, role="patient")
     return await login_test_user(client, email=email, password=password)
+
+
+async def create_and_login_doctor(
+    client: AsyncClient,
+    email: str = "doctor@example.com",
+    password: str = "TestPassword123!",
+) -> dict:
+    """Helper to create and login a doctor, returning tokens."""
+    await create_test_user(client, email=email, password=password, role="doctor")
+    return await login_test_user(client, email=email, password=password)
+
+
+async def create_and_login_admin(
+    client: AsyncClient,
+    email: str = "admin@example.com",
+    password: str = "AdminPassword123!",
+) -> dict:
+    """Helper to insert and login a SaaS Admin, returning tokens."""
+    async with test_session_maker() as session:
+        admin = User(
+            email=email.lower().strip(),
+            password_hash=hash_password(password),
+            role=UserRole.SAAS_ADMIN,
+            status=UserStatus.ACTIVE,
+            is_active=True,
+        )
+        session.add(admin)
+        await session.commit()
+
+    resp = await client.post(
+        "/api/v1/admin/auth/login",
+        json={"email": email, "password": password},
+    )
+    return resp.json()

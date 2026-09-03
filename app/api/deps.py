@@ -5,18 +5,23 @@ Reusable dependencies for:
 - Database sessions
 - Current authenticated user extraction from JWT
 - Role-based access control (RBAC)
+- Doctor onboarding access control
 """
 
 import uuid
 from typing import List
 
-from fastapi import Depends, Header
+from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.exceptions import AuthenticationError, AuthorizationError, AccountInactiveError
+from app.core.exceptions import (
+    AccountInactiveError,
+    AuthenticationError,
+    AuthorizationError,
+)
 from app.core.security import decode_token
 from app.models.enums import UserRole, UserStatus
 from app.models.user import User
@@ -30,28 +35,24 @@ security_scheme = HTTPBearer(
 )
 
 
-# ── Get Current User ─────────────────────────────────────────────────────────
+# ── Base User Dependency ─────────────────────────────────────────────────────
 
-async def get_current_user(
+async def get_current_user_any_status(
     credentials: HTTPAuthorizationCredentials | None = Depends(security_scheme),
     session: AsyncSession = Depends(get_db),
 ) -> User:
     """
-    Extract and validate the current user from the Bearer token.
+    Extract and validate user from JWT token regardless of approval status.
 
     Checks:
     1. Token exists and is valid
     2. Token type is "access" (not refresh)
     3. User exists in database
-    4. Account is active
-    5. Account status is active
+    4. Account is active (is_active == True)
+    5. Account is not SUSPENDED
 
     Returns:
         The authenticated User model instance.
-
-    Raises:
-        AuthenticationError: If token is missing, invalid, or expired.
-        AccountInactiveError: If account is not active.
     """
     if credentials is None:
         raise AuthenticationError(detail="Authentication required")
@@ -82,13 +83,63 @@ async def get_current_user(
     if not user:
         raise AuthenticationError(detail="User not found")
 
-    # Check account is active
-    if not user.is_active:
-        raise AccountInactiveError(detail="Account is not active")
+    # Suspended or disabled accounts are immediately blocked
+    if not user.is_active or user.status == UserStatus.SUSPENDED:
+        raise AccountInactiveError(detail="Account is suspended or deactivated")
 
+    return user
+
+
+# ── Active User Dependency ───────────────────────────────────────────────────
+
+async def get_current_user(
+    user: User = Depends(get_current_user_any_status),
+) -> User:
+    """
+    Extract current user and ensure status is ACTIVE.
+
+    Used for general platform and dashboard endpoints.
+    """
     if user.status != UserStatus.ACTIVE:
-        raise AccountInactiveError(detail="Account is not active")
+        if user.status == UserStatus.PENDING:
+            raise AccountInactiveError(
+                detail="Account is pending approval. Please complete your profile and verification."
+            )
+        elif user.status == UserStatus.REJECTED:
+            raise AccountInactiveError(
+                detail="Account application was rejected. Please review feedback in your profile."
+            )
+        else:
+            raise AccountInactiveError(detail="Account is not active")
 
+    return user
+
+
+# ── Doctor Specific Dependencies ─────────────────────────────────────────────
+
+async def get_current_doctor(
+    user: User = Depends(get_current_user_any_status),
+) -> User:
+    """
+    Dependency for doctor onboarding endpoints (profile, document upload, status).
+
+    Allows PENDING, REJECTED, and ACTIVE doctors to access onboarding features.
+    """
+    if user.role != UserRole.DOCTOR:
+        raise AuthorizationError(detail="Only doctors can access this resource")
+    return user
+
+
+async def get_current_active_doctor(
+    user: User = Depends(get_current_user),
+) -> User:
+    """
+    Dependency for doctor clinical / dashboard endpoints.
+
+    Requires role=DOCTOR and status=ACTIVE.
+    """
+    if user.role != UserRole.DOCTOR:
+        raise AuthorizationError(detail="Only active doctors can access this resource")
     return user
 
 

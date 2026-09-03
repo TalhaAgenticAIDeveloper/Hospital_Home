@@ -11,6 +11,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr
 
+from app.schemas.doctor import DoctorProfileResponse
+
 
 class UserResponse(BaseModel):
     """Safe user representation for API responses."""
@@ -32,3 +34,19 @@ class UserBriefResponse(BaseModel):
     id: UUID
     email: EmailStr
     role: str
+    status: Optional[str] = None
+
+
+class MeResponse(BaseModel):
+    """Current authenticated user profile details."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    email: EmailStr
+    role: str
+    status: str
+    is_active: bool
+    created_at: datetime
+    last_login_at: Optional[datetime] = None
+    doctor_profile: Optional[DoctorProfileResponse] = None
