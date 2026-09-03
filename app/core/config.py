@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     PASSWORD_MIN_LENGTH: int = 8
     PASSWORD_MAX_LENGTH: int = 128
 
+    # ── File Uploads ──────────────────────────────────────────────────────
+    UPLOAD_DIR: str = "uploads/doctor_documents"
+    MAX_UPLOAD_SIZE_MB: int = 10
+    ALLOWED_UPLOAD_TYPES: str = "application/pdf,image/jpeg,image/png"
+
     # ── Test Database ────────────────────────────────────────────────────
     TEST_DATABASE_URL: str = ""
 
@@ -68,6 +73,20 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.APP_ENV.lower() == "production"
+
+    @property
+    def allowed_upload_types_list(self) -> List[str]:
+        """Parse comma-separated allowed MIME types."""
+        return [
+            t.strip()
+            for t in self.ALLOWED_UPLOAD_TYPES.split(",")
+            if t.strip()
+        ]
+
+    @property
+    def max_upload_size_bytes(self) -> int:
+        """Convert MB to bytes."""
+        return self.MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
 
 @lru_cache()

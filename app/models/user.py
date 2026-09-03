@@ -54,11 +54,11 @@ class User(TimestampMixin, Base):
 
     # ── Role & Status ────────────────────────────────────────────────────
     role: Mapped[UserRole] = mapped_column(
-        Enum(UserRole, name="user_role", create_constraint=True),
+        Enum(UserRole, name="user_role", values_callable=lambda x: [e.value for e in x], create_constraint=True),
         nullable=False,
     )
     status: Mapped[UserStatus] = mapped_column(
-        Enum(UserStatus, name="user_status", create_constraint=True),
+        Enum(UserStatus, name="user_status", values_callable=lambda x: [e.value for e in x], create_constraint=True),
         default=UserStatus.PENDING,
         server_default=UserStatus.PENDING.value,
         nullable=False,
@@ -90,6 +90,7 @@ class User(TimestampMixin, Base):
         uselist=False,
         cascade="all, delete-orphan",
         lazy="selectin",
+        foreign_keys="[DoctorProfile.user_id]",
     )
 
     # ── Table Constraints ────────────────────────────────────────────────

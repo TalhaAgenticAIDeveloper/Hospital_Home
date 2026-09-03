@@ -57,7 +57,7 @@ class AuthService:
         Register a new patient or doctor account.
 
         Patient → status = active (immediate access)
-        Doctor  → status = pending (requires admin approval)
+        Doctor  → status = pending (requires onboarding & admin approval)
 
         Raises:
             AuthorizationError: If role is saas_admin.
@@ -92,7 +92,7 @@ class AuthService:
         try:
             await UserRepository.create(session, user)
 
-            # Create empty doctor profile for future use
+            # Create initial doctor profile record
             if data.role == UserRole.DOCTOR.value:
                 doctor_profile = DoctorProfile(user_id=user.id)
                 session.add(doctor_profile)
@@ -108,7 +108,7 @@ class AuthService:
         status_message = (
             "Patient account created successfully"
             if data.role == UserRole.PATIENT.value
-            else "Doctor account created successfully. Your account is pending approval."
+            else "Doctor account created successfully. Please log in to complete your profile and upload verification documents."
         )
 
         return SignupResponse(
@@ -117,6 +117,7 @@ class AuthService:
                 id=user.id,
                 email=user.email,
                 role=user.role.value,
+                status=user.status.value,
             ),
         )
 
@@ -131,7 +132,7 @@ class AuthService:
 
         Raises:
             AuthenticationError: Invalid credentials.
-            AccountInactiveError: Account is not active.
+            AccountInactiveError: Account is not active / suspended.
         """
         normalized_email = data.email.lower().strip()
 
@@ -144,7 +145,6 @@ class AuthService:
 
         # Reject admin accounts from public login
         if user.role == UserRole.SAAS_ADMIN:
-            # Same generic message — don't reveal that this is an admin account
             hash_password("dummy-password-for-timing")
             raise AuthenticationError()
 
@@ -182,7 +182,7 @@ class AuthService:
             await session.rollback()
             raise
 
-        logger.info(f"login_success: role={user.role.value}")
+        logger.info(f"login_success: role={user.role.value} status={user.status.value}")
 
         return LoginResponse(
             access_token=access_token,
@@ -192,6 +192,7 @@ class AuthService:
                 id=user.id,
                 email=user.email,
                 role=user.role.value,
+                status=user.status.value,
             ),
         )
 
@@ -280,7 +281,6 @@ class AuthService:
         try:
             payload = decode_token(data.refresh_token)
         except JWTError:
-            # Silently succeed — client may be logging out an already-expired token
             return
 
         if payload.get("type") != "refresh":
@@ -299,19 +299,14 @@ class AuthService:
     @staticmethod
     def _check_account_status(user: User) -> None:
         """
-        Verify the user's account status allows login.
+        Verify the user's account status allows authentication.
 
-        Raises:
-            AccountInactiveError: If account cannot login.
+        - Inactive / Suspended users are denied.
+        - Patients must be ACTIVE.
+        - Doctors with PENDING/REJECTED status can log in to access onboarding/review info.
         """
-        if not user.is_active:
-            raise AccountInactiveError(detail="Account is not active")
+        if not user.is_active or user.status == UserStatus.SUSPENDED:
+            raise AccountInactiveError(detail="Account is suspended or inactive")
 
-        if user.status == UserStatus.PENDING:
-            raise AccountInactiveError(detail="Account is pending approval")
-        elif user.status == UserStatus.REJECTED:
-            raise AccountInactiveError(detail="Account is not active")
-        elif user.status == UserStatus.SUSPENDED:
-            raise AccountInactiveError(detail="Account is not active")
-        elif user.status != UserStatus.ACTIVE:
+        if user.role == UserRole.PATIENT and user.status != UserStatus.ACTIVE:
             raise AccountInactiveError(detail="Account is not active")

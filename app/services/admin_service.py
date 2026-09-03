@@ -1,36 +1,47 @@
 """
-Admin service — business logic for SaaS Admin authentication.
-
-Admin accounts cannot be created via public signup. They are created
-via the CLI script (app.scripts.create_admin).
+Admin service — business logic for SaaS Admin authentication and doctor application review.
 """
 
+import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import AuthenticationError
+from app.core.exceptions import AuthenticationError, NotFoundError, ValidationError
 from app.core.logging import get_logger
 from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    hash_password,
     hash_token,
     verify_password,
-    hash_password,
 )
 from app.models.enums import UserRole, UserStatus
 from app.models.refresh_token import RefreshToken
+from app.models.user import User
+from app.repositories.doctor_repository import DoctorRepository
 from app.repositories.token_repository import TokenRepository
 from app.repositories.user_repository import UserRepository
+from app.schemas.admin import (
+    AllDoctorsListResponse,
+    DoctorReviewRequest,
+    DoctorReviewResponse,
+    DoctorStatusCounts,
+    PendingDoctorDetailResponse,
+    PendingDoctorListItem,
+    PendingDoctorListResponse,
+)
 from app.schemas.auth import AdminLoginRequest, LoginResponse
+from app.schemas.doctor import DoctorDocumentResponse
 from app.schemas.user import UserBriefResponse
 
 logger = get_logger(__name__)
 
 
 class AdminService:
-    """Handles SaaS Admin authentication workflows."""
+    """Handles SaaS Admin authentication and management workflows."""
 
     @staticmethod
     async def admin_login(
@@ -102,5 +113,177 @@ class AdminService:
                 id=user.id,
                 email=user.email,
                 role=user.role.value,
+                status=user.status.value,
             ),
+        )
+
+    # ── Doctor Application Review ────────────────────────────────────────
+
+    @staticmethod
+    async def list_pending_doctors(
+        session: AsyncSession, skip: int = 0, limit: int = 50
+    ) -> PendingDoctorListResponse:
+        """List all pending doctor applications awaiting SaaS Admin review."""
+        profiles, total = await DoctorRepository.get_pending_applications(
+            session, skip=skip, limit=limit
+        )
+
+        items = []
+        for profile in profiles:
+            items.append(
+                PendingDoctorListItem(
+                    doctor_id=profile.id,
+                    user_id=profile.user_id,
+                    email=profile.user.email if profile.user else "",
+                    full_name=profile.full_name,
+                    specialization=profile.specialization,
+                    license_number=profile.license_number,
+                    years_of_experience=profile.years_of_experience,
+                    submitted_at=profile.submitted_at,
+                    status=profile.user.status.value if profile.user else "pending",
+                    document_count=len(profile.documents),
+                )
+            )
+
+        return PendingDoctorListResponse(total=total, items=items)
+
+    @staticmethod
+    async def list_all_doctors(
+        session: AsyncSession,
+        status: Optional[str] = None,
+        search: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 50,
+    ) -> AllDoctorsListResponse:
+        """List all doctors with status breakdown counts and optional filters."""
+        profiles, filtered_total, counts = await DoctorRepository.list_all_doctors(
+            session, status_filter=status, search=search, skip=skip, limit=limit
+        )
+
+        items = []
+        for profile in profiles:
+            items.append(
+                PendingDoctorListItem(
+                    doctor_id=profile.id,
+                    user_id=profile.user_id,
+                    email=profile.user.email if profile.user else "",
+                    full_name=profile.full_name,
+                    specialization=profile.specialization,
+                    license_number=profile.license_number,
+                    years_of_experience=profile.years_of_experience,
+                    submitted_at=profile.submitted_at,
+                    status=profile.user.status.value if profile.user else "pending",
+                    document_count=len(profile.documents),
+                )
+            )
+
+        return AllDoctorsListResponse(
+            total=filtered_total,
+            counts=DoctorStatusCounts(**counts),
+            items=items,
+        )
+
+    @staticmethod
+    async def delete_doctor(
+        session: AsyncSession, doctor_user_id: uuid.UUID
+    ) -> dict:
+        """Delete doctor account, profile, documents, and disk files."""
+        deleted = await DoctorRepository.delete_doctor(session, doctor_user_id)
+        if not deleted:
+            raise NotFoundError(detail="Doctor not found")
+        logger.info(f"Doctor deleted successfully: doctor_user_id={doctor_user_id}")
+        return {"message": "Doctor account deleted successfully"}
+
+    @staticmethod
+    async def get_doctor_detail(
+        session: AsyncSession, doctor_user_id: uuid.UUID
+    ) -> PendingDoctorDetailResponse:
+        """Get complete doctor profile with uploaded documents for review."""
+        user = await UserRepository.get_by_id(session, doctor_user_id)
+        if not user or user.role != UserRole.DOCTOR:
+            raise NotFoundError(detail="Doctor not found")
+
+        profile = await DoctorRepository.get_profile_by_user_id(session, doctor_user_id)
+        if not profile:
+            raise NotFoundError(detail="Doctor profile not found")
+
+        return PendingDoctorDetailResponse(
+            doctor_id=profile.id,
+            user_id=user.id,
+            email=user.email,
+            status=user.status.value,
+            full_name=profile.full_name,
+            phone_number=profile.phone_number,
+            specialization=profile.specialization,
+            license_number=profile.license_number,
+            years_of_experience=profile.years_of_experience,
+            qualification=profile.qualification,
+            bio=profile.bio,
+            submitted_at=profile.submitted_at,
+            admin_feedback=profile.admin_feedback,
+            reviewed_at=profile.reviewed_at,
+            documents=[
+                DoctorDocumentResponse.model_validate(doc)
+                for doc in profile.documents
+            ],
+        )
+
+    @staticmethod
+    async def review_doctor(
+        session: AsyncSession,
+        doctor_user_id: uuid.UUID,
+        admin_user: User,
+        data: DoctorReviewRequest,
+    ) -> DoctorReviewResponse:
+        """
+        Approve or reject a doctor application.
+
+        - Approve: status becomes ACTIVE (doctor can log in to full platform).
+        - Reject: status becomes REJECTED and admin_feedback is recorded so the
+          doctor can see the reason and re-submit.
+        """
+        user = await UserRepository.get_by_id(session, doctor_user_id)
+        if not user or user.role != UserRole.DOCTOR:
+            raise NotFoundError(detail="Doctor account not found")
+
+        profile = await DoctorRepository.get_profile_by_user_id(session, doctor_user_id)
+        if not profile:
+            raise NotFoundError(detail="Doctor profile not found")
+
+        now = datetime.now(timezone.utc)
+        profile.reviewed_at = now
+        profile.reviewed_by = admin_user.id
+
+        if data.action == "approve":
+            user.status = UserStatus.ACTIVE
+            profile.admin_feedback = (
+                data.feedback.strip() if data.feedback else None
+            )
+            msg = "Doctor application approved successfully."
+            logger.info(
+                f"Doctor application APPROVED: doctor_user_id={user.id} by admin={admin_user.id}"
+            )
+        elif data.action == "reject":
+            if not data.feedback or not data.feedback.strip():
+                raise ValidationError(
+                    detail="Feedback reason is required when rejecting an application."
+                )
+            user.status = UserStatus.REJECTED
+            profile.admin_feedback = data.feedback.strip()
+            msg = "Doctor application rejected with feedback."
+            logger.info(
+                f"Doctor application REJECTED: doctor_user_id={user.id} by admin={admin_user.id}"
+            )
+        else:
+            raise ValidationError(detail=f"Invalid action '{data.action}'")
+
+        await session.commit()
+
+        return DoctorReviewResponse(
+            message=msg,
+            doctor_id=profile.id,
+            user_id=user.id,
+            new_status=user.status.value,
+            admin_feedback=profile.admin_feedback,
+            reviewed_at=now,
         )

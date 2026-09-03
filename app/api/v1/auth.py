@@ -1,13 +1,17 @@
 """
-Public authentication routes — signup, login, refresh, logout.
+Public authentication routes — signup, login, refresh, logout, me.
 
 Used by patients and doctors. SaaS Admin uses a separate endpoint.
 """
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_current_user_any_status
 from app.core.database import get_db
+from app.models.enums import UserRole
+from app.models.user import User
+from app.repositories.doctor_repository import DoctorRepository
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
@@ -18,6 +22,8 @@ from app.schemas.auth import (
     SignupResponse,
     TokenResponse,
 )
+from app.schemas.doctor import DoctorDocumentResponse, DoctorProfileResponse
+from app.schemas.user import MeResponse
 from app.services.auth_service import AuthService
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -30,7 +36,7 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
     summary="Register a new patient or doctor account",
     description=(
         "Creates a new user account. Patients are activated immediately. "
-        "Doctors are set to 'pending' status and require admin approval. "
+        "Doctors are set to 'pending' status and proceed to onboarding. "
         "The 'saas_admin' role cannot be registered through this endpoint."
     ),
     responses={
@@ -54,13 +60,12 @@ async def signup(
     description=(
         "Authenticates a user and returns JWT access and refresh tokens. "
         "The user's role is determined from the database — the client does "
-        "not specify the role. Accounts that are pending, rejected, or "
-        "suspended cannot log in."
+        "not specify the role."
     ),
     responses={
         200: {"description": "Login successful"},
         401: {"description": "Invalid email or password"},
-        403: {"description": "Account is not active"},
+        403: {"description": "Account is suspended or deactivated"},
     },
 )
 async def login(
@@ -94,9 +99,9 @@ async def refresh(
 @router.post(
     "/logout",
     response_model=MessageResponse,
-    summary="Logout — revoke refresh token",
+    summary="Logout — revoke refresh token and delete cookies",
     description=(
-        "Revokes the provided refresh token. The access token remains valid "
+        "Revokes the provided refresh token and clears session cookies. The access token remains valid "
         "until its short expiration. This supports clean session termination."
     ),
     responses={
@@ -105,7 +110,60 @@ async def refresh(
 )
 async def logout(
     data: LogoutRequest,
+    response: Response,
     session: AsyncSession = Depends(get_db),
 ) -> MessageResponse:
     await AuthService.logout(session, data)
+    # Clear cookies
+    response.delete_cookie(key="access_token", path="/")
+    response.delete_cookie(key="refresh_token", path="/")
+    response.delete_cookie(key="token", path="/")
+    response.delete_cookie(key="session", path="/")
     return MessageResponse(message="Logged out successfully")
+
+
+@router.get(
+    "/me",
+    response_model=MeResponse,
+    summary="Get current user profile and status",
+    description="Retrieve the authenticated user's account information, role, status, and doctor profile/feedback if applicable.",
+)
+async def get_me(
+    user: User = Depends(get_current_user_any_status),
+    session: AsyncSession = Depends(get_db),
+) -> MeResponse:
+    doctor_profile_resp = None
+    if user.role == UserRole.DOCTOR:
+        profile = await DoctorRepository.get_profile_by_user_id(session, user.id)
+        if profile:
+            doctor_profile_resp = DoctorProfileResponse(
+                id=profile.id,
+                user_id=user.id,
+                email=user.email,
+                status=user.status.value,
+                full_name=profile.full_name,
+                phone_number=profile.phone_number,
+                specialization=profile.specialization,
+                license_number=profile.license_number,
+                years_of_experience=profile.years_of_experience,
+                qualification=profile.qualification,
+                bio=profile.bio,
+                submitted_at=profile.submitted_at,
+                admin_feedback=profile.admin_feedback,
+                reviewed_at=profile.reviewed_at,
+                documents=[
+                    DoctorDocumentResponse.model_validate(doc)
+                    for doc in profile.documents
+                ],
+            )
+
+    return MeResponse(
+        id=user.id,
+        email=user.email,
+        role=user.role.value,
+        status=user.status.value,
+        is_active=user.is_active,
+        created_at=user.created_at,
+        last_login_at=user.last_login_at,
+        doctor_profile=doctor_profile_resp,
+    )
