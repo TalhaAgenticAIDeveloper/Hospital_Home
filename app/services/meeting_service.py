@@ -4,7 +4,7 @@ Business logic service for Doctor Availability, Booking, Meetings, and Transcrip
 
 import os
 import uuid
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Optional, Tuple
 
 from fastapi import HTTPException, status
@@ -19,16 +19,20 @@ from app.models.doctor_profile import DoctorProfile
 from app.models.enums import MeetingStatus, UserRole, UserStatus
 from app.models.meeting import Meeting
 from app.models.user import User
+from app.models.weekly_schedule import DoctorWeeklySchedule
 from app.repositories.meeting_repository import MeetingRepository
 from app.schemas.meeting import (
     AvailabilityBatchCreateRequest,
     AvailabilityResponse,
     AvailabilitySlotCreate,
     DoctorDirectoryItemResponse,
+    GenerateWeekSlotsRequest,
     MeetingBookRequest,
     MeetingEndAndSaveTranscriptRequest,
     MeetingResponse,
     MeetingTranscriptResponse,
+    WeeklyScheduleResponse,
+    WeeklyScheduleSaveRequest,
 )
 from app.services.signaling_manager import signaling_manager
 
@@ -71,7 +75,9 @@ class MeetingService:
 
         now = datetime.now(timezone.utc)
 
-        if window_start <= now:
+        # Allow slots starting within the current minute (truncate seconds for comparison)
+        now_truncated = now.replace(second=0, microsecond=0)
+        if window_start < now_truncated:
             raise ValidationError("Availability window must be in the future")
 
         delta = timedelta(minutes=request.slot_duration_minutes)
@@ -582,3 +588,183 @@ class MeetingService:
             has_transcript=bool(meeting.transcript_text or meeting.transcript_path),
             created_at=meeting.created_at,
         )
+
+    # ── Weekly Schedule Management ───────────────────────────────────────
+
+    @staticmethod
+    async def save_weekly_schedule(
+        session: AsyncSession,
+        doctor_user: User,
+        request: WeeklyScheduleSaveRequest,
+    ) -> List[WeeklyScheduleResponse]:
+        """Save or replace the doctor's entire weekly availability template."""
+        if doctor_user.role != UserRole.DOCTOR:
+            raise AuthorizationError("Only doctors can set weekly schedule")
+        if doctor_user.status != UserStatus.ACTIVE:
+            raise AuthorizationError("Only verified active doctors can set weekly schedule")
+
+        # Delete existing schedule for this doctor
+        await MeetingRepository.delete_all_weekly_schedules(session, doctor_user.id)
+
+        # Create new schedule entries (only active days)
+        schedules_to_create = []
+        seen_days = set()
+        for slot in request.schedule:
+            if slot.day_of_week in seen_days:
+                raise ValidationError(f"Duplicate day_of_week: {slot.day_of_week}")
+            seen_days.add(slot.day_of_week)
+
+            if not slot.is_active:
+                continue
+
+            h1, m1 = map(int, slot.start_time.split(":"))
+            h2, m2 = map(int, slot.end_time.split(":"))
+
+            schedules_to_create.append(
+                DoctorWeeklySchedule(
+                    id=uuid.uuid4(),
+                    doctor_id=doctor_user.id,
+                    day_of_week=slot.day_of_week,
+                    start_time=time(h1, m1),
+                    end_time=time(h2, m2),
+                    slot_duration_minutes=slot.slot_duration_minutes,
+                    is_active=True,
+                )
+            )
+
+        if schedules_to_create:
+            await MeetingRepository.create_weekly_schedules(session, schedules_to_create)
+
+        await session.commit()
+
+        # Return all (including inactive markers)
+        all_schedules = await MeetingRepository.get_weekly_schedule(session, doctor_user.id)
+        return [
+            WeeklyScheduleResponse(
+                id=s.id,
+                doctor_id=s.doctor_id,
+                day_of_week=s.day_of_week,
+                start_time=s.start_time.strftime("%H:%M"),
+                end_time=s.end_time.strftime("%H:%M"),
+                slot_duration_minutes=s.slot_duration_minutes,
+                is_active=s.is_active,
+            )
+            for s in all_schedules
+        ]
+
+    @staticmethod
+    async def get_weekly_schedule(
+        session: AsyncSession,
+        doctor_user: User,
+    ) -> List[WeeklyScheduleResponse]:
+        """Fetch doctor's current weekly schedule template."""
+        schedules = await MeetingRepository.get_weekly_schedule(session, doctor_user.id)
+        return [
+            WeeklyScheduleResponse(
+                id=s.id,
+                doctor_id=s.doctor_id,
+                day_of_week=s.day_of_week,
+                start_time=s.start_time.strftime("%H:%M"),
+                end_time=s.end_time.strftime("%H:%M"),
+                slot_duration_minutes=s.slot_duration_minutes,
+                is_active=s.is_active,
+            )
+            for s in schedules
+        ]
+
+    @staticmethod
+    async def generate_slots_from_schedule(
+        session: AsyncSession,
+        doctor_user: User,
+        request: GenerateWeekSlotsRequest,
+    ) -> List[AvailabilityResponse]:
+        """
+        Generate actual bookable DoctorAvailability slots from the saved weekly
+        schedule template for the specified number of weeks ahead.
+        """
+        if doctor_user.role != UserRole.DOCTOR:
+            raise AuthorizationError("Only doctors can generate availability slots")
+        if doctor_user.status != UserStatus.ACTIVE:
+            raise AuthorizationError("Only verified active doctors can generate slots")
+
+        schedules = await MeetingRepository.get_weekly_schedule(session, doctor_user.id)
+        active_schedules = [s for s in schedules if s.is_active]
+
+        if not active_schedules:
+            raise ValidationError("No active weekly schedule found. Please save your weekly schedule first.")
+
+        now = datetime.now(timezone.utc)
+        today = now.date()
+        total_days = request.weeks_ahead * 7
+        slots_created: List[DoctorAvailability] = []
+
+        # The schedule times are in doctor's local timezone.
+        # Convert to UTC by applying the timezone offset.
+        # JS getTimezoneOffset() returns negative for ahead-of-UTC (e.g. -300 for PKT/UTC+5)
+        # So: UTC_time = local_time + offset_minutes (where offset is negative for +UTC zones)
+        tz_offset = timedelta(minutes=request.timezone_offset_minutes)
+
+        for day_offset in range(total_days):
+            target_date = today + timedelta(days=day_offset)
+            # Python weekday: Monday=0, Sunday=6 (matches our model)
+            target_weekday = target_date.weekday()
+
+            for sched in active_schedules:
+                if sched.day_of_week != target_weekday:
+                    continue
+
+                # Build datetime in doctor's local time, then convert to UTC
+                local_start = datetime.combine(
+                    target_date, sched.start_time, tzinfo=timezone.utc
+                )
+                local_end = datetime.combine(
+                    target_date, sched.end_time, tzinfo=timezone.utc
+                )
+
+                # Apply timezone offset to convert local → UTC
+                window_start = local_start + tz_offset
+                window_end = local_end + tz_offset
+
+                delta = timedelta(minutes=sched.slot_duration_minutes)
+                current = window_start
+
+                while current + delta <= window_end:
+                    slot_end = current + delta
+
+                    # Skip slots that are already in the past
+                    if current < now:
+                        current = slot_end
+                        continue
+
+                    # Check for existing conflict
+                    has_conflict = await MeetingRepository.check_slot_conflict(
+                        session, doctor_user.id, current, slot_end
+                    )
+                    if not has_conflict:
+                        slots_created.append(
+                            DoctorAvailability(
+                                id=uuid.uuid4(),
+                                doctor_id=doctor_user.id,
+                                start_time=current,
+                                end_time=slot_end,
+                                is_booked=False,
+                            )
+                        )
+
+                    current = slot_end
+
+        if not slots_created:
+            raise ConflictError(
+                "No new slots could be generated. All slots either already exist, "
+                "conflict with existing ones, or are in the past."
+            )
+
+        created = await MeetingRepository.create_availability_slots(session, slots_created)
+        await session.commit()
+
+        logger.info(
+            f"Generated {len(created)} slots from weekly schedule for doctor {doctor_user.id} "
+            f"({request.weeks_ahead} week(s) ahead)"
+        )
+
+        return [AvailabilityResponse.model_validate(slot) for slot in created]

@@ -160,3 +160,52 @@ class SessionTranscriptResponse(BaseModel):
     transcript_path: str
     message: str
 
+
+# ── Weekly Schedule Schemas ──────────────────────────────────────────────────
+
+class WeeklyScheduleSlot(BaseModel):
+    """A single day's availability in the weekly template."""
+    day_of_week: int = Field(..., ge=0, le=6, description="0=Monday, 1=Tuesday, ..., 6=Sunday")
+    start_time: str = Field(..., description="Start time in HH:MM format (24h)")
+    end_time: str = Field(..., description="End time in HH:MM format (24h)")
+    slot_duration_minutes: int = Field(30, ge=15, le=120, description="Duration in minutes (15-120)")
+    is_active: bool = Field(True, description="Whether this day is enabled")
+
+    @model_validator(mode="after")
+    def validate_times(self) -> "WeeklyScheduleSlot":
+        from datetime import time as dt_time
+        try:
+            h1, m1 = map(int, self.start_time.split(":"))
+            h2, m2 = map(int, self.end_time.split(":"))
+            t1 = dt_time(h1, m1)
+            t2 = dt_time(h2, m2)
+        except (ValueError, IndexError):
+            raise ValueError("Times must be in HH:MM format")
+        if t1 >= t2:
+            raise ValueError("start_time must be before end_time")
+        return self
+
+
+class WeeklyScheduleSaveRequest(BaseModel):
+    """Save the full weekly schedule template (replaces existing)."""
+    schedule: List[WeeklyScheduleSlot] = Field(..., description="List of day schedules (active days only)")
+
+
+class WeeklyScheduleResponse(BaseModel):
+    """Response for a single day's schedule."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    doctor_id: uuid.UUID
+    day_of_week: int
+    start_time: str
+    end_time: str
+    slot_duration_minutes: int
+    is_active: bool
+
+
+class GenerateWeekSlotsRequest(BaseModel):
+    """Trigger bulk slot generation from saved weekly template."""
+    weeks_ahead: int = Field(1, ge=1, le=4, description="Number of weeks ahead to generate slots for (1-4)")
+    timezone_offset_minutes: int = Field(0, description="Client timezone offset in minutes (e.g. -300 for UTC+5)")
+

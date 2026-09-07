@@ -1,0 +1,32 @@
+================================================================================
+MEDTRUST HEALTHCARE — TELEMEDICINE CONSULTATION TRANSCRIPT
+================================================================================
+Meeting ID      : 89080e8c-9f20-414c-a3b1-fee3a094510b
+Room Code       : telemed_b68b77bdfbcb42b5
+Date & Time     : 2026-09-07 07:45:00 UTC
+Doctor          : Dr. Muhammad Talha Iftikhar (doctor1@gmail.com)
+Specialization  : Artificial Intelligence and Full Stack Web Development
+Patient         : patient1@gmail.com
+Languages       : English / Urdu (اردو)
+Recorded At     : 2026-09-07 07:47:19 UTC
+================================================================================
+
+[PATIENT CHIEF COMPLAINT / REASON FOR VISIT]:
+for stomach pain
+
+[DOCTOR CLINICAL NOTES & SUMMARY]:
+No clinical notes added
+
+================================================================================
+DIALOGUE TRANSCRIPT (ENGLISH & URDU):
+================================================================================
+[12:46:17] Muhammad Talha Iftikhar [en-US]: ہیلو
+[12:46:17] patient1 [ur-PK]: ہیلو
+[12:46:27] Muhammad Talha Iftikhar [en-US]: ہیلو
+[12:46:27] patient1 [ur-PK]: ہیلو
+[12:46:34] patient1 [ur-PK]: ار یو
+[12:46:56] patient1 [ur-PK]: ار یو گیٹ
+
+================================================================================
+END OF CONSULTATION TRANSCRIPT — CONFIDENTIAL MEDICAL RECORD
+================================================================================

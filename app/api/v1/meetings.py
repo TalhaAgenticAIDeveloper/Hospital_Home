@@ -34,12 +34,15 @@ from app.schemas.meeting import (
     AvailabilityResponse,
     AvailabilitySlotCreate,
     DoctorDirectoryItemResponse,
+    GenerateWeekSlotsRequest,
     MeetingBookRequest,
     MeetingEndAndSaveTranscriptRequest,
     MeetingResponse,
     MeetingTranscriptResponse,
     SessionTranscriptSaveRequest,
     SessionTranscriptResponse,
+    WeeklyScheduleResponse,
+    WeeklyScheduleSaveRequest,
 )
 from app.services.meeting_service import MeetingService
 from app.services.signaling_manager import signaling_manager
@@ -47,6 +50,48 @@ from app.services.signaling_manager import signaling_manager
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/meetings", tags=["Consultations & Telemedicine Meetings"])
+
+# ── Weekly Schedule Management Endpoints ─────────────────────────────────────
+
+@router.put(
+    "/weekly-schedule",
+    response_model=List[WeeklyScheduleResponse],
+    summary="Save or update weekly availability schedule",
+    description="Doctor sets their recurring weekly availability template. Replaces any existing schedule.",
+)
+async def save_weekly_schedule(
+    request: WeeklyScheduleSaveRequest,
+    doctor_user: User = Depends(get_current_active_doctor),
+    session: AsyncSession = Depends(get_db),
+) -> List[WeeklyScheduleResponse]:
+    return await MeetingService.save_weekly_schedule(session, doctor_user, request)
+
+
+@router.get(
+    "/weekly-schedule",
+    response_model=List[WeeklyScheduleResponse],
+    summary="Get doctor's weekly schedule template",
+)
+async def get_weekly_schedule(
+    doctor_user: User = Depends(get_current_active_doctor),
+    session: AsyncSession = Depends(get_db),
+) -> List[WeeklyScheduleResponse]:
+    return await MeetingService.get_weekly_schedule(session, doctor_user)
+
+
+@router.post(
+    "/weekly-schedule/generate",
+    response_model=List[AvailabilityResponse],
+    status_code=status.HTTP_201_CREATED,
+    summary="Generate bookable slots from weekly schedule",
+    description="Bulk-generate actual bookable availability slots from the saved weekly template for the specified number of weeks ahead.",
+)
+async def generate_slots_from_schedule(
+    request: GenerateWeekSlotsRequest,
+    doctor_user: User = Depends(get_current_active_doctor),
+    session: AsyncSession = Depends(get_db),
+) -> List[AvailabilityResponse]:
+    return await MeetingService.generate_slots_from_schedule(session, doctor_user, request)
 
 
 # ── Doctor Availability Management Endpoints ─────────────────────────────────

@@ -15,6 +15,7 @@ from app.models.doctor_profile import DoctorProfile
 from app.models.enums import MeetingStatus, UserRole, UserStatus
 from app.models.meeting import Meeting
 from app.models.user import User
+from app.models.weekly_schedule import DoctorWeeklySchedule
 
 
 class MeetingRepository:
@@ -253,3 +254,44 @@ class MeetingRepository:
         await session.flush()
         await session.refresh(meeting)
         return meeting
+
+    # ── Weekly Schedule Operations ───────────────────────────────────────
+
+    @staticmethod
+    async def get_weekly_schedule(
+        session: AsyncSession,
+        doctor_id: uuid.UUID,
+    ) -> List[DoctorWeeklySchedule]:
+        """Fetch all weekly schedule entries for a doctor."""
+        query = (
+            select(DoctorWeeklySchedule)
+            .where(DoctorWeeklySchedule.doctor_id == doctor_id)
+            .order_by(DoctorWeeklySchedule.day_of_week.asc())
+        )
+        result = await session.execute(query)
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def delete_all_weekly_schedules(
+        session: AsyncSession,
+        doctor_id: uuid.UUID,
+    ) -> None:
+        """Delete all weekly schedule entries for a doctor (before re-saving)."""
+        from sqlalchemy import delete
+        stmt = delete(DoctorWeeklySchedule).where(
+            DoctorWeeklySchedule.doctor_id == doctor_id
+        )
+        await session.execute(stmt)
+        await session.flush()
+
+    @staticmethod
+    async def create_weekly_schedules(
+        session: AsyncSession,
+        schedules: List[DoctorWeeklySchedule],
+    ) -> List[DoctorWeeklySchedule]:
+        """Bulk insert weekly schedule entries."""
+        session.add_all(schedules)
+        await session.flush()
+        for s in schedules:
+            await session.refresh(s)
+        return schedules
