@@ -1,9 +1,8 @@
 """
-WebRTC Signaling and In-Memory Transcript Aggregator for 1-to-1 Video Consultations.
+WebRTC Signaling Manager for 1-to-1 Video Consultations.
 """
 
 import json
-from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from fastapi import WebSocket
 
@@ -23,15 +22,13 @@ class MeetingConnection:
 
 class SignalingManager:
     """
-    Manages active WebRTC signaling connections and aggregates real-time
-    bilingual (English/Urdu) speech transcripts per meeting room.
+    Manages active WebRTC signaling connections per meeting room
+    (offer, answer, ice-candidates, peer-joined, peer-left, meeting-ended).
     """
 
     def __init__(self):
         # room_id -> List[MeetingConnection]
         self._rooms: Dict[str, List[MeetingConnection]] = {}
-        # room_id -> List[dict] transcript segments
-        self._transcripts: Dict[str, List[dict]] = {}
 
     async def connect(
         self,
@@ -49,11 +46,8 @@ class SignalingManager:
 
         if room_id not in self._rooms:
             self._rooms[room_id] = []
-            if room_id not in self._transcripts:
-                self._transcripts[room_id] = []
 
         # Check room capacity (max 2: 1 doctor, 1 patient)
-        existing_roles = [conn.role for conn in self._rooms[room_id]]
         if len(self._rooms[room_id]) >= 2:
             await websocket.send_text(json.dumps({
                 "type": "error",
@@ -88,7 +82,6 @@ class SignalingManager:
                 {"user_id": c.user_id, "role": c.role, "name": c.name}
                 for c in self._rooms[room_id]
             ],
-            "existing_transcripts": self._transcripts.get(room_id, []),
         }))
 
         return True
@@ -107,7 +100,6 @@ class SignalingManager:
                 logger.info(f"User {leaving_conn.user_id} ({leaving_conn.role}) left room {room_id}")
 
             if not self._rooms[room_id]:
-                # Keep transcript buffer for later persistence
                 del self._rooms[room_id]
 
     async def broadcast(self, room_id: str, message: dict, exclude: Optional[WebSocket] = None):
@@ -124,7 +116,7 @@ class SignalingManager:
                     logger.warning(f"Failed to send to participant {conn.user_id}: {e}")
 
     async def handle_message(self, room_id: str, sender_ws: WebSocket, raw_text: str):
-        """Process WebRTC signaling or live speech transcription message."""
+        """Process WebRTC signaling or meeting control message."""
         try:
             data = json.loads(raw_text)
         except Exception:
@@ -136,27 +128,6 @@ class SignalingManager:
         if msg_type in ("offer", "answer", "ice-candidate"):
             await self.broadcast(room_id, data, exclude=sender_ws)
 
-        # ── Real-Time Bilingual Speech Transcript Segment ────────────────────
-        elif msg_type == "transcript-segment":
-            segment = {
-                "speaker": data.get("speaker", "unknown"),
-                "speaker_name": data.get("speaker_name", "Anonymous"),
-                "text": data.get("text", "").strip(),
-                "timestamp": data.get("timestamp") or datetime.now(timezone.utc).strftime("%H:%M:%S"),
-                "language": data.get("language", "en-US"),
-            }
-
-            if segment["text"]:
-                if room_id not in self._transcripts:
-                    self._transcripts[room_id] = []
-                self._transcripts[room_id].append(segment)
-
-                # Broadcast live segment to both participants for live subtitles / notes
-                await self.broadcast(room_id, {
-                    "type": "transcript-segment",
-                    "segment": segment,
-                })
-
         # ── Meeting Ended Signal ─────────────────────────────────────────────
         elif msg_type == "meeting-ended":
             await self.broadcast(room_id, {
@@ -165,12 +136,12 @@ class SignalingManager:
             })
 
     def get_transcript_segments(self, room_id: str) -> List[dict]:
-        """Retrieve all accumulated transcript segments for room."""
-        return self._transcripts.get(room_id, [])
+        """Legacy stub — returns empty list."""
+        return []
 
     def clear_transcript_buffer(self, room_id: str):
-        """Clear memory buffer after persisting to disk/database."""
-        self._transcripts.pop(room_id, None)
+        """Legacy stub — no-op."""
+        pass
 
 
 # Global singleton instance

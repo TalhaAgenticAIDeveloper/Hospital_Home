@@ -5,7 +5,7 @@ Business logic service for Doctor Availability, Booking, Meetings, and Transcrip
 import os
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from fastapi import HTTPException, status
 from fastapi.responses import FileResponse
@@ -30,9 +30,12 @@ from app.schemas.meeting import (
     DoctorDirectoryItemResponse,
     GenerateWeekSlotsRequest,
     MeetingBookRequest,
+    MeetingEndRequest,
+    MeetingEndResponse,
     MeetingEndAndSaveTranscriptRequest,
     MeetingResponse,
     MeetingTranscriptResponse,
+    SessionTranscriptResponse,
     WeeklyScheduleResponse,
     WeeklyScheduleSaveRequest,
 )
@@ -42,15 +45,9 @@ from app.services.signaling_manager import signaling_manager
 logger = get_logger(__name__)
 settings = get_settings()
 
-TRANSCRIPT_DIR = os.path.join("uploads", "meeting_transcripts")
-
 
 class MeetingService:
-    """Service layer for doctor schedules, booking consultations, and transcript delivery."""
-
-    @staticmethod
-    def _ensure_transcript_dir():
-        os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+    """Service layer for doctor schedules, booking consultations, and meeting lifecycle."""
 
     # ── Doctor Availability Management ───────────────────────────────────
 
@@ -337,271 +334,101 @@ class MeetingService:
 
         return MeetingService._format_meeting_response(meeting)
 
-    # ── Meeting Completion & Transcript Saving (Bilingual English/Urdu) ──
+    # ── Meeting Completion ───────────────────────────────────────────────
+
+    @staticmethod
+    async def end_meeting(
+        session: AsyncSession,
+        user: User,
+        meeting_id: uuid.UUID,
+        doctor_notes: Optional[str] = None,
+    ) -> MeetingEndResponse:
+        """
+        End consultation session, save doctor clinical notes if provided,
+        and transition meeting status to COMPLETED.
+        """
+        meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
+        if not meeting:
+            raise NotFoundError("Meeting not found")
+
+        if user.id not in (meeting.doctor_id, meeting.patient_id) and user.role != UserRole.SAAS_ADMIN:
+            raise AuthorizationError("Only meeting participants can end the consultation")
+
+        updated = await MeetingRepository.update_meeting_status(
+            session=session,
+            meeting=meeting,
+            status=MeetingStatus.COMPLETED,
+            doctor_notes=doctor_notes,
+        )
+        await session.commit()
+
+        # Broadcast meeting-ended signal to connected peer via WebSocket
+        await signaling_manager.broadcast(
+            meeting.room_id,
+            {
+                "type": "meeting-ended",
+                "ended_by": user.role.value if hasattr(user.role, "value") else str(user.role),
+            },
+        )
+
+        return MeetingEndResponse(
+            meeting_id=updated.id,
+            room_id=updated.room_id,
+            doctor_notes=updated.doctor_notes,
+            status=updated.status,
+            completed_at=updated.updated_at,
+            message="Consultation completed successfully",
+        )
 
     @staticmethod
     async def finalize_meeting_and_save_transcript(
         session: AsyncSession,
         user: User,
         meeting_id: uuid.UUID,
-        request: MeetingEndAndSaveTranscriptRequest,
+        request: Any,
     ) -> MeetingTranscriptResponse:
         """
-        Compile bilingual (English/Urdu) speech transcript, save formatted UTF-8
-        file to disk for the doctor, and update meeting record.
+        Backwards-compatible wrapper that completes the meeting.
         """
-        meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
-        if not meeting:
-            raise NotFoundError("Meeting not found")
-
-        if user.id not in (meeting.doctor_id, meeting.patient_id) and user.role != UserRole.SAAS_ADMIN:
-            raise AuthorizationError("Only meeting participants can finalize the meeting")
-
-        # Aggregate transcript segments from request or in-memory WebSocket manager
-        segments = request.segments or []
-        if not segments:
-            in_memory_segments = signaling_manager.get_transcript_segments(meeting.room_id)
-            segments = [
-                {
-                    "speaker": s.get("speaker", "participant"),
-                    "speaker_name": s.get("speaker_name", "Participant"),
-                    "text": s.get("text", ""),
-                    "timestamp": s.get("timestamp", ""),
-                    "language": s.get("language", "en-US"),
-                }
-                for s in in_memory_segments
-            ]
-
-        doctor_profile = meeting.doctor.doctor_profile if meeting.doctor else None
-        doctor_name = doctor_profile.full_name if doctor_profile and doctor_profile.full_name else meeting.doctor.email
-        specialization = doctor_profile.specialization if doctor_profile and doctor_profile.specialization else "General Physician"
-        patient_name = meeting.patient.email
-
-        # Build clean formatted consultation transcript document
-        MeetingService._ensure_transcript_dir()
-        file_name = f"{meeting.id}_transcript.txt"
-        file_path = os.path.join(TRANSCRIPT_DIR, file_name)
-
-        now_utc = datetime.now(timezone.utc)
-        header_lines = [
-            "=" * 80,
-            "MEDTRUST HEALTHCARE — TELEMEDICINE CONSULTATION TRANSCRIPT",
-            "=" * 80,
-            f"Meeting ID      : {meeting.id}",
-            f"Room Code       : {meeting.room_id}",
-            f"Date & Time     : {meeting.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            f"Doctor          : Dr. {doctor_name} ({meeting.doctor.email})",
-            f"Specialization  : {specialization}",
-            f"Patient         : {patient_name}",
-            f"Languages       : English / Urdu (اردو)",
-            f"Recorded At     : {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            "=" * 80,
-            "",
-            "[PATIENT CHIEF COMPLAINT / REASON FOR VISIT]:",
-            f"{meeting.patient_notes or 'None specified'}",
-            "",
-            "[DOCTOR CLINICAL NOTES & SUMMARY]:",
-            f"{request.doctor_notes or meeting.doctor_notes or 'No clinical notes added'}",
-            "",
-            "=" * 80,
-            "DIALOGUE TRANSCRIPT (ENGLISH & URDU):",
-            "=" * 80,
-        ]
-
-        body_lines = []
-        if segments:
-            for seg in segments:
-                if isinstance(seg, dict):
-                    speaker = seg.get("speaker_name") or seg.get("speaker") or "Participant"
-                    ts = seg.get("timestamp", "")
-                    text = seg.get("text", "").strip()
-                    lang = seg.get("language", "")
-                else:
-                    speaker = getattr(seg, "speaker_name", None) or getattr(seg, "speaker", None) or "Participant"
-                    ts = getattr(seg, "timestamp", "")
-                    text = (getattr(seg, "text", "") or "").strip()
-                    lang = getattr(seg, "language", "")
-                lang_tag = f" [{lang}]" if lang else ""
-                body_lines.append(f"[{ts}] {speaker}{lang_tag}: {text}")
-        else:
-            body_lines.append("(No spoken conversation was detected or transcribed during this call)")
-
-        footer_lines = [
-            "",
-            "=" * 80,
-            "END OF CONSULTATION TRANSCRIPT — CONFIDENTIAL MEDICAL RECORD",
-            "=" * 80,
-        ]
-
-        full_transcript_text = "\n".join(header_lines + body_lines + footer_lines)
-
-        # Write UTF-8 file to disk
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(full_transcript_text)
-
-        # Persist to DB
-        updated = await MeetingRepository.update_meeting_status_and_transcript(
+        doctor_notes = getattr(request, "doctor_notes", None)
+        end_resp = await MeetingService.end_meeting(
             session=session,
-            meeting=meeting,
-            status=MeetingStatus.COMPLETED,
-            transcript_text=full_transcript_text,
-            transcript_path=file_path,
-            doctor_notes=request.doctor_notes,
+            user=user,
+            meeting_id=meeting_id,
+            doctor_notes=doctor_notes,
         )
-        await session.commit()
-
-        # Clear in-memory buffer
-        signaling_manager.clear_transcript_buffer(meeting.room_id)
-
         return MeetingTranscriptResponse(
-            meeting_id=updated.id,
-            room_id=updated.room_id,
-            transcript_text=updated.transcript_text,
-            doctor_notes=updated.doctor_notes,
-            status=updated.status,
-            completed_at=updated.updated_at,
+            meeting_id=end_resp.meeting_id,
+            room_id=end_resp.room_id,
+            transcript_text=None,
+            doctor_notes=end_resp.doctor_notes,
+            status=end_resp.status,
+            completed_at=end_resp.completed_at,
         )
-
-    # ── Session-Based Transcript Saving (Per Join/Leave Cycle) ───────────
 
     @staticmethod
     async def save_session_transcript(
         session: AsyncSession,
         user: User,
         meeting_id: uuid.UUID,
-        request,
-    ):
-        """
-        Save a transcript for a single session (one join/leave cycle).
-        Does NOT change meeting status — meeting remains active for rejoin.
-        Each session generates a separate file: {meeting_id}_session_{n}_transcript.txt
-        """
-        from app.schemas.meeting import SessionTranscriptResponse
-
-        meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
-        if not meeting:
-            raise NotFoundError("Meeting not found")
-
-        if user.id not in (meeting.doctor_id, meeting.patient_id) and user.role != UserRole.SAAS_ADMIN:
-            raise AuthorizationError("Only meeting participants can save session transcripts")
-
-        segments = request.segments or []
-        if not segments:
-            in_memory_segments = signaling_manager.get_transcript_segments(meeting.room_id)
-            segments = [
-                {
-                    "speaker": s.get("speaker", "participant"),
-                    "speaker_name": s.get("speaker_name", "Participant"),
-                    "text": s.get("text", ""),
-                    "timestamp": s.get("timestamp", ""),
-                    "language": s.get("language", "en-US"),
-                }
-                for s in in_memory_segments
-            ]
-
-        doctor_profile = meeting.doctor.doctor_profile if meeting.doctor else None
-        doctor_name = doctor_profile.full_name if doctor_profile and doctor_profile.full_name else meeting.doctor.email
-        specialization = doctor_profile.specialization if doctor_profile and doctor_profile.specialization else "General Physician"
-        patient_name = meeting.patient.email
-
-        # Build formatted session transcript
-        MeetingService._ensure_transcript_dir()
-        session_num = request.session_number
-        file_name = f"{meeting.id}_session_{session_num}_transcript.txt"
-        file_path = os.path.join(TRANSCRIPT_DIR, file_name)
-
-        now_utc = datetime.now(timezone.utc)
-        header_lines = [
-            "=" * 80,
-            f"MEDTRUST HEALTHCARE — SESSION {session_num} TRANSCRIPT",
-            "=" * 80,
-            f"Meeting ID      : {meeting.id}",
-            f"Room Code       : {meeting.room_id}",
-            f"Session Number  : {session_num}",
-            f"Meeting Window  : {meeting.start_time.strftime('%Y-%m-%d %H:%M:%S UTC')} - {meeting.end_time.strftime('%H:%M:%S UTC')}",
-            f"Doctor          : Dr. {doctor_name} ({meeting.doctor.email})",
-            f"Specialization  : {specialization}",
-            f"Patient         : {patient_name}",
-            f"Languages       : English / Urdu (اردو)",
-            f"Recorded At     : {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            "=" * 80,
-            "",
-            "[DOCTOR CLINICAL NOTES & SUMMARY]:",
-            f"{request.doctor_notes or 'No clinical notes added'}",
-            "",
-            "=" * 80,
-            f"SESSION {session_num} DIALOGUE TRANSCRIPT (ENGLISH & URDU):",
-            "=" * 80,
-        ]
-
-        body_lines = []
-        if segments:
-            for seg in segments:
-                if isinstance(seg, dict):
-                    speaker = seg.get("speaker_name") or seg.get("speaker") or "Participant"
-                    ts = seg.get("timestamp", "")
-                    text = seg.get("text", "").strip()
-                    lang = seg.get("language", "")
-                else:
-                    speaker = getattr(seg, "speaker_name", None) or getattr(seg, "speaker", None) or "Participant"
-                    ts = getattr(seg, "timestamp", "")
-                    text = (getattr(seg, "text", "") or "").strip()
-                    lang = getattr(seg, "language", "")
-                lang_tag = f" [{lang}]" if lang else ""
-                body_lines.append(f"[{ts}] {speaker}{lang_tag}: {text}")
-        else:
-            body_lines.append("(No spoken conversation was detected or transcribed during this session)")
-
-        footer_lines = [
-            "",
-            "=" * 80,
-            f"END OF SESSION {session_num} TRANSCRIPT — CONFIDENTIAL MEDICAL RECORD",
-            "=" * 80,
-        ]
-
-        full_text = "\n".join(header_lines + body_lines + footer_lines)
-
-        # Write UTF-8 file to disk
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
-
-        logger.info(f"Session {session_num} transcript saved for meeting {meeting.id} at {file_path}")
-
+        request: Any,
+    ) -> SessionTranscriptResponse:
+        """Legacy stub for per-session saving."""
         return SessionTranscriptResponse(
-            meeting_id=meeting.id,
-            session_number=session_num,
-            transcript_path=file_path,
-            message=f"Session {session_num} transcript saved successfully",
+            meeting_id=meeting_id,
+            session_number=getattr(request, "session_number", 1),
+            transcript_path="",
+            message="Session saved successfully",
         )
-
-    # ── Transcript Download for Doctor ───────────────────────────────────
 
     @staticmethod
     async def get_transcript_download(
         session: AsyncSession,
         user: User,
         meeting_id: uuid.UUID,
-    ) -> FileResponse:
-        """
-        Securely stream transcript file download exclusively to the consulting doctor.
-        """
-        meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
-        if not meeting:
-            raise NotFoundError("Meeting not found")
-
-        # Restrict to doctor (or admin)
-        if user.id != meeting.doctor_id and user.role != UserRole.SAAS_ADMIN:
-            raise AuthorizationError("Only the consulting doctor can download this consultation transcript")
-
-        if not meeting.transcript_path or not os.path.exists(meeting.transcript_path):
-            raise NotFoundError("Transcript file is not yet generated for this meeting")
-
-        file_name = f"Consultation_Transcript_{meeting.room_id}.txt"
-        return FileResponse(
-            path=meeting.transcript_path,
-            media_type="text/plain; charset=utf-8",
-            filename=file_name,
-        )
+    ):
+        """Legacy download endpoint — returns 404 since transcripts are discontinued."""
+        raise NotFoundError("Transcripts are no longer supported or generated.")
 
     # ── Response Helpers ─────────────────────────────────────────────────
 

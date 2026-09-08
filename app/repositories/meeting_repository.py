@@ -243,6 +243,21 @@ class MeetingRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def update_meeting_status(
+        session: AsyncSession,
+        meeting: Meeting,
+        status: MeetingStatus,
+        doctor_notes: Optional[str] = None,
+    ) -> Meeting:
+        """Update meeting status and optional doctor notes."""
+        meeting.status = status
+        if doctor_notes is not None:
+            meeting.doctor_notes = doctor_notes
+        await session.flush()
+        await session.refresh(meeting)
+        return meeting
+
+    @staticmethod
     async def update_meeting_status_and_transcript(
         session: AsyncSession,
         meeting: Meeting,
@@ -251,17 +266,13 @@ class MeetingRepository:
         transcript_path: Optional[str] = None,
         doctor_notes: Optional[str] = None,
     ) -> Meeting:
-        """Update meeting state and save transcript metadata."""
-        meeting.status = status
-        if transcript_text is not None:
-            meeting.transcript_text = transcript_text
-        if transcript_path is not None:
-            meeting.transcript_path = transcript_path
-        if doctor_notes is not None:
-            meeting.doctor_notes = doctor_notes
-        await session.flush()
-        await session.refresh(meeting)
-        return meeting
+        """Backwards-compatible wrapper for updating meeting status."""
+        return await MeetingRepository.update_meeting_status(
+            session=session,
+            meeting=meeting,
+            status=status,
+            doctor_notes=doctor_notes,
+        )
 
     # ── Weekly Schedule Operations ───────────────────────────────────────
 

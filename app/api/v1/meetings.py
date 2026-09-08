@@ -36,6 +36,8 @@ from app.schemas.meeting import (
     DoctorDirectoryItemResponse,
     GenerateWeekSlotsRequest,
     MeetingBookRequest,
+    MeetingEndRequest,
+    MeetingEndResponse,
     MeetingEndAndSaveTranscriptRequest,
     MeetingResponse,
     MeetingTranscriptResponse,
@@ -222,17 +224,37 @@ async def get_meeting_details(
     return await MeetingService.get_meeting_by_id_or_room(session, user, meeting_id_or_room)
 
 
-# ── Meeting Completion & Transcript Endpoints ────────────────────────────────
+# ── Meeting Completion Endpoints ─────────────────────────────────────────────
+
+@router.post(
+    "/{meeting_id}/end",
+    response_model=MeetingEndResponse,
+    summary="End consultation meeting",
+    description="Ends the 1-to-1 consultation, saves optional clinical doctor notes, and transitions meeting status to completed.",
+)
+async def end_meeting(
+    meeting_id: uuid.UUID,
+    request: MeetingEndRequest = MeetingEndRequest(),
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> MeetingEndResponse:
+    return await MeetingService.end_meeting(
+        session=session,
+        user=user,
+        meeting_id=meeting_id,
+        doctor_notes=request.doctor_notes,
+    )
+
 
 @router.post(
     "/{meeting_id}/end-and-save-transcript",
     response_model=MeetingTranscriptResponse,
-    summary="End meeting and finalize bilingual speech transcript",
-    description="Aggregates transcript segments (English & Urdu), writes a formatted UTF-8 text file to storage, and saves records.",
+    summary="End meeting (legacy alias)",
+    description="Backwards-compatible endpoint for finalizing consultation.",
 )
 async def end_meeting_and_save_transcript(
     meeting_id: uuid.UUID,
-    request: MeetingEndAndSaveTranscriptRequest,
+    request: MeetingEndAndSaveTranscriptRequest = MeetingEndAndSaveTranscriptRequest(),
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> MeetingTranscriptResponse:

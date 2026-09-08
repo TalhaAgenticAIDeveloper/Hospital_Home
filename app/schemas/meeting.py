@@ -131,25 +131,30 @@ class MeetingResponse(BaseModel):
     created_at: datetime
 
 
-# ── Transcript Schemas ───────────────────────────────────────────────────────
+# ── Meeting Completion Schemas ─────────────────────────────────────────────
 
-class TranscriptSegment(BaseModel):
-    """A speech segment spoken by a participant in English or Urdu."""
-    speaker: str = Field(..., description="'doctor' or 'patient'")
-    speaker_name: str = Field(..., description="Display name of the speaker")
-    text: str = Field(..., description="Transcribed text in Urdu or English")
-    timestamp: str = Field(..., description="Timestamp in HH:MM:SS format")
-    language: Optional[str] = Field("en-US", description="'ur-PK' or 'en-US'")
+class MeetingEndRequest(BaseModel):
+    """Payload when ending a consultation."""
+    doctor_notes: Optional[str] = Field(None, max_length=5000, description="Optional clinical notes added by the doctor")
+    segments: Optional[List[dict]] = Field(default_factory=list, description="Legacy field for backward compatibility")
 
 
-class MeetingEndAndSaveTranscriptRequest(BaseModel):
-    """Payload when completing a meeting and saving transcript."""
-    doctor_notes: Optional[str] = Field(None, max_length=5000)
-    segments: Optional[List[TranscriptSegment]] = Field(default_factory=list)
+class MeetingEndResponse(BaseModel):
+    """Response returned when a consultation is completed."""
+    meeting_id: uuid.UUID
+    room_id: str
+    doctor_notes: Optional[str] = None
+    status: MeetingStatus
+    completed_at: Optional[datetime] = None
+    message: str = "Consultation completed successfully"
+
+
+# Backwards compatibility aliases
+MeetingEndAndSaveTranscriptRequest = MeetingEndRequest
 
 
 class MeetingTranscriptResponse(BaseModel):
-    """Meeting transcript content."""
+    """Legacy response for meeting completion."""
     meeting_id: uuid.UUID
     room_id: str
     transcript_text: Optional[str] = None
@@ -158,19 +163,28 @@ class MeetingTranscriptResponse(BaseModel):
     completed_at: Optional[datetime] = None
 
 
+class TranscriptSegment(BaseModel):
+    """Legacy speech segment schema."""
+    speaker: str = Field(..., description="'doctor' or 'patient'")
+    speaker_name: str = Field(..., description="Display name of the speaker")
+    text: str = Field(..., description="Text segment")
+    timestamp: str = Field(..., description="Timestamp in HH:MM:SS format")
+    language: Optional[str] = Field("en-US")
+
+
 class SessionTranscriptSaveRequest(BaseModel):
-    """Payload for saving a per-session transcript (one join/leave cycle)."""
-    session_number: int = Field(..., ge=1, description="Session number (1, 2, 3...)")
-    doctor_notes: Optional[str] = Field(None, max_length=5000)
-    segments: Optional[List[TranscriptSegment]] = Field(default_factory=list)
+    """Legacy schema for session saving."""
+    session_number: int = Field(1)
+    doctor_notes: Optional[str] = None
+    segments: Optional[List[dict]] = Field(default_factory=list)
 
 
 class SessionTranscriptResponse(BaseModel):
-    """Response after saving a session transcript."""
+    """Legacy schema for session saving."""
     meeting_id: uuid.UUID
     session_number: int
-    transcript_path: str
-    message: str
+    transcript_path: str = ""
+    message: str = "Session completed"
 
 
 # ── Weekly Schedule Schemas ──────────────────────────────────────────────────

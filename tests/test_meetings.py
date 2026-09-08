@@ -172,9 +172,9 @@ async def test_patient_booking_and_double_booking_prevention(client: AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_meeting_bilingual_transcript_flow_and_download(client: AsyncClient):
-    """Test bilingual (English and Urdu) transcript saving, UTF-8 integrity, and doctor-only download."""
-    doc_auth = await create_active_doctor(client, "doc_transcript@example.com")
+async def test_meeting_completion_and_notes(client: AsyncClient):
+    """Test ending consultation meeting, doctor clinical notes persistence, and completed status."""
+    doc_auth = await create_active_doctor(client, "doc_completion@example.com")
     doc_headers = {"Authorization": f"Bearer {doc_auth['access_token']}"}
 
     tomorrow = (datetime.now(timezone.utc) + timedelta(days=2)).date()
@@ -191,7 +191,7 @@ async def test_meeting_bilingual_transcript_flow_and_download(client: AsyncClien
     slot_id = batch_resp.json()[0]["id"]
     doctor_id = batch_resp.json()[0]["doctor_id"]
 
-    patient_auth = await create_and_login_patient(client, "patient_transcript@example.com")
+    patient_auth = await create_and_login_patient(client, "patient_completion@example.com")
     p_headers = {"Authorization": f"Bearer {patient_auth['access_token']}"}
 
     book_resp = await client.post(
@@ -206,62 +206,29 @@ async def test_meeting_bilingual_transcript_flow_and_download(client: AsyncClien
     assert book_resp.status_code == 201
     meeting_id = book_resp.json()["id"]
 
-    # End meeting and save bilingual transcript
-    transcript_payload = {
-        "doctor_notes": "Prescribed Paracetamol 500mg and advised 3 days rest.",
-        "segments": [
-            {
-                "speaker": "doctor",
-                "speaker_name": "Dr. Sarah Ahmed",
-                "text": "Hello, how are you feeling today?",
-                "timestamp": "16:02:10",
-                "language": "en-US",
-            },
-            {
-                "speaker": "patient",
-                "speaker_name": "Patient",
-                "text": "ڈاکٹر صاحب مجھے کل رات سے تیز بخار ہے اور گلے میں شدید درد ہے۔",
-                "timestamp": "16:02:25",
-                "language": "ur-PK",
-            },
-            {
-                "speaker": "doctor",
-                "speaker_name": "Dr. Sarah Ahmed",
-                "text": "Do you have any cough or difficulty breathing?",
-                "timestamp": "16:02:40",
-                "language": "en-US",
-            },
-            {
-                "speaker": "patient",
-                "speaker_name": "Patient",
-                "text": "نہیں، کھانسی نہیں ہے لیکن کمزوری بہت زیادہ محسوس ہو رہی ہے۔",
-                "timestamp": "16:02:55",
-                "language": "ur-PK",
-            },
-        ],
-    }
+    # Unauthorized user tries to end meeting
+    other_patient = await create_and_login_patient(client, "other_completion@example.com")
+    other_headers = {"Authorization": f"Bearer {other_patient['access_token']}"}
+    unauth_resp = await client.post(
+        f"/api/v1/meetings/{meeting_id}/end",
+        json={"doctor_notes": "Hacker notes"},
+        headers=other_headers,
+    )
+    assert unauth_resp.status_code == 403
 
+    # Doctor ends meeting with clinical notes
     end_resp = await client.post(
-        f"/api/v1/meetings/{meeting_id}/end-and-save-transcript",
-        json=transcript_payload,
+        f"/api/v1/meetings/{meeting_id}/end",
+        json={"doctor_notes": "Prescribed Paracetamol 500mg and advised 3 days rest."},
         headers=doc_headers,
     )
     assert end_resp.status_code == 200
     saved = end_resp.json()
     assert saved["status"] == "completed"
-    assert "ڈاکٹر صاحب مجھے کل رات سے تیز بخار ہے" in saved["transcript_text"]
-    assert "Hello, how are you feeling today?" in saved["transcript_text"]
+    assert saved["doctor_notes"] == "Prescribed Paracetamol 500mg and advised 3 days rest."
 
-    # Doctor downloads transcript file
-    dl_resp = await client.get(f"/api/v1/meetings/{meeting_id}/transcript/download", headers=doc_headers)
-    assert dl_resp.status_code == 200
-    assert "text/plain" in dl_resp.headers["content-type"]
-    content_text = dl_resp.content.decode("utf-8")
-    assert "ڈاکٹر صاحب مجھے کل رات سے تیز بخار ہے" in content_text
-
-    # Unauthorized user (another patient) tries to download transcript
-    other_patient = await create_and_login_patient(client, "other_patient@example.com")
-    other_headers = {"Authorization": f"Bearer {other_patient['access_token']}"}
-
-    unauth_resp = await client.get(f"/api/v1/meetings/{meeting_id}/transcript/download", headers=other_headers)
-    assert unauth_resp.status_code == 403
+    # Verify meeting status via details endpoint
+    details_resp = await client.get(f"/api/v1/meetings/{meeting_id}", headers=doc_headers)
+    assert details_resp.status_code == 200
+    assert details_resp.json()["status"] == "completed"
+    assert details_resp.json()["doctor_notes"] == "Prescribed Paracetamol 500mg and advised 3 days rest."
