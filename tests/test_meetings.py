@@ -143,15 +143,27 @@ async def test_patient_booking_and_double_booking_prevention(client: AsyncClient
     assert meeting["patient_notes"] == "Severe migraine and fever"
     assert meeting["doctor_name"] == "Dr. Sarah Ahmed"
 
-    # Patient 2 attempts to book the same slot
+    # Patient 2 attempts to book the same slot without reason (should get 422)
     patient2_auth = await create_and_login_patient(client, "patient2@example.com")
     p2_headers = {"Authorization": f"Bearer {patient2_auth['access_token']}"}
 
+    invalid_reason_resp = await client.post(
+        "/api/v1/meetings/book",
+        json={
+            "doctor_id": doctor_id,
+            "availability_id": slot_id,
+        },
+        headers=p2_headers,
+    )
+    assert invalid_reason_resp.status_code == 422
+
+    # Patient 2 attempts to book the same slot with reason (should get 409 conflict)
     conflict_resp = await client.post(
         "/api/v1/meetings/book",
         json={
             "doctor_id": doctor_id,
             "availability_id": slot_id,
+            "patient_notes": "Follow up consultation",
         },
         headers=p2_headers,
     )
@@ -184,9 +196,14 @@ async def test_meeting_bilingual_transcript_flow_and_download(client: AsyncClien
 
     book_resp = await client.post(
         "/api/v1/meetings/book",
-        json={"doctor_id": doctor_id, "availability_id": slot_id},
+        json={
+            "doctor_id": doctor_id,
+            "availability_id": slot_id,
+            "patient_notes": "Throat pain and fever",
+        },
         headers=p_headers,
     )
+    assert book_resp.status_code == 201
     meeting_id = book_resp.json()["id"]
 
     # End meeting and save bilingual transcript

@@ -14,6 +14,8 @@ from app.models.doctor_availability import DoctorAvailability
 from app.models.doctor_profile import DoctorProfile
 from app.models.enums import MeetingStatus, UserRole, UserStatus
 from app.models.meeting import Meeting
+from app.models.meeting_document import MeetingDocument
+from app.models.patient_document import PatientDocument
 from app.models.user import User
 from app.models.weekly_schedule import DoctorWeeklySchedule
 
@@ -179,6 +181,8 @@ class MeetingRepository:
                 selectinload(Meeting.doctor).selectinload(User.doctor_profile),
                 selectinload(Meeting.patient),
                 selectinload(Meeting.availability),
+                selectinload(Meeting.attached_documents)
+                    .selectinload(MeetingDocument.patient_document),
             )
             .where(Meeting.id == meeting_id)
         )
@@ -196,6 +200,8 @@ class MeetingRepository:
             .options(
                 selectinload(Meeting.doctor).selectinload(User.doctor_profile),
                 selectinload(Meeting.patient),
+                selectinload(Meeting.attached_documents)
+                    .selectinload(MeetingDocument.patient_document),
             )
             .where(Meeting.room_id == room_id)
         )
@@ -227,6 +233,8 @@ class MeetingRepository:
                 selectinload(Meeting.doctor).selectinload(User.doctor_profile),
                 selectinload(Meeting.patient),
                 selectinload(Meeting.availability),
+                selectinload(Meeting.attached_documents)
+                    .selectinload(MeetingDocument.patient_document),
             )
             .where(and_(*conditions))
             .order_by(Meeting.start_time.asc())
@@ -295,3 +303,36 @@ class MeetingRepository:
         for s in schedules:
             await session.refresh(s)
         return schedules
+
+    # ── Meeting Document Operations ──────────────────────────────────────
+
+    @staticmethod
+    async def create_meeting_documents(
+        session: AsyncSession,
+        meeting_documents: List[MeetingDocument],
+    ) -> List[MeetingDocument]:
+        """Bulk insert meeting-document associations."""
+        if not meeting_documents:
+            return []
+        session.add_all(meeting_documents)
+        await session.flush()
+        for md in meeting_documents:
+            await session.refresh(md)
+        return meeting_documents
+
+    @staticmethod
+    async def get_meeting_documents(
+        session: AsyncSession,
+        meeting_id: uuid.UUID,
+    ) -> List[MeetingDocument]:
+        """List all patient documents attached to a specific meeting."""
+        query = (
+            select(MeetingDocument)
+            .options(
+                selectinload(MeetingDocument.patient_document),
+            )
+            .where(MeetingDocument.meeting_id == meeting_id)
+            .order_by(MeetingDocument.created_at.asc())
+        )
+        result = await session.execute(query)
+        return list(result.scalars().all())

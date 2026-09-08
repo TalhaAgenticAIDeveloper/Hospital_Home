@@ -9,6 +9,7 @@ from typing import List, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.enums import MeetingStatus
+from app.schemas.patient_document import MeetingDocumentResponse
 
 
 # ── Availability Schemas ─────────────────────────────────────────────────────
@@ -86,7 +87,17 @@ class MeetingBookRequest(BaseModel):
     availability_id: Optional[uuid.UUID] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    patient_notes: Optional[str] = Field(None, max_length=2000, description="Reason for visit or symptoms")
+    patient_notes: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="Reason for visit or symptoms (required)",
+    )
+    document_ids: Optional[List[uuid.UUID]] = Field(
+        None,
+        max_length=5,
+        description="IDs of patient's uploaded medical documents to attach to this appointment",
+    )
 
     @model_validator(mode="after")
     def validate_booking_target(self) -> "MeetingBookRequest":
@@ -116,6 +127,7 @@ class MeetingResponse(BaseModel):
     patient_notes: Optional[str] = None
     doctor_notes: Optional[str] = None
     has_transcript: bool = False
+    attached_documents: List[MeetingDocumentResponse] = []
     created_at: datetime
 
 

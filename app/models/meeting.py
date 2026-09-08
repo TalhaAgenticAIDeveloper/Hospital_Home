@@ -4,7 +4,7 @@ Meeting model — represents scheduled 1-to-1 video/audio telemedicine consultat
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text
 from sqlalchemy.dialects.postgresql import UUID
@@ -16,6 +16,7 @@ from app.models.enums import MeetingStatus
 
 if TYPE_CHECKING:
     from app.models.doctor_availability import DoctorAvailability
+    from app.models.meeting_document import MeetingDocument
     from app.models.user import User
 
 
@@ -128,6 +129,12 @@ class Meeting(TimestampMixin, Base):
         "DoctorAvailability",
         back_populates="meeting",
         foreign_keys=[availability_id],
+        lazy="selectin",
+    )
+    attached_documents: Mapped[List["MeetingDocument"]] = relationship(
+        "MeetingDocument",
+        back_populates="meeting",
+        cascade="all, delete-orphan",
         lazy="selectin",
     )
 

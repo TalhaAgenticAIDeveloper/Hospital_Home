@@ -19,6 +19,7 @@ from app.models.enums import UserRole, UserStatus
 
 if TYPE_CHECKING:
     from app.models.doctor_profile import DoctorProfile
+    from app.models.patient_document import PatientDocument
     from app.models.refresh_token import RefreshToken
 
 
@@ -91,6 +92,13 @@ class User(TimestampMixin, Base):
         cascade="all, delete-orphan",
         lazy="selectin",
         foreign_keys="[DoctorProfile.user_id]",
+    )
+    patient_documents: Mapped[List["PatientDocument"]] = relationship(
+        "PatientDocument",
+        back_populates="patient",
+        cascade="all, delete-orphan",
+        lazy="noload",
+        foreign_keys="[PatientDocument.patient_id]",
     )
 
     # ── Table Constraints ────────────────────────────────────────────────

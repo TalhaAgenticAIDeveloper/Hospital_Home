@@ -18,9 +18,11 @@ from app.models.doctor_availability import DoctorAvailability
 from app.models.doctor_profile import DoctorProfile
 from app.models.enums import MeetingStatus, UserRole, UserStatus
 from app.models.meeting import Meeting
+from app.models.meeting_document import MeetingDocument
 from app.models.user import User
 from app.models.weekly_schedule import DoctorWeeklySchedule
 from app.repositories.meeting_repository import MeetingRepository
+from app.repositories.patient_document_repository import PatientDocumentRepository
 from app.schemas.meeting import (
     AvailabilityBatchCreateRequest,
     AvailabilityResponse,
@@ -34,6 +36,7 @@ from app.schemas.meeting import (
     WeeklyScheduleResponse,
     WeeklyScheduleSaveRequest,
 )
+from app.schemas.patient_document import MeetingDocumentResponse
 from app.services.signaling_manager import signaling_manager
 
 logger = get_logger(__name__)
@@ -219,6 +222,10 @@ class MeetingService:
         if patient_user.id == request.doctor_id:
             raise ValidationError("You cannot book a meeting with yourself")
 
+        # Validate mandatory reason
+        if not request.patient_notes or not request.patient_notes.strip():
+            raise ValidationError("Reason for consultation is required")
+
         start_time: datetime
         end_time: datetime
         slot: Optional[DoctorAvailability] = None
@@ -253,15 +260,46 @@ class MeetingService:
             start_time=start_time,
             end_time=end_time,
             status=MeetingStatus.SCHEDULED,
-            patient_notes=request.patient_notes,
+            patient_notes=request.patient_notes.strip(),
         )
 
         await MeetingRepository.create_meeting(session, meeting)
+
+        # Attach patient documents if any were selected
+        if request.document_ids:
+            # Validate all document IDs belong to the patient
+            docs = await PatientDocumentRepository.get_documents_by_ids(
+                session, request.document_ids, patient_user.id
+            )
+            if len(docs) != len(request.document_ids):
+                raise ValidationError(
+                    "One or more selected documents were not found or don't belong to you"
+                )
+
+            meeting_docs = [
+                MeetingDocument(
+                    id=uuid.uuid4(),
+                    meeting=meeting,
+                    meeting_id=meeting.id,
+                    patient_document_id=doc.id,
+                    patient_document=doc,
+                )
+                for doc in docs
+            ]
+            await MeetingRepository.create_meeting_documents(session, meeting_docs)
+            meeting.attached_documents = meeting_docs
+
         await session.commit()
 
-        # Re-fetch to load relationships
-        loaded_meeting = await MeetingRepository.get_meeting_by_id(session, meeting.id)
-        return MeetingService._format_meeting_response(loaded_meeting)
+        # Re-fetch with fresh relationships
+        meeting_id = meeting.id
+        loaded_meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
+        if loaded_meeting:
+            if not loaded_meeting.attached_documents and request.document_ids:
+                loaded_meeting.attached_documents = meeting.attached_documents
+            return MeetingService._format_meeting_response(loaded_meeting)
+
+        return MeetingService._format_meeting_response(meeting)
 
     # ── Meetings Listing & Retrieval ─────────────────────────────────────
 
@@ -570,6 +608,26 @@ class MeetingService:
     @staticmethod
     def _format_meeting_response(meeting: Meeting) -> MeetingResponse:
         doctor_profile = meeting.doctor.doctor_profile if meeting.doctor else None
+
+        # Format attached patient documents
+        attached_docs = []
+        if hasattr(meeting, 'attached_documents') and meeting.attached_documents:
+            for md in meeting.attached_documents:
+                pd = md.patient_document
+                if pd:
+                    attached_docs.append(
+                        MeetingDocumentResponse(
+                            id=md.id,
+                            meeting_id=md.meeting_id,
+                            patient_document_id=md.patient_document_id,
+                            label=pd.label,
+                            original_filename=pd.original_filename,
+                            file_size=pd.file_size,
+                            mime_type=pd.mime_type,
+                            uploaded_at=pd.created_at,
+                        )
+                    )
+
         return MeetingResponse(
             id=meeting.id,
             room_id=meeting.room_id,
@@ -586,6 +644,7 @@ class MeetingService:
             patient_notes=meeting.patient_notes,
             doctor_notes=meeting.doctor_notes,
             has_transcript=bool(meeting.transcript_text or meeting.transcript_path),
+            attached_documents=attached_docs,
             created_at=meeting.created_at,
         )
 
