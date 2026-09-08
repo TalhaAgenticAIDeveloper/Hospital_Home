@@ -162,9 +162,10 @@ class PatientDocumentService:
         session: AsyncSession,
         requesting_user: User,
         document_id: uuid.UUID,
+        inline: bool = False,
     ) -> FileResponse:
         """
-        Stream a patient document for download.
+        Stream a patient document for download or inline browser viewing.
 
         Access control:
         - The document owner (patient) can always download their own documents
@@ -192,8 +193,10 @@ class PatientDocumentService:
         if not os.path.exists(document.file_path):
             raise NotFoundError("Document file not found on server")
 
+        content_disposition_type = "inline" if inline else "attachment"
         return FileResponse(
             path=document.file_path,
             media_type=document.mime_type,
             filename=document.original_filename,
+            content_disposition_type=content_disposition_type,
         )

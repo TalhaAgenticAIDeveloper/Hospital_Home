@@ -23,6 +23,9 @@ class PatientDocumentResponse(BaseModel):
     original_filename: str
     file_size: int
     mime_type: str
+    ai_summary: Optional[str] = None
+    ai_summary_status: Optional[str] = None
+    ai_summary_generated_at: Optional[datetime] = None
     created_at: datetime
 
 
@@ -40,3 +43,19 @@ class MeetingDocumentResponse(BaseModel):
     file_size: Optional[int] = None
     mime_type: Optional[str] = None
     uploaded_at: Optional[datetime] = None
+    ai_summary: Optional[str] = None
+    ai_summary_status: Optional[str] = None
+    ai_summary_generated_at: Optional[datetime] = None
+
+
+class DocumentSummaryResponse(BaseModel):
+    """Response schema for AI document summarization (Groq LLM)."""
+
+    document_id: uuid.UUID
+    meeting_id: Optional[uuid.UUID] = None
+    label: Optional[str] = None
+    original_filename: str
+    status: str  # 'completed' | 'unclear' | 'failed'
+    summary: str
+    is_cached: bool = False
+    generated_at: datetime

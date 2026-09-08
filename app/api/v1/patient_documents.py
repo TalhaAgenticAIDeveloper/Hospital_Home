@@ -98,17 +98,18 @@ async def delete_patient_document(
 
 @router.get(
     "/{document_id}/download",
-    summary="Download a medical document",
+    summary="Download or view a medical document",
     description=(
-        "Download or view an uploaded medical document. "
+        "Download or view an uploaded medical document. Set inline=true to view in browser. "
         "Only the document owner or a SaaS admin can access this endpoint."
     ),
 )
 async def download_patient_document(
     document_id: uuid.UUID,
+    inline: bool = False,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
     return await PatientDocumentService.download_document(
-        session, user, document_id
+        session, user, document_id, inline=inline
     )

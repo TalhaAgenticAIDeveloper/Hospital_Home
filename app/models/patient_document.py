@@ -7,9 +7,10 @@ Patients can upload up to 5 documents, each up to 50 MB.
 """
 
 import uuid
+from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import ForeignKey, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -76,6 +77,23 @@ class PatientDocument(TimestampMixin, Base):
     mime_type: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
+    )
+
+    # ── AI Summary (Groq LLM) ────────────────────────────────────────────
+    ai_summary: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+    )
+    ai_summary_status: Mapped[Optional[str]] = mapped_column(
+        String(50),
+        nullable=True,
+        default=None,
+    )
+    ai_summary_generated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
     )
 
     # ── Relationships ────────────────────────────────────────────────────

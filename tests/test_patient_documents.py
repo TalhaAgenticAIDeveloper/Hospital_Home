@@ -202,3 +202,132 @@ async def test_booking_with_attached_patient_documents(client: AsyncClient):
     )
     assert doc_download_resp.status_code == 200
     assert doc_download_resp.content == b"\x89PNG\r\n\x1a\ntest"
+    assert "attachment" in doc_download_resp.headers.get("content-disposition", "")
+
+    # Doctor views the patient's attached document inline (in-browser)
+    doc_inline_resp = await client.get(
+        f"/api/v1/meetings/{meeting_id}/patient-documents/{doc1_id}/download?inline=true",
+        headers=doc_headers,
+    )
+    assert doc_inline_resp.status_code == 200
+    assert doc_inline_resp.content == b"\x89PNG\r\n\x1a\ntest"
+    assert "inline" in doc_inline_resp.headers.get("content-disposition", "")
+
+    # Patient views own document inline
+    patient_inline_resp = await client.get(
+        f"/api/v1/patient/documents/{doc1_id}/download?inline=true",
+        headers=p_headers,
+    )
+    assert patient_inline_resp.status_code == 200
+    assert "inline" in patient_inline_resp.headers.get("content-disposition", "")
+
+
+@pytest.mark.asyncio
+async def test_ai_summarization_flow_and_caching(client: AsyncClient, monkeypatch):
+    """Test AI document summarization with mocked Groq call, DB caching, and blurry doc handling."""
+    from app.services.document_ai_service import DocumentAIService
+
+    # Create doctor
+    doc_auth = await create_active_doctor(client, "doc_summarize@example.com")
+    doc_headers = {"Authorization": f"Bearer {doc_auth['access_token']}"}
+
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=4)).date()
+    slot_resp = await client.post(
+        "/api/v1/meetings/availability/batch",
+        json={
+            "slot_date": tomorrow.isoformat(),
+            "start_time": "15:00",
+            "end_time": "15:30",
+            "slot_duration_minutes": 30,
+        },
+        headers=doc_headers,
+    )
+    slot_id = slot_resp.json()[0]["id"]
+    doctor_id = slot_resp.json()[0]["doctor_id"]
+
+    # Create patient and upload document
+    patient = await create_and_login_patient(client, "patient_summarize@example.com")
+    p_headers = {"Authorization": f"Bearer {patient['access_token']}"}
+
+    upload = await client.post(
+        "/api/v1/patient/documents",
+        files={"file": ("blood_work.png", io.BytesIO(b"\x89PNG\r\n\x1a\ntest_blood"), "image/png")},
+        data={"label": "Complete Blood Count"},
+        headers=p_headers,
+    )
+    doc_id = upload.json()["id"]
+
+    # Book meeting with attached doc
+    book_resp = await client.post(
+        "/api/v1/meetings/book",
+        json={
+            "doctor_id": doctor_id,
+            "availability_id": slot_id,
+            "patient_notes": "Routine checkup and blood review",
+            "document_ids": [doc_id],
+        },
+        headers=p_headers,
+    )
+    meeting_id = book_resp.json()["id"]
+
+    # Mock Groq API response
+    mock_summary = (
+        "📄 **Document Type**: Complete Blood Count (CBC)\n"
+        "🔬 **Key Findings**: Hemoglobin normal (14.2 g/dL), WBC slightly elevated (11,500/uL).\n"
+        "💡 **Clinical Impression**: Mild leukocytosis; evaluate for minor infection."
+    )
+
+    async def mock_call_groq(messages, model):
+        return mock_summary
+
+    monkeypatch.setattr(DocumentAIService, "_call_groq_api", mock_call_groq)
+
+    # 1. Doctor requests AI summary
+    summarize_resp = await client.post(
+        f"/api/v1/meetings/{meeting_id}/patient-documents/{doc_id}/summarize",
+        headers=doc_headers,
+    )
+    assert summarize_resp.status_code == 200
+    summary_data = summarize_resp.json()
+    assert summary_data["status"] == "completed"
+    assert "Complete Blood Count" in summary_data["summary"]
+    assert summary_data["is_cached"] is False
+
+    # 2. Re-fetching summary returns cached version without re-calling Groq
+    async def failing_groq(messages, model):
+        raise RuntimeError("Should not be called because summary is cached")
+
+    monkeypatch.setattr(DocumentAIService, "_call_groq_api", failing_groq)
+
+    cached_resp = await client.post(
+        f"/api/v1/meetings/{meeting_id}/patient-documents/{doc_id}/summarize",
+        headers=doc_headers,
+    )
+    assert cached_resp.status_code == 200
+    cached_data = cached_resp.json()
+    assert cached_data["is_cached"] is True
+    assert cached_data["summary"] == mock_summary
+
+    # 3. Patient cannot call doctor summarize endpoint (unauthorized)
+    unauthorized_resp = await client.post(
+        f"/api/v1/meetings/{meeting_id}/patient-documents/{doc_id}/summarize",
+        headers=p_headers,
+    )
+    assert unauthorized_resp.status_code == 403
+
+    # 4. Test Blurry / Low Legibility detection
+    blurry_summary = "⚠️ [Document Unclear / Low Legibility]\nThe image is out of focus and cannot be read."
+
+    async def blurry_groq(messages, model):
+        return blurry_summary
+
+    monkeypatch.setattr(DocumentAIService, "_call_groq_api", blurry_groq)
+
+    force_resp = await client.post(
+        f"/api/v1/meetings/{meeting_id}/patient-documents/{doc_id}/summarize?force_refresh=true",
+        headers=doc_headers,
+    )
+    assert force_resp.status_code == 200
+    blurry_data = force_resp.json()
+    assert blurry_data["status"] == "unclear"
+    assert "Document Unclear" in blurry_data["summary"]
