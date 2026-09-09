@@ -9,6 +9,7 @@ from app.models.enums import DocumentType, MeetingStatus, UserRole, UserStatus
 from app.models.meeting import Meeting
 from app.models.meeting_document import MeetingDocument
 from app.models.patient_document import PatientDocument
+from app.models.patient_profile import PatientProfile
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
 from app.models.weekly_schedule import DoctorWeeklySchedule
@@ -22,6 +23,7 @@ __all__ = [
     "Meeting",
     "MeetingDocument",
     "PatientDocument",
+    "PatientProfile",
     "DoctorWeeklySchedule",
     "UserRole",
     "UserStatus",

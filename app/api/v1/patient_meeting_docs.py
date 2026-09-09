@@ -18,6 +18,7 @@ from app.api.deps import get_current_user, get_db
 from app.core.exceptions import AuthorizationError, NotFoundError
 from app.core.logging import get_logger
 from app.models.enums import UserRole
+from app.models.meeting import Meeting
 from app.models.user import User
 from app.repositories.meeting_repository import MeetingRepository
 from app.repositories.patient_document_repository import PatientDocumentRepository
@@ -32,6 +33,19 @@ router = APIRouter(
 )
 
 
+async def _resolve_meeting(session: AsyncSession, meeting_id_or_room: str) -> Meeting:
+    """Resolve meeting by UUID or room_id string."""
+    meeting = None
+    try:
+        m_uuid = uuid.UUID(meeting_id_or_room)
+        meeting = await MeetingRepository.get_meeting_by_id(session, m_uuid)
+    except ValueError:
+        meeting = await MeetingRepository.get_meeting_by_room_id(session, meeting_id_or_room)
+    if not meeting:
+        raise NotFoundError("Meeting not found")
+    return meeting
+
+
 @router.get(
     "/{meeting_id}/patient-documents",
     response_model=List[MeetingDocumentResponse],
@@ -43,14 +57,12 @@ router = APIRouter(
     ),
 )
 async def get_meeting_patient_documents(
-    meeting_id: uuid.UUID,
+    meeting_id: str,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> List[MeetingDocumentResponse]:
     # Fetch meeting and verify access
-    meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
-    if not meeting:
-        raise NotFoundError("Meeting not found")
+    meeting = await _resolve_meeting(session, meeting_id)
 
     if (
         user.id not in (meeting.doctor_id, meeting.patient_id)
@@ -59,7 +71,7 @@ async def get_meeting_patient_documents(
         raise AuthorizationError("You are not authorized to access this meeting's documents")
 
     # Fetch attached documents
-    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting_id)
+    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting.id)
 
     result = []
     for md in meeting_docs:
@@ -94,16 +106,14 @@ async def get_meeting_patient_documents(
     ),
 )
 async def download_meeting_patient_document(
-    meeting_id: uuid.UUID,
+    meeting_id: str,
     document_id: uuid.UUID,
     inline: bool = False,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ):
     # Fetch meeting and verify access
-    meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
-    if not meeting:
-        raise NotFoundError("Meeting not found")
+    meeting = await _resolve_meeting(session, meeting_id)
 
     if (
         user.id not in (meeting.doctor_id, meeting.patient_id)
@@ -111,11 +121,11 @@ async def download_meeting_patient_document(
     ):
         raise AuthorizationError("You are not authorized to access this meeting's documents")
 
-    # Verify the document is actually attached to this meeting
-    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting_id)
+    # Verify the document is actually attached to this meeting (check both patient_document_id and md.id)
+    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting.id)
     target_doc = None
     for md in meeting_docs:
-        if md.patient_document_id == document_id:
+        if md.patient_document_id == document_id or md.id == document_id:
             target_doc = md.patient_document
             break
 
@@ -147,16 +157,14 @@ async def download_meeting_patient_document(
     ),
 )
 async def summarize_meeting_patient_document(
-    meeting_id: uuid.UUID,
+    meeting_id: str,
     document_id: uuid.UUID,
-    force_refresh: bool = False,
+    force_refresh: bool = True,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> DocumentSummaryResponse:
     # Verify meeting and doctor access
-    meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
-    if not meeting:
-        raise NotFoundError("Meeting not found")
+    meeting = await _resolve_meeting(session, meeting_id)
 
     if user.id != meeting.doctor_id and user.role != UserRole.SAAS_ADMIN:
         raise AuthorizationError(
@@ -164,14 +172,19 @@ async def summarize_meeting_patient_document(
         )
 
     # Verify the document is actually attached to this meeting
-    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting_id)
-    is_attached = any(md.patient_document_id == document_id for md in meeting_docs)
-    if not is_attached:
+    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting.id)
+    actual_pd_id = None
+    for md in meeting_docs:
+        if md.patient_document_id == document_id or md.id == document_id:
+            actual_pd_id = md.patient_document_id
+            break
+
+    if not actual_pd_id:
         raise NotFoundError("Document not found or not attached to this meeting")
 
     return await DocumentAIService.summarize_patient_document(
         session=session,
-        document_id=document_id,
-        meeting_id=meeting_id,
+        document_id=actual_pd_id,
+        meeting_id=meeting.id,
         force_refresh=force_refresh,
     )

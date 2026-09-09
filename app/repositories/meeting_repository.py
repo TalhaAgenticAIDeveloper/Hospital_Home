@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -179,7 +179,7 @@ class MeetingRepository:
             select(Meeting)
             .options(
                 selectinload(Meeting.doctor).selectinload(User.doctor_profile),
-                selectinload(Meeting.patient),
+                selectinload(Meeting.patient).selectinload(User.patient_profile),
                 selectinload(Meeting.availability),
                 selectinload(Meeting.attached_documents)
                     .selectinload(MeetingDocument.patient_document),
@@ -199,7 +199,7 @@ class MeetingRepository:
             select(Meeting)
             .options(
                 selectinload(Meeting.doctor).selectinload(User.doctor_profile),
-                selectinload(Meeting.patient),
+                selectinload(Meeting.patient).selectinload(User.patient_profile),
                 selectinload(Meeting.attached_documents)
                     .selectinload(MeetingDocument.patient_document),
             )
@@ -207,6 +207,34 @@ class MeetingRepository:
         )
         result = await session.execute(query)
         return result.scalar_one_or_none()
+
+    @staticmethod
+    async def auto_complete_expired_meetings(
+        session: AsyncSession,
+        user_id: uuid.UUID,
+        role: UserRole,
+        now_utc: datetime,
+    ) -> None:
+        """Mark scheduled or in_progress meetings whose end_time has passed as COMPLETED."""
+        conditions = [
+            Meeting.end_time <= now_utc,
+            Meeting.status.in_([MeetingStatus.SCHEDULED, MeetingStatus.IN_PROGRESS]),
+        ]
+        if role == UserRole.DOCTOR:
+            conditions.append(Meeting.doctor_id == user_id)
+        elif role == UserRole.PATIENT:
+            conditions.append(Meeting.patient_id == user_id)
+        else:
+            conditions.append(or_(Meeting.doctor_id == user_id, Meeting.patient_id == user_id))
+
+        stmt = (
+            update(Meeting)
+            .where(and_(*conditions))
+            .values(status=MeetingStatus.COMPLETED)
+            .execution_options(synchronize_session=False)
+        )
+        await session.execute(stmt)
+        await session.commit()
 
     @staticmethod
     async def list_meetings_for_user(
@@ -231,7 +259,7 @@ class MeetingRepository:
             select(Meeting)
             .options(
                 selectinload(Meeting.doctor).selectinload(User.doctor_profile),
-                selectinload(Meeting.patient),
+                selectinload(Meeting.patient).selectinload(User.patient_profile),
                 selectinload(Meeting.availability),
                 selectinload(Meeting.attached_documents)
                     .selectinload(MeetingDocument.patient_document),

@@ -124,8 +124,8 @@ class SignalingManager:
 
         msg_type = data.get("type")
 
-        # ── WebRTC Signaling: Offer / Answer / ICE Candidate ─────────────────
-        if msg_type in ("offer", "answer", "ice-candidate"):
+        # ── WebRTC Signaling & Custom In-Meeting Events ──────────────────────
+        if msg_type in ("offer", "answer", "ice-candidate", "documents-updated", "doc-summary-update"):
             await self.broadcast(room_id, data, exclude=sender_ws)
 
         # ── Meeting Ended Signal ─────────────────────────────────────────────

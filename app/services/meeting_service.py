@@ -306,7 +306,12 @@ class MeetingService:
         user: User,
         status_filter: Optional[MeetingStatus] = None,
     ) -> List[MeetingResponse]:
-        """List meetings for current doctor or patient."""
+        """List meetings for current doctor or patient, auto-completing expired meetings."""
+        now_utc = datetime.now(timezone.utc)
+        await MeetingRepository.auto_complete_expired_meetings(
+            session, user.id, user.role, now_utc
+        )
+
         meetings = await MeetingRepository.list_meetings_for_user(
             session, user.id, user.role, status_filter
         )
@@ -331,6 +336,11 @@ class MeetingService:
 
         if user.id not in (meeting.doctor_id, meeting.patient_id) and user.role != UserRole.SAAS_ADMIN:
             raise AuthorizationError("You are not authorized to access this consultation")
+
+        now_utc = datetime.now(timezone.utc)
+        if meeting.end_time <= now_utc and meeting.status in (MeetingStatus.SCHEDULED, MeetingStatus.IN_PROGRESS):
+            meeting.status = MeetingStatus.COMPLETED
+            await session.commit()
 
         return MeetingService._format_meeting_response(meeting)
 
@@ -435,6 +445,7 @@ class MeetingService:
     @staticmethod
     def _format_meeting_response(meeting: Meeting) -> MeetingResponse:
         doctor_profile = meeting.doctor.doctor_profile if meeting.doctor else None
+        patient_profile = meeting.patient.patient_profile if meeting.patient else None
 
         # Format attached patient documents
         attached_docs = []
@@ -452,6 +463,9 @@ class MeetingService:
                             file_size=pd.file_size,
                             mime_type=pd.mime_type,
                             uploaded_at=pd.created_at,
+                            ai_summary=pd.ai_summary,
+                            ai_summary_status=pd.ai_summary_status,
+                            ai_summary_generated_at=pd.ai_summary_generated_at,
                         )
                     )
 
@@ -463,7 +477,7 @@ class MeetingService:
             doctor_specialization=doctor_profile.specialization if doctor_profile else None,
             doctor_email=meeting.doctor.email if meeting.doctor else "",
             patient_id=meeting.patient_id,
-            patient_name=meeting.patient.email if meeting.patient else "",
+            patient_name=(patient_profile.full_name if (patient_profile and patient_profile.full_name) else (meeting.patient.email if meeting.patient else "")),
             patient_email=meeting.patient.email if meeting.patient else "",
             start_time=meeting.start_time,
             end_time=meeting.end_time,

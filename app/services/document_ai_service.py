@@ -12,6 +12,7 @@ Provides:
 
 import base64
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Tuple
@@ -103,7 +104,7 @@ class DocumentAIService:
             "model": model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": 1200,
+            "max_tokens": 2048,
         }
 
         headers = {
@@ -111,7 +112,7 @@ class DocumentAIService:
             "Content-Type": "application/json",
         }
 
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
 
             if resp.status_code != 200:
@@ -124,7 +125,12 @@ class DocumentAIService:
             if not choices:
                 raise ValidationError("Groq AI returned an empty response.")
 
-            return choices[0].get("message", {}).get("content", "").strip()
+            raw_content = choices[0].get("message", {}).get("content", "").strip()
+            # Clean <think>...</think> tags if reasoning model (e.g. Qwen, DeepSeek)
+            cleaned_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
+            if "<think>" in cleaned_content and "</think>" not in cleaned_content:
+                cleaned_content = cleaned_content.split("<think>", 1)[0].strip()
+            return cleaned_content or raw_content
 
     @classmethod
     async def summarize_patient_document(
@@ -146,8 +152,8 @@ class DocumentAIService:
         if not document:
             raise NotFoundError("Patient document not found")
 
-        # Return cached summary if available
-        if document.ai_summary and not force_refresh:
+        # Return cached summary only if not forcing refresh and previously completed successfully
+        if document.ai_summary and not force_refresh and document.ai_summary_status == "completed":
             return DocumentSummaryResponse(
                 document_id=document.id,
                 meeting_id=meeting_id,
@@ -196,8 +202,8 @@ class DocumentAIService:
                     summary_status = "failed"
 
             elif scanned_image_bytes:
-                # Scanned PDF with embedded image — use Vision model
-                vision_model = settings.GROQ_VISION_MODEL or "llama-3.2-11b-vision-preview"
+                # Scanned PDF with embedded image — use scan model from .env (e.g. GROQ_SCAN_MODEL)
+                vision_model = settings.groq_scan_model
                 b64_image = base64.b64encode(scanned_image_bytes).decode("utf-8")
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -244,7 +250,7 @@ class DocumentAIService:
                     raw_bytes = img_file.read()
 
                 b64_img = base64.b64encode(raw_bytes).decode("utf-8")
-                vision_model = settings.GROQ_VISION_MODEL or "llama-3.2-11b-vision-preview"
+                vision_model = settings.groq_scan_model
 
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},

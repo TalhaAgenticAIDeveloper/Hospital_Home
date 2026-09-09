@@ -63,7 +63,8 @@ class Settings(BaseSettings):
     GROQ_API: Optional[str] = None
     GROQ_API_KEY: Optional[str] = None
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
-    GROQ_VISION_MODEL: str = "llama-3.2-11b-vision-preview"
+    GROQ_VISION_MODEL: Optional[str] = None
+    GROQ_SCAN_MODEL: Optional[str] = None
 
     # ── Test Database ────────────────────────────────────────────────────
     TEST_DATABASE_URL: str = ""
@@ -72,6 +73,15 @@ class Settings(BaseSettings):
     def groq_api_key(self) -> Optional[str]:
         """Return the Groq API key from GROQ_API or GROQ_API_KEY."""
         return self.GROQ_API or self.GROQ_API_KEY
+
+    @property
+    def groq_scan_model(self) -> str:
+        """Return the model to use for scanned documents and vision analysis from .env (e.g. GROQ_SCAN_MODEL)."""
+        if self.GROQ_SCAN_MODEL and self.GROQ_SCAN_MODEL.strip():
+            return self.GROQ_SCAN_MODEL.strip()
+        if self.GROQ_VISION_MODEL and self.GROQ_VISION_MODEL.strip() and "llama-3.2-11b-vision-preview" not in self.GROQ_VISION_MODEL:
+            return self.GROQ_VISION_MODEL.strip()
+        return "qwen/qwen3.6-27b"
 
     @property
     def cors_origins_list(self) -> List[str]:
