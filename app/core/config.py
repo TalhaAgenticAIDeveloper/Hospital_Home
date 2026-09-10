@@ -6,7 +6,7 @@ Secrets must NEVER be hard-coded here.
 """
 
 from functools import lru_cache
-from typing import List
+from typing import List, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,10 +27,11 @@ class Settings(BaseSettings):
     )
 
     # ── Application ──────────────────────────────────────────────────────
-    APP_ENV: str = "development"
     APP_NAME: str = "HealthcareSaaS"
+    APP_ENV: str = "development"
     APP_VERSION: str = "0.1.0"
     DEBUG: bool = False
+    API_V1_STR: str = "/api/v1"
 
     # ── Database ─────────────────────────────────────────────────────────
     DATABASE_URL: str
@@ -46,7 +47,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
-    # ── CORS ─────────────────────────────────────────────────────────────
+    # ── Security & CORS ──────────────────────────────────────────────────
     CORS_ORIGINS: str = "http://localhost:3000"
 
     # ── Password Policy ──────────────────────────────────────────────────
@@ -58,8 +59,29 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 10
     ALLOWED_UPLOAD_TYPES: str = "application/pdf,image/jpeg,image/png"
 
+    # ── Groq LLM Configuration ───────────────────────────────────────────
+    GROQ_API: Optional[str] = None
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_VISION_MODEL: Optional[str] = None
+    GROQ_SCAN_MODEL: Optional[str] = None
+
     # ── Test Database ────────────────────────────────────────────────────
     TEST_DATABASE_URL: str = ""
+
+    @property
+    def groq_api_key(self) -> Optional[str]:
+        """Return the Groq API key from GROQ_API or GROQ_API_KEY."""
+        return self.GROQ_API or self.GROQ_API_KEY
+
+    @property
+    def groq_scan_model(self) -> str:
+        """Return the model to use for scanned documents and vision analysis from .env (e.g. GROQ_SCAN_MODEL)."""
+        if self.GROQ_SCAN_MODEL and self.GROQ_SCAN_MODEL.strip():
+            return self.GROQ_SCAN_MODEL.strip()
+        if self.GROQ_VISION_MODEL and self.GROQ_VISION_MODEL.strip() and "llama-3.2-11b-vision-preview" not in self.GROQ_VISION_MODEL:
+            return self.GROQ_VISION_MODEL.strip()
+        return "qwen/qwen3.6-27b"
 
     @property
     def cors_origins_list(self) -> List[str]:

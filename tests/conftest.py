@@ -29,6 +29,8 @@ from app.models.user import User
 
 settings = get_settings()
 
+from sqlalchemy.pool import NullPool
+
 # ── Test Database Engine ─────────────────────────────────────────────────────
 
 TEST_DATABASE_URL = settings.TEST_DATABASE_URL or settings.DATABASE_URL
@@ -36,7 +38,7 @@ TEST_DATABASE_URL = settings.TEST_DATABASE_URL or settings.DATABASE_URL
 test_engine = create_async_engine(
     TEST_DATABASE_URL,
     echo=False,
-    pool_pre_ping=True,
+    poolclass=NullPool,
 )
 
 test_session_maker = async_sessionmaker(
@@ -78,6 +80,8 @@ async def clean_tables():
     """
     yield
     async with test_session_maker() as session:
+        await session.execute(text("DELETE FROM meetings"))
+        await session.execute(text("DELETE FROM doctor_availabilities"))
         await session.execute(text("DELETE FROM doctor_documents"))
         await session.execute(text("DELETE FROM doctor_profiles"))
         await session.execute(text("DELETE FROM refresh_tokens"))

@@ -12,6 +12,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, EmailStr
 
 from app.schemas.doctor import DoctorProfileResponse
+from app.schemas.patient import PatientProfileResponse
 
 
 class UserResponse(BaseModel):
@@ -50,3 +51,4 @@ class MeResponse(BaseModel):
     created_at: datetime
     last_login_at: Optional[datetime] = None
     doctor_profile: Optional[DoctorProfileResponse] = None
+    patient_profile: Optional[PatientProfileResponse] = None

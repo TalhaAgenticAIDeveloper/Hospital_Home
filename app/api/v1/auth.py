@@ -12,6 +12,7 @@ from app.core.database import get_db
 from app.models.enums import UserRole
 from app.models.user import User
 from app.repositories.doctor_repository import DoctorRepository
+from app.repositories.patient_repository import PatientRepository
 from app.schemas.auth import (
     LoginRequest,
     LoginResponse,
@@ -23,6 +24,7 @@ from app.schemas.auth import (
     TokenResponse,
 )
 from app.schemas.doctor import DoctorDocumentResponse, DoctorProfileResponse
+from app.schemas.patient import PatientProfileResponse
 from app.schemas.user import MeResponse
 from app.services.auth_service import AuthService
 
@@ -133,6 +135,8 @@ async def get_me(
     session: AsyncSession = Depends(get_db),
 ) -> MeResponse:
     doctor_profile_resp = None
+    patient_profile_resp = None
+
     if user.role == UserRole.DOCTOR:
         profile = await DoctorRepository.get_profile_by_user_id(session, user.id)
         if profile:
@@ -156,6 +160,23 @@ async def get_me(
                     for doc in profile.documents
                 ],
             )
+    elif user.role == UserRole.PATIENT:
+        p_profile = await PatientRepository.get_profile_by_user_id(session, user.id)
+        if p_profile:
+            patient_profile_resp = PatientProfileResponse(
+                id=p_profile.id,
+                user_id=user.id,
+                email=user.email,
+                full_name=p_profile.full_name,
+                age=p_profile.age,
+                date_of_birth=p_profile.date_of_birth,
+                gender=p_profile.gender,
+                blood_group=p_profile.blood_group,
+                address=p_profile.address,
+                is_completed=p_profile.is_completed,
+                created_at=p_profile.created_at,
+                updated_at=p_profile.updated_at,
+            )
 
     return MeResponse(
         id=user.id,
@@ -166,4 +187,5 @@ async def get_me(
         created_at=user.created_at,
         last_login_at=user.last_login_at,
         doctor_profile=doctor_profile_resp,
+        patient_profile=patient_profile_resp,
     )

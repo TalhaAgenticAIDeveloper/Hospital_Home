@@ -32,3 +32,13 @@ class DocumentType(str, enum.Enum):
     ID_PROOF = "id_proof"
     PROFILE_PHOTO = "profile_photo"
     OTHER = "other"
+
+
+class MeetingStatus(str, enum.Enum):
+    """Status lifecycle for doctor-patient meetings."""
+
+    SCHEDULED = "scheduled"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+

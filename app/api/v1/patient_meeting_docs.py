@@ -1,0 +1,190 @@
+"""
+API endpoints for doctors to view patient documents attached to their meetings.
+
+When a patient books an appointment and selects documents to share,
+the consulting doctor can view and download those specific documents
+through these endpoints.
+"""
+
+import os
+import uuid
+from typing import List
+
+from fastapi import APIRouter, Depends, status
+from fastapi.responses import FileResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_user, get_db
+from app.core.exceptions import AuthorizationError, NotFoundError
+from app.core.logging import get_logger
+from app.models.enums import UserRole
+from app.models.meeting import Meeting
+from app.models.user import User
+from app.repositories.meeting_repository import MeetingRepository
+from app.repositories.patient_document_repository import PatientDocumentRepository
+from app.schemas.patient_document import DocumentSummaryResponse, MeetingDocumentResponse
+from app.services.document_ai_service import DocumentAIService
+
+logger = get_logger(__name__)
+
+router = APIRouter(
+    prefix="/meetings",
+    tags=["Meeting Patient Documents"],
+)
+
+
+async def _resolve_meeting(session: AsyncSession, meeting_id_or_room: str) -> Meeting:
+    """Resolve meeting by UUID or room_id string."""
+    meeting = None
+    try:
+        m_uuid = uuid.UUID(meeting_id_or_room)
+        meeting = await MeetingRepository.get_meeting_by_id(session, m_uuid)
+    except ValueError:
+        meeting = await MeetingRepository.get_meeting_by_room_id(session, meeting_id_or_room)
+    if not meeting:
+        raise NotFoundError("Meeting not found")
+    return meeting
+
+
+@router.get(
+    "/{meeting_id}/patient-documents",
+    response_model=List[MeetingDocumentResponse],
+    summary="List patient documents attached to a meeting",
+    description=(
+        "Returns all patient medical documents that the patient selected "
+        "to share when booking this appointment. Only accessible by the "
+        "consulting doctor, the patient, or a SaaS admin."
+    ),
+)
+async def get_meeting_patient_documents(
+    meeting_id: str,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> List[MeetingDocumentResponse]:
+    # Fetch meeting and verify access
+    meeting = await _resolve_meeting(session, meeting_id)
+
+    if (
+        user.id not in (meeting.doctor_id, meeting.patient_id)
+        and user.role != UserRole.SAAS_ADMIN
+    ):
+        raise AuthorizationError("You are not authorized to access this meeting's documents")
+
+    # Fetch attached documents
+    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting.id)
+
+    result = []
+    for md in meeting_docs:
+        pd = md.patient_document
+        if pd:
+            result.append(
+                MeetingDocumentResponse(
+                    id=md.id,
+                    meeting_id=md.meeting_id,
+                    patient_document_id=md.patient_document_id,
+                    label=pd.label,
+                    original_filename=pd.original_filename,
+                    file_size=pd.file_size,
+                    mime_type=pd.mime_type,
+                    uploaded_at=pd.created_at,
+                    ai_summary=pd.ai_summary,
+                    ai_summary_status=pd.ai_summary_status,
+                    ai_summary_generated_at=pd.ai_summary_generated_at,
+                )
+            )
+
+    return result
+
+
+@router.get(
+    "/{meeting_id}/patient-documents/{document_id}/download",
+    summary="Download or view a patient document attached to a meeting",
+    description=(
+        "Download or view a specific patient medical document attached to "
+        "this meeting. Set inline=true for in-browser viewing. Only the consulting "
+        "doctor, the patient, or a SaaS admin can access the document."
+    ),
+)
+async def download_meeting_patient_document(
+    meeting_id: str,
+    document_id: uuid.UUID,
+    inline: bool = False,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+):
+    # Fetch meeting and verify access
+    meeting = await _resolve_meeting(session, meeting_id)
+
+    if (
+        user.id not in (meeting.doctor_id, meeting.patient_id)
+        and user.role != UserRole.SAAS_ADMIN
+    ):
+        raise AuthorizationError("You are not authorized to access this meeting's documents")
+
+    # Verify the document is actually attached to this meeting (check both patient_document_id and md.id)
+    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting.id)
+    target_doc = None
+    for md in meeting_docs:
+        if md.patient_document_id == document_id or md.id == document_id:
+            target_doc = md.patient_document
+            break
+
+    if not target_doc:
+        raise NotFoundError(
+            "Document not found or not attached to this meeting"
+        )
+
+    if not os.path.exists(target_doc.file_path):
+        raise NotFoundError("Document file not found on server")
+
+    content_disposition_type = "inline" if inline else "attachment"
+    return FileResponse(
+        path=target_doc.file_path,
+        media_type=target_doc.mime_type,
+        filename=target_doc.original_filename,
+        content_disposition_type=content_disposition_type,
+    )
+
+
+@router.post(
+    "/{meeting_id}/patient-documents/{document_id}/summarize",
+    response_model=DocumentSummaryResponse,
+    summary="Summarize an attached patient document using Groq LLM",
+    description=(
+        "Extracts text or image from an attached document and generates a structured "
+        "clinical summary using Groq LLM (or Vision API for scanned documents/images). "
+        "Gracefully handles blurry or unreadable files. Accessible by the consulting doctor or admin."
+    ),
+)
+async def summarize_meeting_patient_document(
+    meeting_id: str,
+    document_id: uuid.UUID,
+    force_refresh: bool = True,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> DocumentSummaryResponse:
+    # Verify meeting and doctor access
+    meeting = await _resolve_meeting(session, meeting_id)
+
+    if user.id != meeting.doctor_id and user.role != UserRole.SAAS_ADMIN:
+        raise AuthorizationError(
+            "Only the consulting doctor or SaaS admin can summarize consultation documents"
+        )
+
+    # Verify the document is actually attached to this meeting
+    meeting_docs = await MeetingRepository.get_meeting_documents(session, meeting.id)
+    actual_pd_id = None
+    for md in meeting_docs:
+        if md.patient_document_id == document_id or md.id == document_id:
+            actual_pd_id = md.patient_document_id
+            break
+
+    if not actual_pd_id:
+        raise NotFoundError("Document not found or not attached to this meeting")
+
+    return await DocumentAIService.summarize_patient_document(
+        session=session,
+        document_id=actual_pd_id,
+        meeting_id=meeting.id,
+        force_refresh=force_refresh,
+    )
