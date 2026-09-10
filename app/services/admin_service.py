@@ -180,9 +180,11 @@ class AdminService:
                 )
             )
 
+        counts_obj = DoctorStatusCounts(**counts)
         return AllDoctorsListResponse(
             total=filtered_total,
-            counts=DoctorStatusCounts(**counts),
+            counts=counts_obj,
+            status_counts=counts_obj,
             items=items,
         )
 

@@ -30,6 +30,10 @@ from app.models.user import User
 
 settings = get_settings()
 
+import os
+import tempfile
+from unittest.mock import patch
+
 from sqlalchemy.pool import NullPool
 
 # ── Test Database Engine ─────────────────────────────────────────────────────
@@ -51,12 +55,26 @@ test_session_maker = async_sessionmaker(
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_test_upload_dir():
+    """
+    Isolate uploaded patient documents during test runs into a temporary directory.
+    Automatically cleaned up after tests, preventing pollution of the real uploads/ dir.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_patient_dir = os.path.join(temp_dir, "patient_documents")
+        os.makedirs(temp_patient_dir, exist_ok=True)
+        with patch("app.services.patient_document_service.PATIENT_DOCUMENTS_DIR", temp_patient_dir):
+            yield temp_patient_dir
+
+
 @pytest_asyncio.fixture(scope="session")
 def event_loop():
     """Create a single event loop for the entire test session."""
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)

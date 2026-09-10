@@ -77,6 +77,9 @@ class DoctorDirectoryItemResponse(BaseModel):
     years_of_experience: Optional[int] = None
     bio: Optional[str] = None
     available_slots_count: int = 0
+    average_rating: Optional[float] = None
+    total_ratings: int = 0
+
 
 
 # ── Meeting Booking Schemas ──────────────────────────────────────────────────

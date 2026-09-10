@@ -150,7 +150,11 @@ class MeetingRepository:
                     User.is_active.is_(True),
                 )
             )
-            .order_by(DoctorProfile.full_name.asc())
+            .order_by(
+                DoctorProfile.average_rating.desc().nulls_last(),
+                DoctorProfile.total_ratings.desc(),
+                DoctorProfile.full_name.asc(),
+            )
         )
 
         result = await session.execute(query)

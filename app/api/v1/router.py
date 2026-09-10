@@ -12,6 +12,8 @@ from app.api.v1.meetings import router as meetings_router
 from app.api.v1.patient import router as patient_router
 from app.api.v1.patient_documents import router as patient_documents_router
 from app.api.v1.patient_meeting_docs import router as patient_meeting_docs_router
+from app.api.v1.prescriptions import router as prescriptions_router
+from app.api.v1.ratings import router as ratings_router
 
 api_v1_router = APIRouter(prefix="/api/v1")
 
@@ -38,3 +40,9 @@ api_v1_router.include_router(patient_documents_router)
 
 # Meeting-specific patient document access (for doctors)
 api_v1_router.include_router(patient_meeting_docs_router)
+
+# Doctor ratings & patient feedback
+api_v1_router.include_router(ratings_router)
+
+# Medical prescriptions & dosage schedules
+api_v1_router.include_router(prescriptions_router)

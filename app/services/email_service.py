@@ -138,3 +138,106 @@ class EmailService:
         except Exception as e:
             logger.error(f"otp_email_failed: to={to_email} purpose={purpose} error={str(e)}")
             raise
+
+    @staticmethod
+    async def send_medicine_reminder_email(
+        to_email: str,
+        patient_name: str,
+        doctor_name: str,
+        medicine_name: str,
+        slot_name: str,
+        time_str: str,
+        before_meal: bool,
+    ) -> bool:
+        """
+        Send a scheduled medicine reminder email to a patient.
+        """
+        meal_text = "Before meal (Khane se pehle)" if before_meal else "After meal (Khane ke baad)"
+        slot_emoji = {
+            "Morning": "☀️",
+            "Afternoon": "🌤️",
+            "Evening": "🌅",
+            "Night": "🌙",
+        }.get(slot_name, "⏰")
+
+        subject = f"🔔 Medicine Reminder: {medicine_name} ({slot_name}) — MedTrust"
+
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        </head>
+        <body style="margin:0; padding:0; background-color:#f0f4f8; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
+            <div style="max-width:520px; margin:40px auto; background:#ffffff; border-radius:16px; overflow:hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.08);">
+                <!-- Header -->
+                <div style="background: linear-gradient(135deg, #059669 0%, #10b981 100%); padding:32px 40px; text-align:center;">
+                    <h1 style="color:#ffffff; margin:0; font-size:22px; font-weight:700; letter-spacing:-0.3px;">
+                        🏥 MedTrust Medicine Reminder
+                    </h1>
+                    <p style="color: rgba(255,255,255,0.9); margin:6px 0 0; font-size:14px;">
+                        Prescribed by Dr. {doctor_name}
+                    </p>
+                </div>
+
+                <!-- Body -->
+                <div style="padding:36px 40px;">
+                    <p style="color:#334155; font-size:15px; line-height:1.6; margin:0 0 20px;">
+                        Hello <strong>{patient_name}</strong>, it's time to take your prescribed medicine:
+                    </p>
+
+                    <!-- Medicine Card -->
+                    <div style="background: #f0fdf4; border: 2px solid #86efac; border-radius:12px; padding:20px 24px; margin-bottom:24px;">
+                        <div style="font-size:20px; font-weight:700; color:#15803d; margin-bottom:8px;">
+                            💊 {medicine_name}
+                        </div>
+                        <div style="font-size:14px; color:#166534; line-height:1.6;">
+                            <div><strong>Slot:</strong> {slot_emoji} {slot_name} ({time_str})</div>
+                            <div style="margin-top:4px;"><strong>Timing:</strong> {meal_text}</div>
+                        </div>
+                    </div>
+
+                    <div style="background:#fffbeb; border-left:4px solid #f59e0b; padding:12px 16px; border-radius:0 8px 8px 0;">
+                        <p style="color:#92400e; font-size:13px; margin:0; line-height:1.5;">
+                            ⚠️ Please take your medicine strictly as advised by your doctor. If you have questions or experience adverse side effects, contact your doctor immediately.
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Footer -->
+                <div style="background:#f8fafc; padding:20px 40px; text-align:center; border-top:1px solid #e2e8f0;">
+                    <p style="color:#94a3b8; font-size:12px; margin:0;">
+                        © {__import__('datetime').datetime.now().year} MedTrust SaaS Platform — Automated Health Reminders
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        msg = MIMEMultipart("alternative")
+        msg["From"] = f"MedTrust Health <{settings.EMAIL_FROM}>"
+        msg["To"] = to_email
+        msg["Subject"] = subject
+
+        plain_text = f"Medicine Reminder for {patient_name}:\n\nMedicine: {medicine_name}\nTime: {slot_name} at {time_str}\nInstruction: {meal_text}\nPrescribed by Dr. {doctor_name}"
+        msg.attach(MIMEText(plain_text, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+
+        try:
+            await aiosmtplib.send(
+                msg,
+                hostname=settings.SMTP_SERVER,
+                port=settings.SMTP_PORT,
+                username=settings.SMTP_USERNAME,
+                password=settings.SMTP_PASSWORD,
+                start_tls=True,
+            )
+            logger.info(f"medicine_reminder_email_sent: to={to_email} medicine={medicine_name} slot={slot_name}")
+            return True
+        except Exception as e:
+            logger.error(f"medicine_reminder_email_failed: to={to_email} medicine={medicine_name} error={str(e)}")
+            # Do not re-raise in background job so it doesn't crash the scheduler
+            return False
+

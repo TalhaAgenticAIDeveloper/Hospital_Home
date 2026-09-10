@@ -84,11 +84,38 @@ async def save_upload_file(
     return original_filename, stored_filename, str(dest_path), file_size, mime_type
 
 
-def delete_file_from_disk(file_path: str) -> None:
-    """Safely delete a file from disk if it exists."""
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def delete_file_from_disk(file_path: str | Path) -> bool:
+    """
+    Safely delete a file from disk if it exists.
+    Resolves both relative and absolute paths.
+
+    Returns:
+        bool: True if the file existed and was deleted, False otherwise.
+    """
+    if not file_path:
+        return False
+
     try:
         path = Path(file_path)
+        if not path.is_absolute():
+            # Check relative to cwd
+            cwd_path = Path.cwd() / path
+            if cwd_path.exists() and cwd_path.is_file():
+                path = cwd_path
+
         if path.exists() and path.is_file():
             path.unlink()
-    except Exception:
-        pass
+            logger.info(f"Successfully deleted file from disk: {path}")
+            return True
+        else:
+            logger.warning(f"File to delete does not exist on disk: {file_path}")
+            return False
+    except Exception as e:
+        logger.error(f"Error deleting file from disk '{file_path}': {e}", exc_info=True)
+        return False
+

@@ -82,6 +82,7 @@ class AllDoctorsListResponse(BaseModel):
 
     total: int
     counts: DoctorStatusCounts
+    status_counts: Optional[DoctorStatusCounts] = None
     items: List[PendingDoctorListItem]
 
 

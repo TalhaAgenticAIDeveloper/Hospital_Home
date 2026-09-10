@@ -17,6 +17,8 @@ from app.core.database import engine
 from app.core.logging import get_logger
 
 settings = get_settings()
+from app.services.reminder_scheduler import shutdown_scheduler, start_scheduler
+
 logger = get_logger(__name__)
 
 
@@ -27,8 +29,17 @@ async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events."""
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
     logger.info(f"Environment: {settings.APP_ENV}")
+    # Start background medicine reminder scheduler
+    try:
+        start_scheduler()
+    except Exception as e:
+        logger.warning(f"Could not start reminder scheduler on startup: {e}")
     yield
-    # Dispose of the database engine on shutdown
+    # Shutdown scheduler and database engine on shutdown
+    try:
+        shutdown_scheduler()
+    except Exception as e:
+        logger.warning(f"Could not stop reminder scheduler on shutdown: {e}")
     await engine.dispose()
     logger.info("Application shutdown complete")
 
