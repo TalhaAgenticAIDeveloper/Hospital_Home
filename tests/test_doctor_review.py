@@ -2,7 +2,6 @@
 Tests for SaaS Admin doctor application review with feedback.
 """
 
-import io
 import pytest
 from httpx import AsyncClient
 
@@ -15,7 +14,6 @@ from tests.conftest import (
 ADMIN_PENDING_URL = "/api/v1/admin/doctors/pending"
 ADMIN_REVIEW_BASE = "/api/v1/admin/doctors"
 PROFILE_URL = "/api/v1/doctors/profile"
-DOCUMENTS_URL = "/api/v1/doctors/documents"
 SUBMIT_URL = "/api/v1/doctors/submit-application"
 ME_URL = "/api/v1/auth/me"
 
@@ -26,25 +24,20 @@ async def setup_submitted_doctor(client: AsyncClient, email: str = "applicant@ex
     doc_token = doc_auth["access_token"]
     headers = {"Authorization": f"Bearer {doc_token}"}
 
-    # Update profile
+    # Update profile with mandatory verification fields
     profile_payload = {
         "full_name": "Dr. Sarah Connor",
+        "father_name": "John Connor",
+        "pmdc_registration_number": "PMDC-7788-S",
         "phone_number": "+1122334455",
         "specialization": "Neurology",
-        "license_number": "NEURO-7788",
         "years_of_experience": 8,
         "qualification": "MBBS, MD - Neurology",
         "bio": "Specialist in neurological disorders",
     }
     await client.put(PROFILE_URL, json=profile_payload, headers=headers)
 
-    # Upload document
-    files = {
-        "file": ("degree.pdf", io.BytesIO(b"%PDF-1.4 test degree certificate"), "application/pdf"),
-    }
-    await client.post(DOCUMENTS_URL, files=files, data={"document_type": "degree_certificate"}, headers=headers)
-
-    # Submit application
+    # Submit application directly (no documents needed)
     await client.post(SUBMIT_URL, headers=headers)
 
     return doc_auth, doc_token
@@ -52,7 +45,7 @@ async def setup_submitted_doctor(client: AsyncClient, email: str = "applicant@ex
 
 @pytest.mark.asyncio
 async def test_admin_list_and_view_pending_doctors(client: AsyncClient):
-    """Admin should see submitted doctor applications with documents."""
+    """Admin should see submitted doctor applications with PMDC and father name."""
     admin_auth = await create_and_login_admin(client, email="admin1@example.com")
     admin_headers = {"Authorization": f"Bearer {admin_auth['access_token']}"}
 
@@ -66,15 +59,16 @@ async def test_admin_list_and_view_pending_doctors(client: AsyncClient):
     data = list_resp.json()
     assert data["total"] == 1
     assert data["items"][0]["email"] == "doctor1@example.com"
-    assert data["items"][0]["document_count"] == 1
+    assert data["items"][0]["pmdc_registration_number"] == "PMDC-7788-S"
 
     # Admin views doctor detail
     detail_resp = await client.get(f"{ADMIN_REVIEW_BASE}/{doctor_user_id}", headers=admin_headers)
     assert detail_resp.status_code == 200
     detail = detail_resp.json()
     assert detail["full_name"] == "Dr. Sarah Connor"
+    assert detail["father_name"] == "John Connor"
+    assert detail["pmdc_registration_number"] == "PMDC-7788-S"
     assert detail["specialization"] == "Neurology"
-    assert len(detail["documents"]) == 1
 
 
 @pytest.mark.asyncio
@@ -97,7 +91,7 @@ async def test_admin_reject_with_feedback_and_doctor_views_feedback(client: Asyn
     assert err_resp.status_code == 422
 
     # 2. Admin rejects with valid feedback reason
-    feedback_text = "Degree certificate is unclear. Please provide an official attested copy."
+    feedback_text = "PMDC registration number could not be verified on the portal. Please provide your correct PMDC number."
     review_payload = {
         "action": "reject",
         "feedback": feedback_text,
@@ -119,11 +113,13 @@ async def test_admin_reject_with_feedback_and_doctor_views_feedback(client: Asyn
     assert me_data["status"] == "rejected"
     assert me_data["doctor_profile"]["admin_feedback"] == feedback_text
 
-    # 4. Doctor uploads a new document and re-submits
-    files = {
-        "file": ("new_degree.pdf", io.BytesIO(b"%PDF-1.4 attested clear degree"), "application/pdf"),
+    # 4. Doctor updates PMDC registration number and re-submits
+    update_payload = {
+        "full_name": "Dr. Sarah Connor",
+        "father_name": "John Connor",
+        "pmdc_registration_number": "PMDC-9999-VERIFIED",
     }
-    await client.post(DOCUMENTS_URL, files=files, data={"document_type": "degree_certificate"}, headers=doc_headers)
+    await client.put(PROFILE_URL, json=update_payload, headers=doc_headers)
 
     resubmit_resp = await client.post(SUBMIT_URL, headers=doc_headers)
     assert resubmit_resp.status_code == 200
@@ -147,7 +143,7 @@ async def test_admin_approves_doctor(client: AsyncClient):
 
     approve_payload = {
         "action": "approve",
-        "feedback": "All credentials verified successfully.",
+        "feedback": "PMDC registration and credentials verified successfully.",
     }
     review_resp = await client.post(
         f"{ADMIN_REVIEW_BASE}/{doc_user_id}/review",

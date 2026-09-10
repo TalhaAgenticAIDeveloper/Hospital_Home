@@ -102,20 +102,20 @@ async def test_nonexistent_email(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_pending_doctor_cannot_login(client: AsyncClient):
-    """Doctor with pending status should not be able to login."""
+    """Doctor with pending status can login to access onboarding portal."""
     await create_test_user(client, email="pending@example.com", role="doctor")
 
     response = await client.post(
         LOGIN_URL,
         json={"email": "pending@example.com", "password": "TestPassword123!"},
     )
-    assert response.status_code == 403
-    assert "pending" in response.json()["detail"].lower()
+    assert response.status_code == 200
+    assert response.json()["user"]["status"] == "pending"
 
 
 @pytest.mark.asyncio
 async def test_rejected_doctor_cannot_login(client: AsyncClient):
-    """Doctor with rejected status should not be able to login."""
+    """Doctor with rejected status can login to access revision portal."""
     await create_test_user(client, email="rejected@example.com", role="doctor")
 
     async with test_session_maker() as session:
@@ -131,7 +131,8 @@ async def test_rejected_doctor_cannot_login(client: AsyncClient):
         LOGIN_URL,
         json={"email": "rejected@example.com", "password": "TestPassword123!"},
     )
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert response.json()["user"]["status"] == "rejected"
 
 
 @pytest.mark.asyncio

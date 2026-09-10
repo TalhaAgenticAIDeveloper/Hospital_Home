@@ -7,7 +7,7 @@ the doctor domain to evolve independently.
 
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
@@ -17,7 +17,6 @@ from app.core.database import Base
 from app.models.base import TimestampMixin
 
 if TYPE_CHECKING:
-    from app.models.doctor_document import DoctorDocument
     from app.models.user import User
 
 
@@ -47,10 +46,18 @@ class DoctorProfile(TimestampMixin, Base):
         nullable=False,
     )
 
-    # ── Professional Information ─────────────────────────────────────────
+    # ── Mandatory Verification Information ───────────────────────────────
     full_name: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, default=None,
     )
+    father_name: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, default=None,
+    )
+    pmdc_registration_number: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, default=None,
+    )
+
+    # ── Professional Information ─────────────────────────────────────────
     phone_number: Mapped[Optional[str]] = mapped_column(
         String(20), nullable=True, default=None,
     )
@@ -95,12 +102,6 @@ class DoctorProfile(TimestampMixin, Base):
         back_populates="doctor_profile",
         foreign_keys=[user_id],
     )
-    documents: Mapped[List["DoctorDocument"]] = relationship(
-        "DoctorDocument",
-        back_populates="doctor_profile",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
 
     def __repr__(self) -> str:
-        return f"<DoctorProfile id={self.id} user_id={self.user_id}>"
+        return f"<DoctorProfile id={self.id} user_id={self.user_id} pmdc={self.pmdc_registration_number}>"

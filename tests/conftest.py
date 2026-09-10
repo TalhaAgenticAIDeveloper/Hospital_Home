@@ -8,6 +8,7 @@ Each test function gets a fresh database state.
 """
 
 import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import AsyncGenerator
 
 import pytest
@@ -82,8 +83,8 @@ async def clean_tables():
     async with test_session_maker() as session:
         await session.execute(text("DELETE FROM meetings"))
         await session.execute(text("DELETE FROM doctor_availabilities"))
-        await session.execute(text("DELETE FROM doctor_documents"))
         await session.execute(text("DELETE FROM doctor_profiles"))
+        await session.execute(text("DELETE FROM email_verifications"))
         await session.execute(text("DELETE FROM refresh_tokens"))
         await session.execute(text("DELETE FROM users"))
         await session.commit()
@@ -125,6 +126,21 @@ async def create_test_user(
     role: str = "patient",
 ) -> dict:
     """Helper to create a test user via the signup endpoint."""
+    from app.models.email_verification import EmailVerification
+    from app.core.security import hash_token
+
+    # Pre-verify the email so signup succeeds in tests
+    async with test_session_maker() as session:
+        v = EmailVerification(
+            email=email.lower().strip(),
+            otp_hash=hash_token("123456"),
+            purpose="signup",
+            is_used=True,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        session.add(v)
+        await session.commit()
+
     response = await client.post(
         "/api/v1/auth/signup",
         json={

@@ -1,21 +1,26 @@
 """
-Authentication service — business logic for signup, login, refresh, and logout.
+Authentication service — business logic for signup, login, refresh, logout,
+email OTP verification, and password reset.
 
 Orchestrates repositories and security utilities. All database operations
 within a single business action are transactional.
 """
 
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timedelta, timezone
 
 from jose import JWTError
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.exceptions import (
     AccountInactiveError,
     AuthenticationError,
     AuthorizationError,
     ConflictError,
+    ValidationError,
 )
 from app.core.logging import get_logger
 from app.core.security import (
@@ -27,6 +32,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models.doctor_profile import DoctorProfile
+from app.models.email_verification import EmailVerification
 from app.models.enums import UserRole, UserStatus
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
@@ -42,12 +48,140 @@ from app.schemas.auth import (
     TokenResponse,
 )
 from app.schemas.user import UserBriefResponse
+from app.services.email_service import EmailService
 
 logger = get_logger(__name__)
+settings = get_settings()
 
 
 class AuthService:
     """Handles patient/doctor authentication workflows."""
+
+    # ── OTP Helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _hash_otp(otp: str) -> str:
+        """SHA-256 hash an OTP for secure storage."""
+        return hashlib.sha256(otp.encode("utf-8")).hexdigest()
+
+    # ── Send OTP ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def send_otp(
+        session: AsyncSession, email: str, purpose: str
+    ) -> dict:
+        """
+        Generate and send an OTP to the given email.
+
+        For signup: checks that email is NOT already registered.
+        For reset_password: checks that email IS registered.
+
+        Invalidates any previous unused OTPs for the same email+purpose.
+        """
+        normalized_email = email.lower().strip()
+
+        # Purpose-specific validation
+        if purpose == "signup":
+            if await UserRepository.email_exists(session, normalized_email):
+                raise ConflictError(
+                    detail="An account with this email already exists"
+                )
+        elif purpose == "reset_password":
+            user = await UserRepository.get_by_email(session, normalized_email)
+            if not user:
+                # Return success to prevent email enumeration
+                return {"message": "If this email is registered, you will receive a verification code."}
+
+        # Invalidate any previous unused OTPs for this email+purpose
+        stmt = (
+            select(EmailVerification)
+            .where(
+                EmailVerification.email == normalized_email,
+                EmailVerification.purpose == purpose,
+                EmailVerification.is_used == False,
+            )
+        )
+        result = await session.execute(stmt)
+        old_otps = result.scalars().all()
+        for old_otp in old_otps:
+            old_otp.is_used = True
+
+        # Generate new OTP
+        otp_code = EmailService.generate_otp()
+        otp_hash = AuthService._hash_otp(otp_code)
+
+        # Create verification record
+        verification = EmailVerification(
+            email=normalized_email,
+            otp_hash=otp_hash,
+            purpose=purpose,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.OTP_EXPIRE_MINUTES),
+        )
+        session.add(verification)
+
+        try:
+            await session.flush()
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+        # Send email (after commit so we don't send on DB failure)
+        try:
+            await EmailService.send_otp_email(normalized_email, otp_code, purpose)
+        except Exception as e:
+            logger.error(f"send_otp_email_failed: {str(e)}")
+            raise ValidationError(
+                detail="Failed to send verification email. Please check your email address and try again."
+            )
+
+        logger.info(f"otp_sent: email={normalized_email} purpose={purpose}")
+        return {"message": "Verification code sent to your email."}
+
+    # ── Verify OTP ───────────────────────────────────────────────────────
+
+    @staticmethod
+    async def verify_otp(
+        session: AsyncSession, email: str, otp: str, purpose: str
+    ) -> dict:
+        """
+        Verify an OTP for the given email and purpose.
+
+        Raises:
+            AuthenticationError: If OTP is invalid, expired, or already used.
+        """
+        normalized_email = email.lower().strip()
+        otp_hash = AuthService._hash_otp(otp)
+
+        # Find matching OTP record
+        stmt = (
+            select(EmailVerification)
+            .where(
+                EmailVerification.email == normalized_email,
+                EmailVerification.otp_hash == otp_hash,
+                EmailVerification.purpose == purpose,
+                EmailVerification.is_used == False,
+            )
+            .order_by(EmailVerification.created_at.desc())
+        )
+        result = await session.execute(stmt)
+        record = result.scalar_one_or_none()
+
+        if not record:
+            raise AuthenticationError(detail="Invalid verification code. Please check and try again.")
+
+        # Check expiration
+        if record.expires_at < datetime.now(timezone.utc):
+            record.is_used = True
+            await session.commit()
+            raise AuthenticationError(detail="Verification code has expired. Please request a new one.")
+
+        # Mark as used
+        record.is_used = True
+        await session.commit()
+
+        logger.info(f"otp_verified: email={normalized_email} purpose={purpose}")
+        return {"message": "Email verified successfully.", "verified": True}
 
     # ── Signup ───────────────────────────────────────────────────────────
 
@@ -73,6 +207,31 @@ class AuthService:
         # App-level uniqueness check (DB constraint is the real safety net)
         if await UserRepository.email_exists(session, normalized_email):
             raise ConflictError(detail="An account with this email already exists")
+
+        # Verify that email was OTP-verified for signup
+        stmt = (
+            select(EmailVerification)
+            .where(
+                EmailVerification.email == normalized_email,
+                EmailVerification.purpose == "signup",
+                EmailVerification.is_used == True,
+            )
+            .order_by(EmailVerification.created_at.desc())
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        verification = result.scalar_one_or_none()
+
+        if not verification:
+            raise ValidationError(
+                detail="Email not verified. Please verify your email with an OTP first."
+            )
+
+        # Check that verification was recent (within 30 minutes)
+        if verification.created_at < datetime.now(timezone.utc) - timedelta(minutes=30):
+            raise ValidationError(
+                detail="Email verification has expired. Please verify your email again."
+            )
 
         # Determine initial status based on role
         initial_status = (
@@ -108,7 +267,7 @@ class AuthService:
         status_message = (
             "Patient account created successfully"
             if data.role == UserRole.PATIENT.value
-            else "Doctor account created successfully. Please log in to complete your profile and upload verification documents."
+            else "Doctor account created successfully. Please log in to complete your profile for PMDC verification."
         )
 
         return SignupResponse(
@@ -195,6 +354,78 @@ class AuthService:
                 status=user.status.value,
             ),
         )
+
+    # ── Forgot / Reset Password ──────────────────────────────────────────
+
+    @staticmethod
+    async def send_reset_otp(session: AsyncSession, email: str) -> dict:
+        """
+        Send a password-reset OTP. Delegates to send_otp with purpose='reset_password'.
+
+        Always returns a success message to prevent email enumeration.
+        """
+        return await AuthService.send_otp(session, email, purpose="reset_password")
+
+    @staticmethod
+    async def reset_password(
+        session: AsyncSession, email: str, otp: str, new_password: str
+    ) -> dict:
+        """
+        Reset a user's password after OTP verification.
+
+        Verifies the OTP, then updates the user's password hash.
+
+        Raises:
+            AuthenticationError: If OTP is invalid.
+            ValidationError: If user not found (shouldn't happen after OTP verify).
+        """
+        normalized_email = email.lower().strip()
+        otp_hash = AuthService._hash_otp(otp)
+
+        # Find and verify the OTP
+        stmt = (
+            select(EmailVerification)
+            .where(
+                EmailVerification.email == normalized_email,
+                EmailVerification.otp_hash == otp_hash,
+                EmailVerification.purpose == "reset_password",
+                EmailVerification.is_used == False,
+            )
+            .order_by(EmailVerification.created_at.desc())
+        )
+        result = await session.execute(stmt)
+        record = result.scalar_one_or_none()
+
+        if not record:
+            raise AuthenticationError(detail="Invalid or expired verification code.")
+
+        if record.expires_at < datetime.now(timezone.utc):
+            record.is_used = True
+            await session.commit()
+            raise AuthenticationError(detail="Verification code has expired. Please request a new one.")
+
+        # Mark OTP as used
+        record.is_used = True
+
+        # Update user password
+        user = await UserRepository.get_by_email(session, normalized_email)
+        if not user:
+            raise ValidationError(detail="Account not found.")
+
+        user.password_hash = hash_password(new_password)
+
+        try:
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+        # Revoke all refresh tokens for security
+        await TokenRepository.revoke_all_for_user(session, user.id)
+        await session.commit()
+
+        logger.info(f"password_reset_success: email={normalized_email}")
+        return {"message": "Password has been reset successfully. You can now log in with your new password."}
 
     # ── Refresh ──────────────────────────────────────────────────────────
 

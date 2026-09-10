@@ -34,7 +34,6 @@ from app.schemas.admin import (
     PendingDoctorListResponse,
 )
 from app.schemas.auth import AdminLoginRequest, LoginResponse
-from app.schemas.doctor import DoctorDocumentResponse
 from app.schemas.user import UserBriefResponse
 
 logger = get_logger(__name__)
@@ -136,12 +135,14 @@ class AdminService:
                     user_id=profile.user_id,
                     email=profile.user.email if profile.user else "",
                     full_name=profile.full_name,
+                    father_name=profile.father_name,
+                    pmdc_registration_number=profile.pmdc_registration_number,
                     specialization=profile.specialization,
-                    license_number=profile.license_number,
+                    license_number=profile.license_number or profile.pmdc_registration_number,
                     years_of_experience=profile.years_of_experience,
                     submitted_at=profile.submitted_at,
                     status=profile.user.status.value if profile.user else "pending",
-                    document_count=len(profile.documents),
+                    document_count=0,
                 )
             )
 
@@ -168,12 +169,14 @@ class AdminService:
                     user_id=profile.user_id,
                     email=profile.user.email if profile.user else "",
                     full_name=profile.full_name,
+                    father_name=profile.father_name,
+                    pmdc_registration_number=profile.pmdc_registration_number,
                     specialization=profile.specialization,
-                    license_number=profile.license_number,
+                    license_number=profile.license_number or profile.pmdc_registration_number,
                     years_of_experience=profile.years_of_experience,
                     submitted_at=profile.submitted_at,
                     status=profile.user.status.value if profile.user else "pending",
-                    document_count=len(profile.documents),
+                    document_count=0,
                 )
             )
 
@@ -213,19 +216,18 @@ class AdminService:
             email=user.email,
             status=user.status.value,
             full_name=profile.full_name,
+            father_name=profile.father_name,
+            pmdc_registration_number=profile.pmdc_registration_number,
             phone_number=profile.phone_number,
             specialization=profile.specialization,
-            license_number=profile.license_number,
+            license_number=profile.license_number or profile.pmdc_registration_number,
             years_of_experience=profile.years_of_experience,
             qualification=profile.qualification,
             bio=profile.bio,
             submitted_at=profile.submitted_at,
             admin_feedback=profile.admin_feedback,
             reviewed_at=profile.reviewed_at,
-            documents=[
-                DoctorDocumentResponse.model_validate(doc)
-                for doc in profile.documents
-            ],
+            documents=[],
         )
 
     @staticmethod

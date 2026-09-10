@@ -8,8 +8,6 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.schemas.doctor import DoctorDocumentResponse
-
 
 class DoctorReviewRequest(BaseModel):
     """
@@ -55,6 +53,8 @@ class PendingDoctorListItem(BaseModel):
     user_id: UUID
     email: str
     full_name: Optional[str] = None
+    father_name: Optional[str] = None
+    pmdc_registration_number: Optional[str] = None
     specialization: Optional[str] = None
     license_number: Optional[str] = None
     years_of_experience: Optional[int] = None
@@ -86,7 +86,7 @@ class AllDoctorsListResponse(BaseModel):
 
 
 class PendingDoctorDetailResponse(BaseModel):
-    """Detailed doctor profile and uploaded documents for admin review."""
+    """Detailed doctor profile for admin review."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -95,6 +95,8 @@ class PendingDoctorDetailResponse(BaseModel):
     email: str
     status: str
     full_name: Optional[str] = None
+    father_name: Optional[str] = None
+    pmdc_registration_number: Optional[str] = None
     phone_number: Optional[str] = None
     specialization: Optional[str] = None
     license_number: Optional[str] = None
@@ -104,4 +106,4 @@ class PendingDoctorDetailResponse(BaseModel):
     submitted_at: Optional[datetime] = None
     admin_feedback: Optional[str] = None
     reviewed_at: Optional[datetime] = None
-    documents: List[DoctorDocumentResponse] = []
+    documents: List = []

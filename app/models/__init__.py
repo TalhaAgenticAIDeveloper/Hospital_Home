@@ -3,9 +3,9 @@ Models package — import all models here so Alembic can discover them.
 """
 
 from app.models.doctor_availability import DoctorAvailability
-from app.models.doctor_document import DoctorDocument
+from app.models.email_verification import EmailVerification
 from app.models.doctor_profile import DoctorProfile
-from app.models.enums import DocumentType, MeetingStatus, UserRole, UserStatus
+from app.models.enums import MeetingStatus, UserRole, UserStatus
 from app.models.meeting import Meeting
 from app.models.meeting_document import MeetingDocument
 from app.models.patient_document import PatientDocument
@@ -18,8 +18,8 @@ __all__ = [
     "User",
     "RefreshToken",
     "DoctorProfile",
-    "DoctorDocument",
     "DoctorAvailability",
+    "EmailVerification",
     "Meeting",
     "MeetingDocument",
     "PatientDocument",
@@ -27,7 +27,5 @@ __all__ = [
     "DoctorWeeklySchedule",
     "UserRole",
     "UserStatus",
-    "DocumentType",
     "MeetingStatus",
 ]
-

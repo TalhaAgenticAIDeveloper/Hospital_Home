@@ -19,15 +19,12 @@ from sqlalchemy import update
 
 from app.models.enums import UserRole, UserStatus
 from app.models.user import User
-from tests.conftest import test_session_maker
+from tests.conftest import test_session_maker, create_test_user
 
 
 async def create_and_login_patient(client: AsyncClient, email: str = "patient_doc@example.com") -> dict:
     """Helper to create and log in a patient user."""
-    await client.post(
-        "/api/v1/auth/signup",
-        json={"email": email, "password": "PatientPassword123!", "role": "patient"},
-    )
+    await create_test_user(client, email=email, password="PatientPassword123!", role="patient")
     login_resp = await client.post(
         "/api/v1/auth/login",
         json={"email": email, "password": "PatientPassword123!"},
@@ -37,10 +34,7 @@ async def create_and_login_patient(client: AsyncClient, email: str = "patient_do
 
 async def create_active_doctor(client: AsyncClient, email: str = "doc_doc@example.com") -> dict:
     """Helper to create an active doctor user with profile."""
-    await client.post(
-        "/api/v1/auth/signup",
-        json={"email": email, "password": "DoctorPassword123!", "role": "doctor"},
-    )
+    await create_test_user(client, email=email, password="DoctorPassword123!", role="doctor")
     async with test_session_maker() as session:
         stmt = update(User).where(User.email == email).values(status=UserStatus.ACTIVE)
         await session.execute(stmt)

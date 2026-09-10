@@ -159,7 +159,7 @@ async def download_meeting_patient_document(
 async def summarize_meeting_patient_document(
     meeting_id: str,
     document_id: uuid.UUID,
-    force_refresh: bool = True,
+    force_refresh: bool = False,
     user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> DocumentSummaryResponse:

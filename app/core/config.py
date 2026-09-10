@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     PASSWORD_MAX_LENGTH: int = 128
 
     # ── File Uploads ──────────────────────────────────────────────────────
-    UPLOAD_DIR: str = "uploads/doctor_documents"
+    UPLOAD_DIR: str = "uploads/documents"
     MAX_UPLOAD_SIZE_MB: int = 10
     ALLOWED_UPLOAD_TYPES: str = "application/pdf,image/jpeg,image/png"
 
@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     GROQ_VISION_MODEL: Optional[str] = None
     GROQ_SCAN_MODEL: Optional[str] = None
+
+    # ── Email / SMTP ─────────────────────────────────────────────────────
+    EMAIL_FROM: str = ""
+    SMTP_SERVER: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+
+    # ── OTP Settings ─────────────────────────────────────────────────────
+    OTP_EXPIRE_MINUTES: int = 5
 
     # ── Test Database ────────────────────────────────────────────────────
     TEST_DATABASE_URL: str = ""
