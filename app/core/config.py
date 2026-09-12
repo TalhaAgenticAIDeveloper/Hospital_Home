@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # ── Security & CORS ──────────────────────────────────────────────────
-    CORS_ORIGINS: str = "http://localhost:3000"
+    CORS_ORIGINS: str = "http://localhost:5173"
 
     # ── Password Policy ──────────────────────────────────────────────────
     PASSWORD_MIN_LENGTH: int = 8
