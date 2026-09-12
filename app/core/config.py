@@ -65,6 +65,17 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     GROQ_VISION_MODEL: Optional[str] = None
     GROQ_SCAN_MODEL: Optional[str] = None
+    GROQ_WHISPER_MODEL: str = "whisper-large-v3-turbo"
+
+    # ── Consultation AI Configuration ────────────────────────────────────
+    CONSULTATION_AUDIO_DIR: str = "uploads/consultation_audio"
+    CONSULTATION_MAX_AUDIO_SIZE_MB: int = 25
+    AI_CHUNK_MAX_TOKENS: int = 6000
+    AI_CHUNK_OVERLAP_TOKENS: int = 500
+    AI_MAX_CONCURRENT_CHUNKS: int = 3
+    AI_LLM_TIMEOUT_SECONDS: int = 90
+    AI_LLM_MAX_RETRIES: int = 2
+    AI_WHISPER_TIMEOUT_SECONDS: int = 120
 
     # ── Email / SMTP ─────────────────────────────────────────────────────
     EMAIL_FROM: str = ""

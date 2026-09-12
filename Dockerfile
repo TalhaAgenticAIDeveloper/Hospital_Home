@@ -1,54 +1,64 @@
-# ── Build Stage ──────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS base
+# ==============================================================================
+# Healthcare SaaS Backend Dockerfile
+# Python 3.12 (Debian Bookworm Slim)
+# ==============================================================================
 
-# Prevent Python from buffering stdout/stderr
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+FROM python:3.12-slim
 
-WORKDIR /app
-
-# Install system dependencies for argon2-cffi
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libffi-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# ── Runtime Stage ────────────────────────────────────────────────────────────
-FROM python:3.12-slim AS runtime
-
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Prevent Python from writing bytecode files (.pyc) and buffer stdout/stderr
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
-# Install runtime dependencies for argon2
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends libffi8 && \
-    rm -rf /var/lib/apt/lists/*
+# Install system dependencies:
+# - curl: needed for container healthchecks
+# - gcc, libpq-dev, libffi-dev: C build tools and headers
+# - netcat-openbsd: networking utility
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    gcc \
+    libpq-dev \
+    libffi-dev \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy installed packages from build stage
-COPY --from=base /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=base /usr/local/bin /usr/local/bin
+# Optimize Docker layer caching: install Python dependencies first
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip && \
+    pip install -r /app/requirements.txt
 
-# Create non-root user
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Create a dedicated non-root user and group
+RUN groupadd -g 1000 appgroup && \
+    useradd -u 1000 -g appgroup -m -s /bin/bash appuser
 
-# Copy application code
-COPY . .
+# Copy application code into container
+COPY . /app
 
-# Change ownership
-RUN chown -R appuser:appuser /app
+# Ensure start.sh has Unix line endings (LF) and executable permissions
+RUN sed -i 's/\r$//' /app/start.sh && \
+    chmod +x /app/start.sh
 
+# Create upload directory structure and assign ownership to appuser
+RUN mkdir -p /app/uploads/documents \
+             /app/uploads/doctor_documents \
+             /app/uploads/consultation_audio \
+             /app/uploads/patient_documents \
+             /app/uploads/meeting_transcripts && \
+    chown -R appuser:appgroup /app
+
+# Run as non-root user for security
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
-
+# Expose FastAPI application port
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Container healthcheck using FastAPI /health endpoint
+HEALTHCHECK --interval=20s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Start container via startup script
+ENTRYPOINT ["/app/start.sh"]

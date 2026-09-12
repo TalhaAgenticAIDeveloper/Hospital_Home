@@ -108,3 +108,33 @@ class PendingDoctorDetailResponse(BaseModel):
     admin_feedback: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     documents: List = []
+
+
+class PatientAdminListItem(BaseModel):
+    """Patient summary for SaaS Admin management."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    patient_id: Optional[UUID] = None
+    user_id: UUID
+    email: str
+    status: str
+    is_active: bool
+    full_name: Optional[str] = None
+    phone_number: Optional[str] = None
+    age: Optional[int] = None
+    date_of_birth: Optional[str] = None
+    gender: Optional[str] = None
+    blood_group: Optional[str] = None
+    address: Optional[str] = None
+    created_at: Optional[datetime] = None
+    consultations_count: int = 0
+    documents_count: int = 0
+
+
+class PatientAdminListResponse(BaseModel):
+    """Paginated list of patients for SaaS Admin."""
+
+    total: int
+    items: List[PatientAdminListItem]
+

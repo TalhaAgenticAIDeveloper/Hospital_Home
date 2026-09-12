@@ -25,6 +25,7 @@ from app.models.saas_admin import SaaSAdmin
 from app.models.user import User
 from app.repositories.admin_token_repository import AdminTokenRepository
 from app.repositories.doctor_repository import DoctorRepository
+from app.repositories.patient_repository import PatientRepository
 from app.repositories.saas_admin_repository import SaaSAdminRepository
 from app.repositories.token_repository import TokenRepository
 from app.repositories.user_repository import UserRepository
@@ -33,6 +34,8 @@ from app.schemas.admin import (
     DoctorReviewRequest,
     DoctorReviewResponse,
     DoctorStatusCounts,
+    PatientAdminListItem,
+    PatientAdminListResponse,
     PendingDoctorDetailResponse,
     PendingDoctorListItem,
     PendingDoctorListResponse,
@@ -289,3 +292,31 @@ class AdminService:
             admin_feedback=profile.admin_feedback,
             reviewed_at=now,
         )
+
+    # ── Patient Management ───────────────────────────────────────────────
+
+    @staticmethod
+    async def list_patients(
+        session: AsyncSession,
+        search: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 50,
+    ) -> PatientAdminListResponse:
+        """List all patients with profile data and activity counts for SaaS Admin."""
+        items_raw, total = await PatientRepository.list_patients(
+            session, search=search, skip=skip, limit=limit
+        )
+        items = [PatientAdminListItem(**item) for item in items_raw]
+        return PatientAdminListResponse(total=total, items=items)
+
+    @staticmethod
+    async def delete_patient(
+        session: AsyncSession, patient_user_id: uuid.UUID
+    ) -> dict:
+        """Permanently delete a patient user account and attached resources."""
+        deleted = await PatientRepository.delete_patient(session, patient_user_id)
+        if not deleted:
+            raise NotFoundError(detail="Patient not found")
+        logger.info(f"Patient deleted successfully: patient_user_id={patient_user_id}")
+        return {"message": "Patient account deleted successfully"}
+

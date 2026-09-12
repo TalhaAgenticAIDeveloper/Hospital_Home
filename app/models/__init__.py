@@ -2,6 +2,8 @@
 Models package — import all models here so Alembic can discover them.
 """
 
+from app.models.consultation_ai_extraction import ConsultationAIExtraction
+from app.models.consultation_transcript import ConsultationTranscript
 from app.models.doctor_availability import DoctorAvailability
 from app.models.doctor_rating import DoctorRating
 from app.models.email_verification import EmailVerification
@@ -23,6 +25,8 @@ __all__ = [
     "SaaSAdmin",
     "RefreshToken",
     "AdminRefreshToken",
+    "ConsultationTranscript",
+    "ConsultationAIExtraction",
     "DoctorProfile",
     "DoctorAvailability",
     "DoctorRating",
