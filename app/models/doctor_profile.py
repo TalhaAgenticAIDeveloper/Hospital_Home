@@ -91,7 +91,7 @@ class DoctorProfile(TimestampMixin, Base):
     )
     reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey("saas_admins.id", ondelete="SET NULL"),
         nullable=True,
         default=None,
     )

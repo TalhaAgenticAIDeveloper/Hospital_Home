@@ -31,11 +31,13 @@ from app.core.security import (
     hash_token,
     verify_password,
 )
+from app.models.admin_refresh_token import AdminRefreshToken
 from app.models.doctor_profile import DoctorProfile
 from app.models.email_verification import EmailVerification
 from app.models.enums import UserRole, UserStatus
 from app.models.refresh_token import RefreshToken
 from app.models.user import User
+from app.repositories.admin_token_repository import AdminTokenRepository
 from app.repositories.token_repository import TokenRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import (
@@ -449,7 +451,52 @@ class AuthService:
         if payload.get("type") != "refresh":
             raise AuthenticationError(detail="Invalid token type")
 
-        # Look up stored token hash
+        role = payload.get("role")
+
+        # ── SaaS Admin Refresh Flow ──────────────────────────────────────────
+        if role == UserRole.SAAS_ADMIN.value:
+            stored_admin_token = await AdminTokenRepository.get_by_token_hash(
+                session, hash_token(data.refresh_token)
+            )
+            if not stored_admin_token:
+                raise AuthenticationError(detail="Invalid or expired refresh token")
+
+            if stored_admin_token.is_revoked:
+                await AdminTokenRepository.revoke_all_for_admin(session, stored_admin_token.admin_id)
+                await session.commit()
+                logger.warning("admin_refresh_token_reuse_detected: possible token theft")
+                raise AuthenticationError(detail="Invalid or expired refresh token")
+
+            if stored_admin_token.expires_at < datetime.now(timezone.utc):
+                raise AuthenticationError(detail="Invalid or expired refresh token")
+
+            await AdminTokenRepository.revoke(session, stored_admin_token.id)
+
+            admin_id = payload["sub"]
+            new_access_token = create_access_token(sub=admin_id, role=role)
+            new_refresh_token = create_refresh_token(sub=admin_id, role=role)
+
+            new_decoded = decode_token(new_refresh_token)
+            new_token_record = AdminRefreshToken(
+                admin_id=stored_admin_token.admin_id,
+                token_hash=hash_token(new_refresh_token),
+                expires_at=datetime.fromtimestamp(new_decoded["exp"], tz=timezone.utc),
+            )
+
+            try:
+                await AdminTokenRepository.create(session, new_token_record)
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+            logger.info("admin_token_refresh_success")
+            return TokenResponse(
+                access_token=new_access_token,
+                refresh_token=new_refresh_token,
+            )
+
+        # ── Regular User Refresh Flow ────────────────────────────────────────
         stored_token = await TokenRepository.get_by_token_hash(
             session, hash_token(data.refresh_token)
         )
@@ -515,6 +562,17 @@ class AuthService:
             return
 
         if payload.get("type") != "refresh":
+            return
+
+        role = payload.get("role")
+        if role == UserRole.SAAS_ADMIN.value:
+            stored_admin_token = await AdminTokenRepository.get_by_token_hash(
+                session, hash_token(data.refresh_token)
+            )
+            if stored_admin_token and not stored_admin_token.is_revoked:
+                await AdminTokenRepository.revoke(session, stored_admin_token.id)
+                await session.commit()
+                logger.info("admin_logout_success")
             return
 
         stored_token = await TokenRepository.get_by_token_hash(

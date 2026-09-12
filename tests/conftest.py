@@ -99,6 +99,8 @@ async def clean_tables():
     """
     yield
     async with test_session_maker() as session:
+        await session.execute(text("DELETE FROM admin_refresh_tokens"))
+        await session.execute(text("DELETE FROM saas_admins"))
         await session.execute(text("DELETE FROM meetings"))
         await session.execute(text("DELETE FROM doctor_availabilities"))
         await session.execute(text("DELETE FROM doctor_profiles"))
@@ -106,6 +108,7 @@ async def clean_tables():
         await session.execute(text("DELETE FROM refresh_tokens"))
         await session.execute(text("DELETE FROM users"))
         await session.commit()
+
 
 
 @pytest_asyncio.fixture
@@ -212,13 +215,15 @@ async def create_and_login_admin(
     password: str = "AdminPassword123!",
 ) -> dict:
     """Helper to insert and login a SaaS Admin, returning tokens."""
+    from app.models.saas_admin import SaaSAdmin
+
     async with test_session_maker() as session:
-        admin = User(
+        admin = SaaSAdmin(
             email=email.lower().strip(),
             password_hash=hash_password(password),
-            role=UserRole.SAAS_ADMIN,
-            status=UserStatus.ACTIVE,
+            full_name="SaaS Administrator",
             is_active=True,
+            single_admin_lock=True,
         )
         session.add(admin)
         await session.commit()
@@ -228,3 +233,4 @@ async def create_and_login_admin(
         json={"email": email, "password": password},
     )
     return resp.json()
+
