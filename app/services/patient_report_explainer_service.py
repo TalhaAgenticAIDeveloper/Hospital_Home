@@ -285,7 +285,8 @@ class PatientReportExplainerService:
             raise ValidationError("The uploaded file is empty.")
 
         if len(file_bytes) > MAX_FILE_SIZE_BYTES:
-            raise ValidationError("File size exceeds the 20 MB limit.")
+            max_mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
+            raise ValidationError(f"File size exceeds the {max_mb} MB limit.")
 
         ext = os.path.splitext(filename)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
