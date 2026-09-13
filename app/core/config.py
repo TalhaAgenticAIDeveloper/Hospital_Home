@@ -48,14 +48,14 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # ── Security & CORS ──────────────────────────────────────────────────
-    CORS_ORIGINS: str = "http://localhost:3000"
+    CORS_ORIGINS: str = "http://localhost:5173"
 
     # ── Password Policy ──────────────────────────────────────────────────
     PASSWORD_MIN_LENGTH: int = 8
     PASSWORD_MAX_LENGTH: int = 128
 
     # ── File Uploads ──────────────────────────────────────────────────────
-    UPLOAD_DIR: str = "uploads/doctor_documents"
+    UPLOAD_DIR: str = "uploads/documents"
     MAX_UPLOAD_SIZE_MB: int = 10
     ALLOWED_UPLOAD_TYPES: str = "application/pdf,image/jpeg,image/png"
 
@@ -65,6 +65,27 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     GROQ_VISION_MODEL: Optional[str] = None
     GROQ_SCAN_MODEL: Optional[str] = None
+    GROQ_WHISPER_MODEL: str = "whisper-large-v3-turbo"
+
+    # ── Consultation AI Configuration ────────────────────────────────────
+    CONSULTATION_AUDIO_DIR: str = "uploads/consultation_audio"
+    CONSULTATION_MAX_AUDIO_SIZE_MB: int = 25
+    AI_CHUNK_MAX_TOKENS: int = 6000
+    AI_CHUNK_OVERLAP_TOKENS: int = 500
+    AI_MAX_CONCURRENT_CHUNKS: int = 3
+    AI_LLM_TIMEOUT_SECONDS: int = 90
+    AI_LLM_MAX_RETRIES: int = 2
+    AI_WHISPER_TIMEOUT_SECONDS: int = 120
+
+    # ── Email / SMTP ─────────────────────────────────────────────────────
+    EMAIL_FROM: str = ""
+    SMTP_SERVER: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+
+    # ── OTP Settings ─────────────────────────────────────────────────────
+    OTP_EXPIRE_MINUTES: int = 5
 
     # ── Test Database ────────────────────────────────────────────────────
     TEST_DATABASE_URL: str = ""

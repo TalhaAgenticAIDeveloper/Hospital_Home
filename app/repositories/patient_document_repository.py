@@ -93,6 +93,13 @@ class PatientDocumentRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def list_all_stored_filenames(session: AsyncSession) -> set[str]:
+        """Fetch set of all stored_filenames currently registered in the database."""
+        query = select(PatientDocument.stored_filename)
+        result = await session.execute(query)
+        return set(result.scalars().all())
+
+    @staticmethod
     async def delete(
         session: AsyncSession,
         document: PatientDocument,
@@ -100,3 +107,4 @@ class PatientDocumentRepository:
         """Delete a patient document record from the database."""
         await session.delete(document)
         await session.flush()
+

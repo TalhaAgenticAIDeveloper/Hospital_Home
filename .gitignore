@@ -48,3 +48,8 @@ desktop.ini
 
 # Alembic
 migrations/versions/__pycache__/
+
+# Uploads
+uploads/
+
+

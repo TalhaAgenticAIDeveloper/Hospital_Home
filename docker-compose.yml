@@ -1,42 +1,83 @@
-version: "3.9"
+# ==============================================================================
+# Healthcare SaaS Backend - Docker Compose Configuration
+# ==============================================================================
 
 services:
-  # ── PostgreSQL ─────────────────────────────────────────────────────────
+  # ----------------------------------------------------------------------------
+  # FastAPI Application Backend Service
+  # ----------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: healthcare_saas_backend
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    env_file:
+      - .env
+    environment:
+      # Automatically connects to the 'db' container by default.
+      # Can be overridden by setting DOCKER_DATABASE_URL in .env if using a remote or host DB.
+      - DATABASE_URL=${DOCKER_DATABASE_URL:-postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-healthcare_saas}}
+      - APP_ENV=${APP_ENV:-development}
+      - DEBUG=${DEBUG:-true}
+      - HOST=0.0.0.0
+      - PORT=8000
+    volumes:
+      # Mount upload directory to persist files on the host
+      - ./uploads:/app/uploads
+      # Uncomment the following line for hot code reloading during local development:
+      # - ./app:/app/app
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - backend_network
+
+  # ----------------------------------------------------------------------------
+  # PostgreSQL 16 Database Service
+  # ----------------------------------------------------------------------------
   db:
     image: postgres:16-alpine
+    container_name: healthcare_saas_db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-healthcare_saas}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-healthcare_saas}"]
+      interval: 5s
       timeout: 5s
       retries: 5
+      start_period: 10s
+    networks:
+      - backend_network
 
-  # ── FastAPI Application ────────────────────────────────────────────────
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    environment:
-      # Override DATABASE_URL to use the Docker service name
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-healthcare_saas}
-    depends_on:
-      db:
-        condition: service_healthy
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
-
+# ------------------------------------------------------------------------------
+# Persistent Storage Volumes
+# ------------------------------------------------------------------------------
 volumes:
   postgres_data:
-    driver: local
+    name: healthcare_saas_postgres_data
+
+# ------------------------------------------------------------------------------
+# Isolated Bridge Network
+# ------------------------------------------------------------------------------
+networks:
+  backend_network:
+    name: healthcare_saas_network
+    driver: bridge

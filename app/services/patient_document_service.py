@@ -7,7 +7,9 @@ medical history documents. Enforces limits (5 docs max, 50 MB per file).
 
 import os
 import uuid
+from pathlib import Path
 from typing import List
+
 
 from fastapi import HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
@@ -200,3 +202,52 @@ class PatientDocumentService:
             filename=document.original_filename,
             content_disposition_type=content_disposition_type,
         )
+
+    @staticmethod
+    async def cleanup_orphan_files(session: AsyncSession) -> dict:
+        """
+        Scan the patient documents folder and delete files that have no
+        corresponding record in the database.
+
+        Returns:
+            dict: Summary of scanned, deleted, and space reclaimed.
+        """
+        upload_dir = Path(PATIENT_DOCUMENTS_DIR)
+        if not upload_dir.exists():
+            return {
+                "scanned_files": 0,
+                "db_registered": 0,
+                "deleted_orphans": 0,
+                "reclaimed_bytes": 0,
+            }
+
+        db_filenames = await PatientDocumentRepository.list_all_stored_filenames(session)
+        scanned = 0
+        deleted = 0
+        reclaimed_bytes = 0
+
+        for file_path in upload_dir.iterdir():
+            if not file_path.is_file():
+                continue
+            scanned += 1
+            if file_path.name not in db_filenames:
+                try:
+                    file_size = file_path.stat().st_size
+                    if delete_file_from_disk(file_path):
+                        deleted += 1
+                        reclaimed_bytes += file_size
+                except Exception as e:
+                    logger.warning(f"Could not remove orphan file {file_path}: {e}")
+
+        logger.info(
+            f"Patient document cleanup completed: {deleted} orphan files deleted, "
+            f"{reclaimed_bytes} bytes reclaimed."
+        )
+
+        return {
+            "scanned_files": scanned,
+            "db_registered": len(db_filenames),
+            "deleted_orphans": deleted,
+            "reclaimed_bytes": reclaimed_bytes,
+        }
+

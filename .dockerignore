@@ -1,0 +1,52 @@
+# =============================================================================
+# Docker Ignore Configuration
+# =============================================================================
+
+# Version control
+.git/
+.gitignore
+
+# Virtual environments (must never be copied into Linux container)
+venv/
+.venv/
+env/
+ENV/
+
+# Python bytecode & build caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg
+*.egg-info/
+
+# Testing & coverage artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# IDE & editor configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets & local environment files
+.env
+.env.local
+.env.production
+
+# Local media uploads & log files (persisted via Docker volumes)
+uploads/
+*.log

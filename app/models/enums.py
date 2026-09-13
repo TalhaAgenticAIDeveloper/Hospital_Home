@@ -1,5 +1,5 @@
 """
-Enumerations for user roles, account statuses, and document types.
+Enumerations for user roles, account statuses, and meeting statuses.
 
 These are used as both Python enums and PostgreSQL enum types via SQLAlchemy.
 """
@@ -24,16 +24,6 @@ class UserStatus(str, enum.Enum):
     SUSPENDED = "suspended"
 
 
-class DocumentType(str, enum.Enum):
-    """Types of documents a doctor can upload."""
-
-    MEDICAL_LICENSE = "medical_license"
-    DEGREE_CERTIFICATE = "degree_certificate"
-    ID_PROOF = "id_proof"
-    PROFILE_PHOTO = "profile_photo"
-    OTHER = "other"
-
-
 class MeetingStatus(str, enum.Enum):
     """Status lifecycle for doctor-patient meetings."""
 
@@ -41,4 +31,3 @@ class MeetingStatus(str, enum.Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
-

@@ -28,6 +28,7 @@ from app.core.database import async_session_maker
 from app.core.security import hash_password
 from app.models.enums import UserRole, UserStatus
 from app.models.user import User
+from app.repositories.saas_admin_repository import SaaSAdminRepository
 
 settings = get_settings()
 
@@ -91,39 +92,24 @@ async def create_admin():
         print(f"\nError: {error_msg}")
         sys.exit(1)
 
-    # ── Create Admin ─────────────────────────────────────────────────
+    # ── Create or Overwrite SaaS Admin ───────────────────────────────
     async with async_session_maker() as session:
-        # Check for existing admin with same email
-        stmt = select(User).where(User.email == email)
-        result = await session.execute(stmt)
-        existing = result.scalar_one_or_none()
-
-        if existing:
-            print(f"\nError: An account with email '{email}' already exists.")
-            sys.exit(1)
-
-        # Create admin user
-        admin = User(
+        admin, was_overwritten = await SaaSAdminRepository.save_or_overwrite(
+            session=session,
             email=email,
             password_hash=hash_password(password),
-            role=UserRole.SAAS_ADMIN,
-            status=UserStatus.ACTIVE,
-            is_active=True,
         )
-
-        try:
-            session.add(admin)
-            await session.commit()
-        except IntegrityError:
-            await session.rollback()
-            print(f"\nError: An account with email '{email}' already exists.")
-            sys.exit(1)
 
     print()
     print("=" * 60)
-    print("  SaaS Admin account created successfully!")
-    print(f"  Email: {email}")
-    print(f"  Role:  {UserRole.SAAS_ADMIN.value}")
+    if was_overwritten:
+        print("  Existing SaaS Admin OVERWRITTEN successfully!")
+        print("  NOTICE: All previous admin login credentials and active sessions")
+        print("          have been invalidated. Only the new credentials can log in.")
+    else:
+        print("  SaaS Admin account created successfully!")
+    print(f"  Admin ID: {admin.id}")
+    print(f"  Email:    {admin.email}")
     print("=" * 60)
     print()
     print("You can now login at: POST /api/v1/admin/auth/login")
@@ -131,3 +117,4 @@ async def create_admin():
 
 if __name__ == "__main__":
     asyncio.run(create_admin())
+

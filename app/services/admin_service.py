@@ -18,10 +18,15 @@ from app.core.security import (
     hash_token,
     verify_password,
 )
+from app.models.admin_refresh_token import AdminRefreshToken
 from app.models.enums import UserRole, UserStatus
 from app.models.refresh_token import RefreshToken
+from app.models.saas_admin import SaaSAdmin
 from app.models.user import User
+from app.repositories.admin_token_repository import AdminTokenRepository
 from app.repositories.doctor_repository import DoctorRepository
+from app.repositories.patient_repository import PatientRepository
+from app.repositories.saas_admin_repository import SaaSAdminRepository
 from app.repositories.token_repository import TokenRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.admin import (
@@ -29,12 +34,13 @@ from app.schemas.admin import (
     DoctorReviewRequest,
     DoctorReviewResponse,
     DoctorStatusCounts,
+    PatientAdminListItem,
+    PatientAdminListResponse,
     PendingDoctorDetailResponse,
     PendingDoctorListItem,
     PendingDoctorListResponse,
 )
 from app.schemas.auth import AdminLoginRequest, LoginResponse
-from app.schemas.doctor import DoctorDocumentResponse
 from app.schemas.user import UserBriefResponse
 
 logger = get_logger(__name__)
@@ -48,74 +54,68 @@ class AdminService:
         session: AsyncSession, data: AdminLoginRequest
     ) -> LoginResponse:
         """
-        Authenticate a SaaS Admin.
-
-        Only users with role=SAAS_ADMIN can use this endpoint.
+        Authenticate a SaaS Admin from the dedicated saas_admins table.
 
         Raises:
-            AuthenticationError: Invalid credentials or not an admin.
+            AuthenticationError: Invalid credentials or account inactive.
         """
         normalized_email = data.email.lower().strip()
 
-        user = await UserRepository.get_by_email(session, normalized_email)
-        if not user:
+        admin = await SaaSAdminRepository.get_by_email(session, normalized_email)
+        if not admin:
             # Timing-safe: still hash to prevent timing attacks
             hash_password("dummy-password-for-timing")
             raise AuthenticationError()
 
-        # Must be a SaaS Admin
-        if user.role != UserRole.SAAS_ADMIN:
-            hash_password("dummy-password-for-timing")
-            raise AuthenticationError()
-
         # Verify password
-        if not verify_password(data.password, user.password_hash):
+        if not verify_password(data.password, admin.password_hash):
             logger.info("admin_login_failure: invalid credentials")
             raise AuthenticationError()
 
         # Check status
-        if user.status != UserStatus.ACTIVE or not user.is_active:
+        if not admin.is_active:
             raise AuthenticationError(detail="Account is not active")
 
         # Generate tokens
         access_token = create_access_token(
-            sub=str(user.id),
-            role=user.role.value,
+            sub=str(admin.id),
+            role=UserRole.SAAS_ADMIN.value,
         )
         refresh_token = create_refresh_token(
-            sub=str(user.id),
-            role=user.role.value,
+            sub=str(admin.id),
+            role=UserRole.SAAS_ADMIN.value,
         )
 
-        # Store refresh token hash
+        # Store refresh token hash in admin_refresh_tokens
         decoded = decode_token(refresh_token)
-        token_record = RefreshToken(
-            user_id=user.id,
+        token_record = AdminRefreshToken(
+            admin_id=admin.id,
             token_hash=hash_token(refresh_token),
             expires_at=datetime.fromtimestamp(decoded["exp"], tz=timezone.utc),
         )
 
         try:
-            await TokenRepository.create(session, token_record)
-            await UserRepository.update_last_login(session, user.id)
+            await AdminTokenRepository.create(session, token_record)
+            await SaaSAdminRepository.update_last_login(session, admin.id)
             await session.commit()
         except Exception:
             await session.rollback()
             raise
 
-        logger.info("admin_login_success")
+        logger.info(f"admin_login_success: email={admin.email}")
 
         return LoginResponse(
             access_token=access_token,
             refresh_token=refresh_token,
             token_type="bearer",
             user=UserBriefResponse(
-                id=user.id,
-                email=user.email,
-                role=user.role.value,
-                status=user.status.value,
+                id=admin.id,
+                email=admin.email,
+                role=UserRole.SAAS_ADMIN.value,
+                status=UserStatus.ACTIVE.value,
             ),
         )
+
 
     # ── Doctor Application Review ────────────────────────────────────────
 
@@ -136,12 +136,14 @@ class AdminService:
                     user_id=profile.user_id,
                     email=profile.user.email if profile.user else "",
                     full_name=profile.full_name,
+                    father_name=profile.father_name,
+                    pmdc_registration_number=profile.pmdc_registration_number,
                     specialization=profile.specialization,
-                    license_number=profile.license_number,
+                    license_number=profile.license_number or profile.pmdc_registration_number,
                     years_of_experience=profile.years_of_experience,
                     submitted_at=profile.submitted_at,
                     status=profile.user.status.value if profile.user else "pending",
-                    document_count=len(profile.documents),
+                    document_count=0,
                 )
             )
 
@@ -168,18 +170,22 @@ class AdminService:
                     user_id=profile.user_id,
                     email=profile.user.email if profile.user else "",
                     full_name=profile.full_name,
+                    father_name=profile.father_name,
+                    pmdc_registration_number=profile.pmdc_registration_number,
                     specialization=profile.specialization,
-                    license_number=profile.license_number,
+                    license_number=profile.license_number or profile.pmdc_registration_number,
                     years_of_experience=profile.years_of_experience,
                     submitted_at=profile.submitted_at,
                     status=profile.user.status.value if profile.user else "pending",
-                    document_count=len(profile.documents),
+                    document_count=0,
                 )
             )
 
+        counts_obj = DoctorStatusCounts(**counts)
         return AllDoctorsListResponse(
             total=filtered_total,
-            counts=DoctorStatusCounts(**counts),
+            counts=counts_obj,
+            status_counts=counts_obj,
             items=items,
         )
 
@@ -213,26 +219,25 @@ class AdminService:
             email=user.email,
             status=user.status.value,
             full_name=profile.full_name,
+            father_name=profile.father_name,
+            pmdc_registration_number=profile.pmdc_registration_number,
             phone_number=profile.phone_number,
             specialization=profile.specialization,
-            license_number=profile.license_number,
+            license_number=profile.license_number or profile.pmdc_registration_number,
             years_of_experience=profile.years_of_experience,
             qualification=profile.qualification,
             bio=profile.bio,
             submitted_at=profile.submitted_at,
             admin_feedback=profile.admin_feedback,
             reviewed_at=profile.reviewed_at,
-            documents=[
-                DoctorDocumentResponse.model_validate(doc)
-                for doc in profile.documents
-            ],
+            documents=[],
         )
 
     @staticmethod
     async def review_doctor(
         session: AsyncSession,
         doctor_user_id: uuid.UUID,
-        admin_user: User,
+        admin_user: User | SaaSAdmin,
         data: DoctorReviewRequest,
     ) -> DoctorReviewResponse:
         """
@@ -287,3 +292,31 @@ class AdminService:
             admin_feedback=profile.admin_feedback,
             reviewed_at=now,
         )
+
+    # ── Patient Management ───────────────────────────────────────────────
+
+    @staticmethod
+    async def list_patients(
+        session: AsyncSession,
+        search: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 50,
+    ) -> PatientAdminListResponse:
+        """List all patients with profile data and activity counts for SaaS Admin."""
+        items_raw, total = await PatientRepository.list_patients(
+            session, search=search, skip=skip, limit=limit
+        )
+        items = [PatientAdminListItem(**item) for item in items_raw]
+        return PatientAdminListResponse(total=total, items=items)
+
+    @staticmethod
+    async def delete_patient(
+        session: AsyncSession, patient_user_id: uuid.UUID
+    ) -> dict:
+        """Permanently delete a patient user account and attached resources."""
+        deleted = await PatientRepository.delete_patient(session, patient_user_id)
+        if not deleted:
+            raise NotFoundError(detail="Patient not found")
+        logger.info(f"Patient deleted successfully: patient_user_id={patient_user_id}")
+        return {"message": "Patient account deleted successfully"}
+

@@ -15,9 +15,25 @@ Covers:
 import pytest
 from httpx import AsyncClient
 
-from tests.conftest import create_test_user
+from tests.conftest import create_test_user, test_session_maker
+from datetime import datetime, timezone, timedelta
+from app.models.email_verification import EmailVerification
+from app.core.security import hash_token
 
 SIGNUP_URL = "/api/v1/auth/signup"
+
+
+async def pre_verify(email: str):
+    async with test_session_maker() as session:
+        v = EmailVerification(
+            email=email.lower().strip(),
+            otp_hash=hash_token("123456"),
+            purpose="signup",
+            is_used=True,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        session.add(v)
+        await session.commit()
 
 
 # ── Valid Signups ────────────────────────────────────────────────────────────
@@ -25,6 +41,7 @@ SIGNUP_URL = "/api/v1/auth/signup"
 @pytest.mark.asyncio
 async def test_patient_signup_success(client: AsyncClient):
     """Patient signup should succeed with status=active."""
+    await pre_verify("patient@example.com")
     response = await client.post(
         SIGNUP_URL,
         json={
@@ -47,6 +64,7 @@ async def test_patient_signup_success(client: AsyncClient):
 @pytest.mark.asyncio
 async def test_doctor_signup_success(client: AsyncClient):
     """Doctor signup should succeed with status=pending."""
+    await pre_verify("doctor@example.com")
     response = await client.post(
         SIGNUP_URL,
         json={
@@ -57,7 +75,7 @@ async def test_doctor_signup_success(client: AsyncClient):
     )
     assert response.status_code == 201
     data = response.json()
-    assert "pending approval" in data["message"].lower()
+    assert "doctor account created" in data["message"].lower()
     assert data["user"]["email"] == "doctor@example.com"
     assert data["user"]["role"] == "doctor"
 

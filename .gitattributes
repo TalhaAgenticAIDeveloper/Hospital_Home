@@ -1,0 +1,2 @@
+# Ensure startup shell script always uses Unix LF line endings
+start.sh text eol=lf

@@ -8,6 +8,7 @@ Each test function gets a fresh database state.
 """
 
 import asyncio
+from datetime import datetime, timezone, timedelta
 from typing import AsyncGenerator
 
 import pytest
@@ -28,6 +29,10 @@ from app.models.enums import UserRole, UserStatus
 from app.models.user import User
 
 settings = get_settings()
+
+import os
+import tempfile
+from unittest.mock import patch
 
 from sqlalchemy.pool import NullPool
 
@@ -50,12 +55,26 @@ test_session_maker = async_sessionmaker(
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_test_upload_dir():
+    """
+    Isolate uploaded patient documents during test runs into a temporary directory.
+    Automatically cleaned up after tests, preventing pollution of the real uploads/ dir.
+    """
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_patient_dir = os.path.join(temp_dir, "patient_documents")
+        os.makedirs(temp_patient_dir, exist_ok=True)
+        with patch("app.services.patient_document_service.PATIENT_DOCUMENTS_DIR", temp_patient_dir):
+            yield temp_patient_dir
+
+
 @pytest_asyncio.fixture(scope="session")
 def event_loop():
     """Create a single event loop for the entire test session."""
     loop = asyncio.new_event_loop()
     yield loop
     loop.close()
+
 
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
@@ -80,13 +99,16 @@ async def clean_tables():
     """
     yield
     async with test_session_maker() as session:
+        await session.execute(text("DELETE FROM admin_refresh_tokens"))
+        await session.execute(text("DELETE FROM saas_admins"))
         await session.execute(text("DELETE FROM meetings"))
         await session.execute(text("DELETE FROM doctor_availabilities"))
-        await session.execute(text("DELETE FROM doctor_documents"))
         await session.execute(text("DELETE FROM doctor_profiles"))
+        await session.execute(text("DELETE FROM email_verifications"))
         await session.execute(text("DELETE FROM refresh_tokens"))
         await session.execute(text("DELETE FROM users"))
         await session.commit()
+
 
 
 @pytest_asyncio.fixture
@@ -125,6 +147,21 @@ async def create_test_user(
     role: str = "patient",
 ) -> dict:
     """Helper to create a test user via the signup endpoint."""
+    from app.models.email_verification import EmailVerification
+    from app.core.security import hash_token
+
+    # Pre-verify the email so signup succeeds in tests
+    async with test_session_maker() as session:
+        v = EmailVerification(
+            email=email.lower().strip(),
+            otp_hash=hash_token("123456"),
+            purpose="signup",
+            is_used=True,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        session.add(v)
+        await session.commit()
+
     response = await client.post(
         "/api/v1/auth/signup",
         json={
@@ -178,13 +215,15 @@ async def create_and_login_admin(
     password: str = "AdminPassword123!",
 ) -> dict:
     """Helper to insert and login a SaaS Admin, returning tokens."""
+    from app.models.saas_admin import SaaSAdmin
+
     async with test_session_maker() as session:
-        admin = User(
+        admin = SaaSAdmin(
             email=email.lower().strip(),
             password_hash=hash_password(password),
-            role=UserRole.SAAS_ADMIN,
-            status=UserStatus.ACTIVE,
+            full_name="SaaS Administrator",
             is_active=True,
+            single_admin_lock=True,
         )
         session.add(admin)
         await session.commit()
@@ -194,3 +233,4 @@ async def create_and_login_admin(
         json={"email": email, "password": password},
     )
     return resp.json()
+
