@@ -104,7 +104,7 @@ class DocumentAIService:
             "model": model,
             "messages": messages,
             "temperature": 0.2,
-            "max_tokens": 800,
+            "max_tokens": 500,
         }
 
         headers = {
