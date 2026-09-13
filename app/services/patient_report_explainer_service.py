@@ -41,7 +41,7 @@ settings = get_settings()
 
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
-MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # ── Structured Layman Explanation Prompts ────────────────────────────────────
 
