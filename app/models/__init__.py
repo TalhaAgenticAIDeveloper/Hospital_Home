@@ -13,6 +13,10 @@ from app.models.meeting import Meeting
 from app.models.meeting_document import MeetingDocument
 from app.models.patient_document import PatientDocument
 from app.models.patient_profile import PatientProfile
+from app.models.patient_report_session import (
+    PatientReportMessage,
+    PatientReportSession,
+)
 from app.models.prescription import Prescription, PrescriptionMedicine
 from app.models.refresh_token import RefreshToken
 from app.models.saas_admin import SaaSAdmin
@@ -35,6 +39,8 @@ __all__ = [
     "MeetingDocument",
     "PatientDocument",
     "PatientProfile",
+    "PatientReportSession",
+    "PatientReportMessage",
     "Prescription",
     "PrescriptionMedicine",
     "DoctorWeeklySchedule",
