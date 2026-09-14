@@ -14,10 +14,11 @@ import json
 import re
 import uuid
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import get_settings
 from app.core.exceptions import ConflictError, NotFoundError, ValidationError
@@ -823,29 +824,46 @@ class PatientPlanService:
             content=clean_text,
         )
         await PatientPlanRepository.add_discussion_message(session, user_msg)
+        plan.discussions.append(user_msg)
 
         lowered = clean_text.lower()
 
         # 1. Deterministic Positive Confirmation
         is_positive_confirmation = (
-            lowered in ("yes", "accept", "sure", "okay", "ok", "confirm", "apply", "change it", "yes please", "do it", "go ahead", "sounds good", "perfect")
+            lowered in (
+                "yes", "accept", "sure", "okay", "ok", "confirm", "apply", "change it",
+                "yes please", "do it", "go ahead", "sounds good", "perfect",
+                "theek hai", "theek hy", "haan", "haan theek hy", "haan theek hai",
+                "kr do", "kar do", "haan kr do", "haan kar do", "apply it", "apply changes",
+                "apply all", "adjust it", "adjust all", "adjust them",
+            )
             or (lowered.startswith("yes") and any(w in lowered for w in ("apply", "change", "please", "do it", "sure")))
-            or ("apply" in lowered and any(w in lowered for w in ("change", "this", "modification", "it", "plan")))
+            or ("apply" in lowered and any(w in lowered for w in ("change", "this", "modification", "it", "plan", "all", "these")))
+            or ("adjust" in lowered and any(w in lowered for w in ("all", "it", "them", "these", "plan")))
+            or any(u in lowered for u in ("theek hai", "theek hy", "kr do", "kar do", "haan kr"))
             or lowered.startswith("confirm")
             or lowered.startswith("accept")
         )
         if is_positive_confirmation:
-            pending_item, pending_data = cls._find_pending_modification(plan)
-            if pending_item and pending_data:
-                # Apply modification deterministically without invoking expensive LLM
+            item_mod_pairs, pending_data, pending_disc = cls._find_pending_modification(plan)
+            if item_mod_pairs and pending_data:
                 applied_msg = await cls._apply_modification_internal(
                     session=session,
                     plan=plan,
-                    item=pending_item,
+                    item_mod_pairs=item_mod_pairs,
                     mod_data=pending_data,
                     user_author=patient_user,
+                    pending_disc=pending_disc,
                 )
+                for d in plan.discussions:
+                    if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                        d_mod = dict(d.proposed_modifications)
+                        d_mod["status"] = "applied"
+                        d.proposed_modifications = d_mod
+                        flag_modified(d, "proposed_modifications")
+                plan.discussions.append(applied_msg)
                 await session.commit()
+                await session.refresh(applied_msg)
                 return cls._format_discussion_response(applied_msg)
 
         # 2. Deterministic Rejection
@@ -856,16 +874,29 @@ class PatientPlanService:
             or lowered.startswith("reject")
         )
         if is_rejection:
-            pending_item, pending_data = cls._find_pending_modification(plan)
+            item_mod_pairs, pending_data, pending_disc = cls._find_pending_modification(plan)
             if pending_data:
                 pending_data["status"] = "rejected"
+                if pending_disc and pending_disc.proposed_modifications:
+                    p_mod = dict(pending_disc.proposed_modifications)
+                    p_mod["status"] = "rejected"
+                    pending_disc.proposed_modifications = p_mod
+                    flag_modified(pending_disc, "proposed_modifications")
+                for d in plan.discussions:
+                    if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                        d_mod = dict(d.proposed_modifications)
+                        d_mod["status"] = "rejected"
+                        d.proposed_modifications = d_mod
+                        flag_modified(d, "proposed_modifications")
                 rejection_reply = PatientPlanDiscussion(
                     plan_id=plan.id,
                     role="assistant",
                     content="No problem! I have kept your current plan unchanged.",
                 )
                 await PatientPlanRepository.add_discussion_message(session, rejection_reply)
+                plan.discussions.append(rejection_reply)
                 await session.commit()
+                await session.refresh(rejection_reply)
                 return cls._format_discussion_response(rejection_reply)
 
         # 3. Detect Goal Change Request ("I want weight loss instead")
@@ -880,7 +911,9 @@ class PatientPlanService:
                 ),
             )
             await PatientPlanRepository.add_discussion_message(session, goal_reply)
+            plan.discussions.append(goal_reply)
             await session.commit()
+            await session.refresh(goal_reply)
             return cls._format_discussion_response(goal_reply)
 
         # 4. Detect Medication Requests & Configure Safety Guidance
@@ -897,6 +930,10 @@ class PatientPlanService:
         for m in recent_msgs:
             if m.role in ("user", "assistant"):
                 conv_context.append({"role": m.role, "content": m.content})
+
+        # Guarantee the user's latest query is present at the end of the context
+        if not conv_context or conv_context[-1]["role"] != "user" or conv_context[-1]["content"] != clean_text:
+            conv_context.append({"role": "user", "content": clean_text})
 
         med_guidance = ""
         if is_med_inquiry:
@@ -918,17 +955,36 @@ class PatientPlanService:
             "1. NO MEDICATIONS: You are strictly forbidden from prescribing, recommending, or suggesting pharmaceutical drugs, pills, tablets, or clinical dosages.\n"
             "2. POLITELY DECLINE & OFFER NATURAL ALTERNATIVES: If the patient asks for any medicine or prescription, politely decline by explaining that you cannot prescribe medications and advise them to consult a licensed doctor, and provide safe natural, dietary, and lifestyle alternatives instead.\n"
             "3. Ground your explanations in their current plan.\n"
-            "4. If the patient requests replacing or changing an item (e.g. swapping food, changing time), "
-            "explain the swap briefly and end your response with a structured proposed modification in this EXACT format:\n"
-            "PROPOSED_MODIFICATION: {\"item_id\": \"<matching-item-uuid-if-any>\", \"original_title\": \"<old>\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<new description>\"}\n"
-            "Keep the rest of your reply concise and friendly (2-4 sentences)."
+            "4. RESPOND IN THE PATIENT'S LANGUAGE: If the patient writes in Urdu, Roman Urdu, or any other language, respond naturally in that same language.\n\n"
+            "HOW TO HANDLE DIFFERENT REQUEST TYPES:\n\n"
+            "A) SINGLE ITEM SWAP (e.g. 'swap my breakfast', 'change workout time'):\n"
+            "   Explain the swap briefly and end your response with exactly ONE proposed modification in this format:\n"
+            "   PROPOSED_MODIFICATION: {\"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<new description>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\"}\n"
+            "   IMPORTANT: Always include proposed_time (24-hour HH:MM format) if the time is changing. Always include proposed_category if the time-of-day category changes.\n\n"
+            "B) SCHEDULE / LIFESTYLE CONSTRAINTS & UNAVAILABILITY (e.g. 'I work 9-5', 'I have no time between 10 am and 5 pm', 'I am busy from 10:00 to 17:00'):\n"
+            "   This is CRITICAL. When the patient specifies an unavailable window or work hours:\n"
+            "   1. Identify EVERY SINGLE schedule item currently scheduled within or overlapping that unavailable window.\n"
+            "   2. Reschedule ALL of those items to suitable times outside that window (e.g. move lunch to before work or appropriate break, move afternoon activities/snacks to evening after work).\n"
+            "   3. In your chat message, clearly list each moved item: old time -> new time.\n"
+            "   4. YOU MUST output ALL of the adjusted items together in PROPOSED_MODIFICATION as a JSON array:\n"
+            "   PROPOSED_MODIFICATION: [\n"
+            "     {\"item_id\": \"<uuid-1>\", \"original_title\": \"<title 1>\", \"proposed_title\": \"<new title 1>\", \"proposed_description\": \"<desc 1>\", \"proposed_time\": \"09:30\", \"proposed_category\": \"lunch\"},\n"
+            "     {\"item_id\": \"<uuid-2>\", \"original_title\": \"<title 2>\", \"proposed_title\": \"<new title 2>\", \"proposed_description\": \"<desc 2>\", \"proposed_time\": \"18:00\", \"proposed_category\": \"evening_activity\"},\n"
+            "     {\"item_id\": \"<uuid-3>\", \"original_title\": \"<title 3>\", \"proposed_title\": \"<new title 3>\", \"proposed_description\": \"<desc 3>\", \"proposed_time\": \"19:00\", \"proposed_category\": \"evening_activity\"}\n"
+            "   ]\n"
+            "   CRITICAL DIRECTIVE: NEVER adjust only one item and leave other items conflicting in the user's unavailable hours! You MUST include ALL conflicting items in the JSON array so the user's entire schedule becomes conflict-free in one click!\n\n"
+            "C) GENERAL QUESTIONS (e.g. 'why this food?', 'is brown rice good?', 'how much water should I drink?'):\n"
+            "   Answer helpfully grounded in their plan. No modification needed.\n\n"
+            "D) VAGUE FEEDBACK (e.g. 'this is too much', 'I can't do all this', 'make it easier'):\n"
+            "   Ask 1-2 specific clarifying questions about which parts feel difficult, then suggest practical lighter alternatives.\n\n"
+            "Keep your replies concise and friendly (3-6 sentences). Always be practical and specific, never generic."
             f"{med_guidance}"
         )
 
         messages = [{"role": "system", "content": chat_system_prompt}] + conv_context
 
         try:
-            ai_response_text = await cls._call_groq_api(messages, temperature=0.3, max_tokens=1024)
+            ai_response_text = await cls._call_groq_api(messages, temperature=0.3, max_tokens=1800)
         except Exception as e:
             logger.error("Groq API error in discuss_plan: %s", e)
             if is_med_inquiry:
@@ -951,18 +1007,44 @@ class PatientPlanService:
             parts = ai_response_text.split("PROPOSED_MODIFICATION:", 1)
             ai_response_text = parts[0].strip()
             mod_json_str = parts[1].strip()
+
+            # Strip markdown code fences if LLM wrapped JSON in ```json ... ```
+            mod_json_str = re.sub(r"^```(?:json)?\s*", "", mod_json_str)
+            mod_json_str = re.sub(r"\s*```\s*$", "", mod_json_str.strip())
+
+            # Try to extract JSON array or object
+            json_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", mod_json_str)
+            if json_match:
+                mod_json_str = json_match.group(0)
+
             try:
-                mod_dict = json.loads(mod_json_str)
-                # Verify proposed modification does not contain medications!
-                mod_corpus = f"{mod_dict.get('proposed_title', '')} {mod_dict.get('proposed_description', '')}"
-                is_mod_unsafe, _ = PlanValidator.contains_blocked_medication(mod_corpus)
-                if not is_mod_unsafe:
+                parsed_mod = json.loads(mod_json_str)
+                if isinstance(parsed_mod, list):
+                    mod_dict = {"status": "pending", "items": parsed_mod}
+                elif isinstance(parsed_mod, dict):
+                    mod_dict = dict(parsed_mod)
                     mod_dict["status"] = "pending"
-                    proposed_mod = mod_dict
+                    for alt_key in ("modifications", "schedule_items", "adjustments", "changes"):
+                        if alt_key in mod_dict and isinstance(mod_dict[alt_key], list):
+                            mod_dict["items"] = mod_dict.pop(alt_key)
+                            break
                 else:
-                    logger.warning("Proposed modification contained medication terms. Dropping modification.")
-            except Exception:
-                pass
+                    mod_dict = None
+
+                if mod_dict:
+                    # Verify proposed modification does not contain medications
+                    mod_corpus = json.dumps(mod_dict)
+                    is_mod_unsafe, _ = PlanValidator.contains_blocked_medication(mod_corpus)
+                    if not is_mod_unsafe:
+                        proposed_mod = mod_dict
+                        item_count = len(mod_dict.get("items", [])) if "items" in mod_dict else 1
+                        logger.info("Successfully parsed PROPOSED_MODIFICATION with %s item(s)", item_count)
+                    else:
+                        logger.warning("Proposed modification contained medication terms. Dropping modification.")
+            except json.JSONDecodeError as je:
+                logger.warning("Failed to parse PROPOSED_MODIFICATION JSON: %s | Raw: %s", je, mod_json_str[:300])
+            except Exception as e:
+                logger.warning("Unexpected error parsing PROPOSED_MODIFICATION: %s", e)
 
         assistant_msg = PatientPlanDiscussion(
             plan_id=plan.id,
@@ -971,72 +1053,174 @@ class PatientPlanService:
             proposed_modifications=proposed_mod,
         )
         await PatientPlanRepository.add_discussion_message(session, assistant_msg)
+        plan.discussions.append(assistant_msg)
         await session.commit()
+        await session.refresh(assistant_msg)
 
         return cls._format_discussion_response(assistant_msg)
 
     @classmethod
-    def _find_pending_modification(cls, plan: PatientPlan) -> Tuple[Optional[PatientPlanItem], Optional[Dict[str, Any]]]:
-        """Finds any pending modification in the discussion history."""
+    def _find_item_for_mod(
+        cls, plan: PatientPlan, mod_item: Dict[str, Any], exclude_ids: Optional[Set[uuid.UUID]] = None
+    ) -> Optional[PatientPlanItem]:
+        """Find matching PatientPlanItem by item_id, original_time, or title with distinct item resolution."""
+        candidates = [i for i in plan.items if exclude_ids is None or i.id not in exclude_ids]
+        if not candidates:
+            return None
+
+        item_id_str = mod_item.get("item_id")
+        if item_id_str:
+            try:
+                target_uuid = uuid.UUID(str(item_id_str))
+                matched = next((i for i in candidates if i.id == target_uuid), None)
+                if matched:
+                    return matched
+            except (ValueError, TypeError):
+                pass
+
+        orig_time = mod_item.get("original_time")
+        if orig_time:
+            matched = next((i for i in candidates if i.time_of_day == orig_time), None)
+            if matched:
+                return matched
+
+        orig_title = mod_item.get("original_title")
+        if orig_title:
+            orig_lower = orig_title.lower()
+            matched = next(
+                (i for i in candidates if orig_lower in i.title.lower() or i.title.lower() in orig_lower), None
+            )
+            if matched:
+                return matched
+            orig_words = set(re.findall(r"\w{3,}", orig_lower))
+            if orig_words:
+                matched = next(
+                    (i for i in candidates if orig_words.intersection(re.findall(r"\w{3,}", i.title.lower()))),
+                    None
+                )
+                if matched:
+                    return matched
+
+        prop_title = mod_item.get("proposed_title")
+        if prop_title:
+            prop_lower = prop_title.lower()
+            matched = next(
+                (i for i in candidates if prop_lower in i.title.lower() or i.title.lower() in prop_lower), None
+            )
+            if matched:
+                return matched
+
+        return None
+
+    @classmethod
+    def _find_pending_modification(
+        cls, plan: PatientPlan
+    ) -> Tuple[List[Tuple[PatientPlanItem, Dict[str, Any]]], Optional[Dict[str, Any]], Optional[PatientPlanDiscussion]]:
+        """
+        Finds any pending modification in the discussion history.
+        Returns (item_mod_pairs, mod_data, disc).
+        """
         for disc in reversed(plan.discussions):
             if disc.proposed_modifications and disc.proposed_modifications.get("status") == "pending":
                 mod = disc.proposed_modifications
-                # Find target item
-                item_id_str = mod.get("item_id")
-                target_item = None
-                if item_id_str:
-                    try:
-                        target_uuid = uuid.UUID(item_id_str)
-                        target_item = next((i for i in plan.items if i.id == target_uuid), None)
-                    except ValueError:
-                        pass
-                if not target_item and mod.get("original_title"):
-                    target_item = next(
-                        (i for i in plan.items if mod["original_title"].lower() in i.title.lower()), None
-                    )
-                if not target_item and plan.items:
-                    target_item = plan.items[0]
-                return target_item, mod
-        return None, None
+                # Multi-item modification
+                if "items" in mod and isinstance(mod["items"], list):
+                    item_mod_pairs = []
+                    used_ids: Set[uuid.UUID] = set()
+                    for m in mod["items"]:
+                        target = cls._find_item_for_mod(plan, m, exclude_ids=used_ids)
+                        if target:
+                            used_ids.add(target.id)
+                            item_mod_pairs.append((target, m))
+                    if item_mod_pairs:
+                        return item_mod_pairs, mod, disc
+                else:
+                    # Single item modification
+                    target = cls._find_item_for_mod(plan, mod)
+                    if not target and plan.items:
+                        target = plan.items[0]
+                    if target:
+                        return [(target, mod)], mod, disc
+        return [], None, None
 
     @classmethod
     async def _apply_modification_internal(
         cls,
         session: AsyncSession,
         plan: PatientPlan,
-        item: PatientPlanItem,
+        item_mod_pairs: List[Tuple[PatientPlanItem, Dict[str, Any]]],
         mod_data: Dict[str, Any],
         user_author: User,
+        pending_disc: Optional[PatientPlanDiscussion] = None,
     ) -> PatientPlanDiscussion:
-        """Internal helper to apply an approved modification with atomic versioning."""
-        old_title = item.title
-        item.title = PlanValidator.sanitize_text(mod_data.get("proposed_title", item.title), 255)
-        item.description = PlanValidator.sanitize_text(mod_data.get("proposed_description", item.description), 1000)
-        mod_data["status"] = "applied"
+        """Internal helper to apply approved modifications with atomic versioning."""
+        valid_categories = {"morning_routine", "breakfast", "lunch", "evening_activity", "dinner", "night_routine", "snack", "exercise", "hydration"}
+        changes_summaries = []
+        revision_items = []
 
-        # Optimistic locking increment
+        for item, m in item_mod_pairs:
+            old_title = item.title
+            old_time = item.time_of_day
+            old_category = item.category
+
+            if m.get("proposed_title"):
+                item.title = PlanValidator.sanitize_text(m["proposed_title"], 255)
+            if m.get("proposed_description"):
+                item.description = PlanValidator.sanitize_text(m["proposed_description"], 1000)
+
+            proposed_time = m.get("proposed_time")
+            if proposed_time and re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", proposed_time):
+                item.time_of_day = proposed_time
+                logger.info("Updating item time: %s -> %s", old_time, proposed_time)
+
+            proposed_category = m.get("proposed_category")
+            if proposed_category and proposed_category.lower() in valid_categories:
+                item.category = proposed_category.lower()
+                logger.info("Updating item category: %s -> %s", old_category, proposed_category)
+
+            time_change = f" moved from **{old_time}** to **{item.time_of_day}**" if old_time != item.time_of_day else ""
+            changes_summaries.append(f"**{item.title}**{time_change}")
+            revision_items.append({
+                "item_id": str(item.id),
+                "previous_title": old_title,
+                "new_title": item.title,
+                "previous_time": old_time,
+                "new_time": item.time_of_day,
+            })
+
+        mod_data["status"] = "applied"
+        if pending_disc and pending_disc.proposed_modifications:
+            p_mod = dict(pending_disc.proposed_modifications)
+            p_mod["status"] = "applied"
+            pending_disc.proposed_modifications = p_mod
+            flag_modified(pending_disc, "proposed_modifications")
+
+        await session.flush()
         plan.version += 1
 
-        # Audit snapshot
         snapshot = {
             "version": plan.version,
-            "modified_item_id": str(item.id),
-            "previous_title": old_title,
-            "new_title": item.title,
+            "modified_items": revision_items,
             "applied_at": datetime.now(timezone.utc).isoformat(),
         }
         await PatientPlanRepository.create_revision(
             session=session,
             plan_id=plan.id,
             revision_number=plan.version,
-            change_summary=f"Replaced '{old_title}' with '{item.title}'.",
+            change_summary=f"Adjusted {len(item_mod_pairs)} schedule item(s).",
             snapshot=snapshot,
         )
+
+        if len(item_mod_pairs) == 1:
+            reply_content = f"✅ Done! I've updated your daily plan: {changes_summaries[0]} has been applied."
+        else:
+            items_list = "\n".join(f"- {s}" for s in changes_summaries)
+            reply_content = f"✅ Done! I've updated your daily plan with all {len(item_mod_pairs)} schedule adjustments:\n{items_list}\nhave been successfully applied."
 
         reply = PatientPlanDiscussion(
             plan_id=plan.id,
             role="assistant",
-            content=f"✅ Done! I've updated your daily plan: **{item.title}** has been applied.",
+            content=reply_content,
             proposed_modifications=mod_data,
         )
         return await PatientPlanRepository.add_discussion_message(session, reply)
@@ -1057,31 +1241,69 @@ class PatientPlanService:
         if not plan:
             raise NotFoundError("Plan not found or does not belong to you.")
 
+        logger.info(
+            "apply_modification: plan_id=%s, plan_version=%s, expected_version=%s, action=%s",
+            plan_id, plan.version, payload.expected_version, payload.action,
+        )
+
         if plan.version != payload.expected_version:
+            logger.warning(
+                "Version mismatch: plan.version=%s != expected=%s",
+                plan.version, payload.expected_version,
+            )
             raise ConflictError("This plan was modified in another session. Please refresh to view the latest version.")
 
-        target_item, pending_data = cls._find_pending_modification(plan)
-        if not pending_data:
+        item_mod_pairs, pending_data, pending_disc = cls._find_pending_modification(plan)
+        logger.info(
+            "apply_modification: found %s items to modify, pending_data=%s",
+            len(item_mod_pairs),
+            bool(pending_data),
+        )
+        if not pending_data or not item_mod_pairs:
+            logger.warning("No pending modification found. Discussion count: %s", len(plan.discussions))
+            for d in plan.discussions[-3:]:
+                logger.warning(
+                    "  Discussion id=%s role=%s has_mods=%s mod_status=%s",
+                    d.id, d.role,
+                    bool(d.proposed_modifications),
+                    d.proposed_modifications.get("status") if d.proposed_modifications else "N/A",
+                )
             raise NotFoundError("No pending modification found to apply.")
 
-        if payload.action == "accept" and target_item:
+        if payload.action == "accept":
             await cls._apply_modification_internal(
                 session=session,
                 plan=plan,
-                item=target_item,
+                item_mod_pairs=item_mod_pairs,
                 mod_data=pending_data,
                 user_author=patient_user,
+                pending_disc=pending_disc,
             )
         else:
             pending_data["status"] = "rejected"
+            if pending_disc and pending_disc.proposed_modifications:
+                p_mod = dict(pending_disc.proposed_modifications)
+                p_mod["status"] = "rejected"
+                pending_disc.proposed_modifications = p_mod
+                flag_modified(pending_disc, "proposed_modifications")
             reject_msg = PatientPlanDiscussion(
                 plan_id=plan.id,
                 role="assistant",
                 content="Modification declined. Your plan remains unchanged.",
             )
             await PatientPlanRepository.add_discussion_message(session, reject_msg)
+            plan.discussions.append(reject_msg)
+
+        # Mark all pending modifications in discussions as resolved
+        for d in plan.discussions:
+            if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                d_mod = dict(d.proposed_modifications)
+                d_mod["status"] = "applied" if payload.action == "accept" else "rejected"
+                d.proposed_modifications = d_mod
+                flag_modified(d, "proposed_modifications")
 
         await session.commit()
+        session.expire_all()  # Force fresh load from DB to pick up item changes
         full_plan = await PatientPlanRepository.get_plan_by_id(session, plan.id, patient_user.id)
         return cls._format_plan_response(full_plan)
 
