@@ -99,6 +99,17 @@ async def clean_tables():
     """
     yield
     async with test_session_maker() as session:
+        await session.execute(text("DELETE FROM patient_plan_notifications"))
+        await session.execute(text("DELETE FROM patient_plan_logs"))
+        await session.execute(text("DELETE FROM patient_plan_revisions"))
+        await session.execute(text("DELETE FROM patient_plan_discussions"))
+        await session.execute(text("DELETE FROM patient_plan_items"))
+        await session.execute(text("DELETE FROM patient_plans"))
+        await session.execute(text("DELETE FROM patient_goal_answers"))
+        await session.execute(text("DELETE FROM patient_goal_questions"))
+        await session.execute(text("DELETE FROM patient_goals"))
+        await session.execute(text("DELETE FROM patient_report_messages"))
+        await session.execute(text("DELETE FROM patient_report_sessions"))
         await session.execute(text("DELETE FROM admin_refresh_tokens"))
         await session.execute(text("DELETE FROM saas_admins"))
         await session.execute(text("DELETE FROM meetings"))
