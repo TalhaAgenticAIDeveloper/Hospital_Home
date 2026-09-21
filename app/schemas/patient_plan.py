@@ -106,6 +106,14 @@ class PlanItemSchema(BaseModel):
     order_index: int = 0
     is_active: bool = True
 
+    # Nutritional metadata
+    calories: Optional[int] = Field(default=None, description="Kilocalories for meals")
+    protein_g: Optional[float] = Field(default=None, description="Grams of protein")
+    carbs_g: Optional[float] = Field(default=None, description="Grams of carbohydrates")
+    fat_g: Optional[float] = Field(default=None, description="Grams of fat")
+    fiber_g: Optional[float] = Field(default=None, description="Grams of dietary fiber")
+    calories_burned: Optional[int] = Field(default=None, description="Calories burned for exercise items")
+
 
 class GeneratedPlanPayload(BaseModel):
     """Schema for validating AI-generated plan JSON before DB persistence."""
@@ -116,6 +124,10 @@ class GeneratedPlanPayload(BaseModel):
     lifestyle_guidelines: List[str] = Field(default_factory=list)
     precautions: List[str] = Field(default_factory=list)
     schedule_items: List[PlanItemSchema] = Field(..., min_length=1)
+    daily_nutrition_summary: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Aggregate daily nutrition totals (total_calories, total_protein_g, total_carbs_g, total_fat_g, total_fiber_g, total_calories_burned, net_calories)",
+    )
 
 
 class ProposedModificationSchema(BaseModel):
@@ -126,6 +138,12 @@ class ProposedModificationSchema(BaseModel):
     proposed_time: Optional[str] = None
     proposed_category: Optional[str] = None
     status: str = "pending"  # pending, applied, rejected
+    calories: Optional[int] = None
+    protein_g: Optional[float] = None
+    carbs_g: Optional[float] = None
+    fat_g: Optional[float] = None
+    fiber_g: Optional[float] = None
+    calories_burned: Optional[int] = None
 
 
 class PlanDiscussionMessageRequest(BaseModel):
@@ -183,6 +201,7 @@ class PatientPlanDetailResponse(BaseModel):
     items: List[PlanItemSchema]
     discussions: List[PlanDiscussionMessageResponse]
     today_logs: List[PlanLogResponse]
+    daily_nutrition_summary: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
 

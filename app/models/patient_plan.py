@@ -20,6 +20,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -269,6 +270,11 @@ class PatientPlan(TimestampMixin, Base):
     lifestyle_guidelines: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=None)
     precautions: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=None)
 
+    # Daily nutritional summary (auto-calculated from schedule items)
+    # e.g. {"total_calories": 2100, "total_protein_g": 120, "total_carbs_g": 250,
+    #        "total_fat_g": 65, "total_fiber_g": 30, "total_calories_burned": 350, "net_calories": 1750}
+    daily_nutrition_summary: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=None)
+
     # Optimistic locking version
     version: Mapped[int] = mapped_column(
         Integer, default=1, server_default="1", nullable=False
@@ -355,6 +361,14 @@ class PatientPlanItem(TimestampMixin, Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default="true", nullable=False
     )
+
+    # Nutritional metadata (populated by AI during plan generation)
+    calories: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)  # kcal for meals
+    protein_g: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
+    carbs_g: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
+    fat_g: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
+    fiber_g: Mapped[Optional[float]] = mapped_column(Float, nullable=True, default=None)
+    calories_burned: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=None)  # for exercise items
 
     # Relationships
     plan: Mapped["PatientPlan"] = relationship("PatientPlan", back_populates="items")

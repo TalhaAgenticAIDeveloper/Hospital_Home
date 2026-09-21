@@ -10,6 +10,7 @@ Provides endpoints for:
 - Atomic plan approval & start
 - Plan pause, resume, and cancellation
 - Daily activity completion logging
+- Standalone nutrition/food/exercise information queries
 """
 
 import uuid
@@ -33,6 +34,9 @@ from app.schemas.patient_plan import (
     QuestionAnswerResponse,
     QuestionnaireAnswerRequest,
 )
+from app.schemas.nutrition_info import NutritionInfoResponse, NutritionQueryRequest
+from app.repositories.patient_plan_repository import PatientPlanRepository
+from app.services.nutrition_info_service import NutritionInfoService
 from app.services.patient_plan_service import PatientPlanService
 
 router = APIRouter(
@@ -137,6 +141,33 @@ async def list_patient_plans(
     return await PatientPlanService.list_patient_plans(
         session=session,
         patient_user=user,
+    )
+
+
+@router.post(
+    "/nutrition-info",
+    response_model=NutritionInfoResponse,
+    summary="Ask nutrition, food, or exercise information questions",
+)
+async def ask_nutrition_info(
+    payload: NutritionQueryRequest,
+    user: User = Depends(require_role(UserRole.PATIENT)),
+    session: AsyncSession = Depends(get_db),
+) -> NutritionInfoResponse:
+    conv_history = None
+    if payload.plan_id:
+        plan = await PatientPlanRepository.get_plan_by_id(session, payload.plan_id, user.id)
+        if plan and plan.discussions:
+            recent_msgs = plan.discussions[-6:] if len(plan.discussions) > 6 else plan.discussions
+            conv_history = [
+                {"role": m.role, "content": m.content}
+                for m in recent_msgs if m.role in ("user", "assistant")
+            ]
+    return await NutritionInfoService.ask_nutrition_question(
+        session=session,
+        patient_user=user,
+        question=payload.message,
+        conversation_history=conv_history,
     )
 
 

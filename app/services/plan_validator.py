@@ -598,6 +598,49 @@ class PlanValidator:
             if phrase in text_corpus:
                 errors.append(f"Plan contains unrealistic or unsafe claim: '{phrase}'.")
 
+        # 5. Nutritional data sanity checks
+        food_categories = {"breakfast", "lunch", "dinner", "snack", "evening_activity"}
+        exercise_categories = {"workout", "exercise"}
+
+        for item in payload.schedule_items:
+            cat = item.category.lower() if item.category else ""
+
+            # Food items with absurdly high/low calories
+            if cat in food_categories and item.calories is not None:
+                if item.calories < 0:
+                    errors.append(
+                        f"Schedule item '{item.title}' has negative calories ({item.calories}). "
+                        "Food items cannot have negative calorie values."
+                    )
+                if item.calories > 3000:
+                    errors.append(
+                        f"Schedule item '{item.title}' has unrealistically high calories ({item.calories} kcal) "
+                        "for a single meal. Maximum expected is ~3000 kcal per meal."
+                    )
+
+            # Exercise items should not have food macros set
+            if cat in exercise_categories:
+                if item.calories is not None and item.calories > 0:
+                    errors.append(
+                        f"Exercise item '{item.title}' should not have food calories. "
+                        "Use calories_burned instead."
+                    )
+                if item.calories_burned is not None and item.calories_burned > 2000:
+                    errors.append(
+                        f"Exercise item '{item.title}' has unrealistically high calories_burned ({item.calories_burned}). "
+                        "Maximum expected per session is ~2000 kcal."
+                    )
+
+        # Daily summary sanity
+        summary = payload.daily_nutrition_summary
+        if summary and isinstance(summary, dict):
+            total_cal = summary.get("total_calories")
+            if total_cal is not None and (total_cal < 200 or total_cal > 10000):
+                errors.append(
+                    f"Daily nutrition summary has unrealistic total_calories ({total_cal}). "
+                    "Expected range: 200-10000 kcal."
+                )
+
         return len(errors) == 0, errors
 
     @classmethod

@@ -644,6 +644,24 @@ class PatientPlanService:
             "2. STRICT ALLERGY RESPECT: Never include any food, ingredient, or snack that conflicts with the patient's declared allergies.\n"
             "3. REALISTIC & GROUNDED: Every activity must have realistic timing, sensible nutrition, and manageable habits.\n"
             "4. OUTPUT FORMAT: You must return ONLY valid, raw JSON matching the required schema. Do NOT include markdown fences, preambles, or explanations.\n\n"
+            "NUTRITIONAL DATA & WEIGHT IMPACT REQUIREMENT:\n"
+            "For EVERY meal/food schedule item, you MUST include accurate nutritional estimates:\n"
+            "- calories (integer, kcal for the described meal/snack)\n"
+            "- protein_g (float, grams of protein)\n"
+            "- carbs_g (float, grams of carbohydrates)\n"
+            "- fat_g (float, grams of fat)\n"
+            "- fiber_g (float, grams of dietary fiber)\n"
+            "- calories_burned: null (set to null for food items)\n\n"
+            "For EVERY exercise/workout schedule item:\n"
+            "- calories: null (set to null for exercise items)\n"
+            "- protein_g: null, carbs_g: null, fat_g: null, fiber_g: null\n"
+            "- calories_burned (integer, estimated kcal burned for a ~70kg person)\n\n"
+            "For non-food/non-exercise items (morning_routine, sleep_routine), set ALL nutrition fields to null.\n\n"
+            "CRITICAL: WEIGHT GAIN / LOSS & CALORIC IMPACT IN DESCRIPTIONS:\n"
+            "If the plan is for weight management (weight gain or weight loss), fitness, or nutrition, you MUST explicitly state the caloric and weight impact in each item's description:\n"
+            "- For meals: mention calories, protein, and how it contributes to a caloric surplus (for weight gain) or deficit (for weight loss), e.g., 'Provides 450 kcal and 25g protein, creating a healthy +300 kcal surplus to support lean muscle gain' or 'Provides 280 kcal and 20g protein, creating a 350 kcal deficit to promote gradual fat loss while keeping you energized'.\n"
+            "- For exercises: mention estimated calories burned and expected loss/burn impact, e.g., 'Burns approx 220 kcal, directly contributing to your daily fat loss deficit'.\n\n"
+            "You MUST also provide a 'daily_nutrition_summary' object with aggregate totals.\n\n"
             "JSON SCHEMA REQUIREMENT:\n"
             "{\n"
             '  "title": "Title of the Personalized Plan",\n'
@@ -657,9 +675,24 @@ class PatientPlanService:
             '      "time_of_day": "HH:MM",\n'
             '      "category": "morning_routine | breakfast | workout | lunch | evening_activity | dinner | sleep_routine",\n'
             '      "title": "Actionable title",\n'
-            '      "description": "Clear guidance and dietary instructions"\n'
+            '      "description": "Clear guidance and dietary instructions",\n'
+            '      "calories": 350,\n'
+            '      "protein_g": 12.0,\n'
+            '      "carbs_g": 55.0,\n'
+            '      "fat_g": 8.0,\n'
+            '      "fiber_g": 6.0,\n'
+            '      "calories_burned": null\n'
             '    }\n'
-            '  ]\n'
+            '  ],\n'
+            '  "daily_nutrition_summary": {\n'
+            '    "total_calories": 2100,\n'
+            '    "total_protein_g": 120.0,\n'
+            '    "total_carbs_g": 250.0,\n'
+            '    "total_fat_g": 65.0,\n'
+            '    "total_fiber_g": 30.0,\n'
+            '    "total_calories_burned": 350,\n'
+            '    "net_calories": 1750\n'
+            '  }\n'
             "}"
         )
 
@@ -738,6 +771,7 @@ class PatientPlanService:
                 diet_guidelines={"items": plan_payload.diet_guidelines},
                 lifestyle_guidelines={"items": plan_payload.lifestyle_guidelines},
                 precautions={"items": plan_payload.precautions},
+                daily_nutrition_summary=plan_payload.daily_nutrition_summary,
                 version=1,
                 status="ready",
             )
@@ -749,6 +783,12 @@ class PatientPlanService:
                     description=PlanValidator.sanitize_text(item.description, 1000),
                     order_index=idx,
                     is_active=True,
+                    calories=item.calories,
+                    protein_g=item.protein_g,
+                    carbs_g=item.carbs_g,
+                    fat_g=item.fat_g,
+                    fiber_g=item.fiber_g,
+                    calories_burned=item.calories_burned,
                 )
                 for idx, item in enumerate(plan_payload.schedule_items)
             ]
@@ -827,6 +867,38 @@ class PatientPlanService:
         plan.discussions.append(user_msg)
 
         lowered = clean_text.lower()
+
+        # 0. Smart Intent Detection — Route nutrition info queries to NutritionInfoService
+        intent = cls._classify_chat_intent(clean_text)
+        if intent == "nutrition_info":
+            # Lazy import to avoid circular dependency
+            from app.services.nutrition_info_service import NutritionInfoService
+
+            # Build conversation context from recent plan discussions
+            recent_msgs = plan.discussions[-6:] if len(plan.discussions) > 6 else plan.discussions
+            conv_history = [
+                {"role": m.role, "content": m.content}
+                for m in recent_msgs if m.role in ("user", "assistant")
+            ]
+
+            info_response = await NutritionInfoService.ask_nutrition_question(
+                session=session,
+                patient_user=patient_user,
+                question=clean_text,
+                conversation_history=conv_history,
+            )
+
+            # Save nutrition info response as a discussion message in the plan chat (seamless UX)
+            assistant_msg = PatientPlanDiscussion(
+                plan_id=plan.id,
+                role="assistant",
+                content=info_response.answer,
+            )
+            await PatientPlanRepository.add_discussion_message(session, assistant_msg)
+            plan.discussions.append(assistant_msg)
+            await session.commit()
+            await session.refresh(assistant_msg)
+            return cls._format_discussion_response(assistant_msg)
 
         # 1. Deterministic Positive Confirmation
         is_positive_confirmation = (
@@ -943,7 +1015,7 @@ class PatientPlanService:
                 "1. STRICTLY FORBIDDEN: You must NEVER prescribe, recommend, or suggest any pharmaceutical drugs, medicines, tablets, pills, syrups, or clinical dosages.\n"
                 "2. POLITELY DECLINE: Clearly and respectfully inform the patient that as an AI wellness guide, you cannot prescribe or advise on medications or clinical treatments, and advise them to consult a qualified physician for prescription needs.\n"
                 "3. PROVIDE NATURAL ALTERNATIVES: Actively provide helpful, evidence-based NATURAL, DIETARY, and LIFESTYLE alternatives (such as herbal infusions like chamomile/ginger tea, proper hydration, wholesome nutrient-rich foods, gentle physical movement, and sleep routines) to support them naturally.\n"
-                "4. Respond naturally in the language used by the patient (Urdu/Roman Urdu or English).\n"
+                "4. Respond in English for English inquiries, or in Roman Urdu (using English letters) if the patient writes in Urdu/Roman Urdu. Never use Arabic/Urdu script.\n"
             )
 
         chat_system_prompt = (
@@ -955,12 +1027,16 @@ class PatientPlanService:
             "1. NO MEDICATIONS: You are strictly forbidden from prescribing, recommending, or suggesting pharmaceutical drugs, pills, tablets, or clinical dosages.\n"
             "2. POLITELY DECLINE & OFFER NATURAL ALTERNATIVES: If the patient asks for any medicine or prescription, politely decline by explaining that you cannot prescribe medications and advise them to consult a licensed doctor, and provide safe natural, dietary, and lifestyle alternatives instead.\n"
             "3. Ground your explanations in their current plan.\n"
-            "4. RESPOND IN THE PATIENT'S LANGUAGE: If the patient writes in Urdu, Roman Urdu, or any other language, respond naturally in that same language.\n\n"
+            "4. STRICT LANGUAGE & SCRIPT RULES:\n"
+            "   - If the patient writes in English, reply strictly in English.\n"
+            "   - If the patient writes in Urdu, Roman Urdu, or Hindi, reply STRICTLY in Roman Urdu (using Latin/English alphabet, e.g. 'Aap ke plan mein breakfast ko update kar diya gaya hai...').\n"
+            "   - NEVER write in traditional Urdu script (اردو رسم الخط / Arabic script). Absolutely NO Nastaliq/Arabic characters. Even if the patient writes in Urdu script, your response MUST be in Roman Urdu with English letters.\n\n"
             "HOW TO HANDLE DIFFERENT REQUEST TYPES:\n\n"
             "A) SINGLE ITEM SWAP (e.g. 'swap my breakfast', 'change workout time'):\n"
             "   Explain the swap briefly and end your response with exactly ONE proposed modification in this format:\n"
-            "   PROPOSED_MODIFICATION: {\"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<new description>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\"}\n"
-            "   IMPORTANT: Always include proposed_time (24-hour HH:MM format) if the time is changing. Always include proposed_category if the time-of-day category changes.\n\n"
+            "   PROPOSED_MODIFICATION: {\"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<new description including weight gain/loss caloric impact>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\", \"calories\": 350, \"protein_g\": 15.0, \"carbs_g\": 45.0, \"fat_g\": 8.0, \"fiber_g\": 5.0, \"calories_burned\": null}\n"
+            "   IMPORTANT: Always include proposed_time (24-hour HH:MM format) if the time is changing. Always include proposed_category if the time-of-day category changes.\n"
+            "   IMPORTANT: For meals, include accurate nutritional estimates (calories, protein_g, carbs_g, fat_g, fiber_g) and in proposed_description explicitly state the caloric surplus/deficit impact (weight gain or loss). For exercise items, set calories to null and provide calories_burned.\n\n"
             "B) SCHEDULE / LIFESTYLE CONSTRAINTS & UNAVAILABILITY (e.g. 'I work 9-5', 'I have no time between 10 am and 5 pm', 'I am busy from 10:00 to 17:00'):\n"
             "   This is CRITICAL. When the patient specifies an unavailable window or work hours:\n"
             "   1. Identify EVERY SINGLE schedule item currently scheduled within or overlapping that unavailable window.\n"
@@ -968,9 +1044,8 @@ class PatientPlanService:
             "   3. In your chat message, clearly list each moved item: old time -> new time.\n"
             "   4. YOU MUST output ALL of the adjusted items together in PROPOSED_MODIFICATION as a JSON array:\n"
             "   PROPOSED_MODIFICATION: [\n"
-            "     {\"item_id\": \"<uuid-1>\", \"original_title\": \"<title 1>\", \"proposed_title\": \"<new title 1>\", \"proposed_description\": \"<desc 1>\", \"proposed_time\": \"09:30\", \"proposed_category\": \"lunch\"},\n"
-            "     {\"item_id\": \"<uuid-2>\", \"original_title\": \"<title 2>\", \"proposed_title\": \"<new title 2>\", \"proposed_description\": \"<desc 2>\", \"proposed_time\": \"18:00\", \"proposed_category\": \"evening_activity\"},\n"
-            "     {\"item_id\": \"<uuid-3>\", \"original_title\": \"<title 3>\", \"proposed_title\": \"<new title 3>\", \"proposed_description\": \"<desc 3>\", \"proposed_time\": \"19:00\", \"proposed_category\": \"evening_activity\"}\n"
+            "     {\"item_id\": \"<uuid-1>\", \"original_title\": \"<title 1>\", \"proposed_title\": \"<new title 1>\", \"proposed_description\": \"<desc 1>\", \"proposed_time\": \"09:30\", \"proposed_category\": \"lunch\", \"calories\": 450, \"protein_g\": 20.0, \"carbs_g\": 60.0, \"fat_g\": 12.0, \"fiber_g\": 6.0, \"calories_burned\": null},\n"
+            "     {\"item_id\": \"<uuid-2>\", \"original_title\": \"<title 2>\", \"proposed_title\": \"<new title 2>\", \"proposed_description\": \"<desc 2>\", \"proposed_time\": \"18:00\", \"proposed_category\": \"evening_activity\", \"calories\": null, \"protein_g\": null, \"carbs_g\": null, \"fat_g\": null, \"fiber_g\": null, \"calories_burned\": 200}\n"
             "   ]\n"
             "   CRITICAL DIRECTIVE: NEVER adjust only one item and leave other items conflicting in the user's unavailable hours! You MUST include ALL conflicting items in the JSON array so the user's entire schedule becomes conflict-free in one click!\n\n"
             "C) GENERAL QUESTIONS (e.g. 'why this food?', 'is brown rice good?', 'how much water should I drink?'):\n"
@@ -1178,6 +1253,20 @@ class PatientPlanService:
                 item.category = proposed_category.lower()
                 logger.info("Updating item category: %s -> %s", old_category, proposed_category)
 
+            # Update nutritional metadata if present in modification
+            if "calories" in m and m["calories"] is not None:
+                item.calories = int(m["calories"])
+            if "protein_g" in m and m["protein_g"] is not None:
+                item.protein_g = float(m["protein_g"])
+            if "carbs_g" in m and m["carbs_g"] is not None:
+                item.carbs_g = float(m["carbs_g"])
+            if "fat_g" in m and m["fat_g"] is not None:
+                item.fat_g = float(m["fat_g"])
+            if "fiber_g" in m and m["fiber_g"] is not None:
+                item.fiber_g = float(m["fiber_g"])
+            if "calories_burned" in m and m["calories_burned"] is not None:
+                item.calories_burned = int(m["calories_burned"])
+
             time_change = f" moved from **{old_time}** to **{item.time_of_day}**" if old_time != item.time_of_day else ""
             changes_summaries.append(f"**{item.title}**{time_change}")
             revision_items.append({
@@ -1187,6 +1276,12 @@ class PatientPlanService:
                 "previous_time": old_time,
                 "new_time": item.time_of_day,
             })
+
+        # Recalculate daily nutrition summary with updated items
+        updated_summary = cls._calculate_daily_nutrition_summary(plan)
+        if updated_summary:
+            plan.daily_nutrition_summary = updated_summary
+            flag_modified(plan, "daily_nutrition_summary")
 
         mod_data["status"] = "applied"
         if pending_disc and pending_disc.proposed_modifications:
@@ -1579,6 +1674,12 @@ class PatientPlanService:
                 description=item.description,
                 order_index=item.order_index,
                 is_active=item.is_active,
+                calories=item.calories,
+                protein_g=item.protein_g,
+                carbs_g=item.carbs_g,
+                fat_g=item.fat_g,
+                fiber_g=item.fiber_g,
+                calories_burned=item.calories_burned,
             )
             for item in plan.items
         ]
@@ -1612,9 +1713,56 @@ class PatientPlanService:
             items=items,
             discussions=discussions,
             today_logs=resolved_today_logs,
+            daily_nutrition_summary=plan.daily_nutrition_summary or cls._calculate_daily_nutrition_summary(plan),
             created_at=plan.created_at,
             updated_at=plan.updated_at,
         )
+
+    @classmethod
+    def _calculate_daily_nutrition_summary(cls, plan: PatientPlan) -> Optional[Dict[str, Any]]:
+        """Calculates aggregate daily nutritional totals from all active items."""
+        total_calories = 0
+        total_protein = 0.0
+        total_carbs = 0.0
+        total_fat = 0.0
+        total_fiber = 0.0
+        total_burned = 0
+        has_nutrition = False
+
+        for item in plan.items:
+            if not item.is_active:
+                continue
+            if item.calories is not None:
+                total_calories += item.calories
+                has_nutrition = True
+            if item.protein_g is not None:
+                total_protein += item.protein_g
+                has_nutrition = True
+            if item.carbs_g is not None:
+                total_carbs += item.carbs_g
+                has_nutrition = True
+            if item.fat_g is not None:
+                total_fat += item.fat_g
+                has_nutrition = True
+            if item.fiber_g is not None:
+                total_fiber += item.fiber_g
+                has_nutrition = True
+            if item.calories_burned is not None:
+                total_burned += item.calories_burned
+                has_nutrition = True
+
+        if not has_nutrition:
+            return None
+
+        return {
+            "total_calories": total_calories,
+            "total_protein_g": round(total_protein, 1),
+            "total_carbs_g": round(total_carbs, 1),
+            "total_fat_g": round(total_fat, 1),
+            "total_fiber_g": round(total_fiber, 1),
+            "total_calories_burned": total_burned,
+            "net_calories": total_calories - total_burned,
+        }
 
     @classmethod
     def _format_discussion_response(cls, d: PatientPlanDiscussion) -> PlanDiscussionMessageResponse:
@@ -1625,3 +1773,103 @@ class PatientPlanService:
             proposed_modifications=d.proposed_modifications,
             created_at=d.created_at,
         )
+
+    # ── Smart Intent Classifier ──────────────────────────────────────────────
+
+    @classmethod
+    def _classify_chat_intent(cls, text: str) -> str:
+        """
+        Deterministic intent classifier for plan chat messages.
+
+        Returns:
+        - "nutrition_info"      → standalone food/exercise information query
+        - "plan_modification"   → plan change request or general plan discussion (default)
+
+        The classifier is conservative: if there's ANY hint the user wants to
+        modify their plan, it falls through to the existing plan chat logic.
+        Only clearly standalone info queries are routed to the nutrition agent.
+        """
+        lowered = text.lower().strip()
+
+        # ── 1. Plan modification verbs → always plan_modification ─────────
+        plan_mod_verbs = (
+            "change", "swap", "shift", "replace", "move", "adjust", "switch",
+            "remove", "add", "update", "modify", "edit", "reschedule",
+            "badal", "badlo", "hatao", "hata do", "laga do", "daal do",
+            "time change", "time badal", "time shift",
+        )
+        for verb in plan_mod_verbs:
+            if verb in lowered:
+                return "plan_modification"
+
+        # ── 2. Plan item references → plan_modification ───────────────────
+        plan_item_refs = (
+            "my breakfast", "my lunch", "my dinner", "my workout",
+            "my plan", "my schedule", "mera plan", "mera breakfast",
+            "mera lunch", "mera dinner", "mera workout",
+            "morning routine", "evening routine", "sleep routine",
+        )
+        for ref in plan_item_refs:
+            if ref in lowered:
+                return "plan_modification"
+
+        # ── 3. Clear nutrition info queries → nutrition_info ──────────────
+
+        # Pattern: "X mein/ma/me kitni/kitna/kitne calories/protein/..."
+        urdu_info_patterns = [
+            r"\b(?:mein|ma|me|mai)\s+(?:kitni|kitna|kitne)\b",
+            r"\b(?:kitni|kitna|kitne)\s+(?:calories|calorie|protein|carbs?|fat|fiber)\b",
+            r"\b(?:agar|agr)\s+(?:main|mein|ma)\b.*\b(?:khaon|khaun|khata|khati|peeta|peeti|piyon)\b",
+            r"\b(?:se|sy)\s+(?:kitna|kitni|kitne)\s+(?:burn|jale|jalega|jalein|milega|milein)\b",
+        ]
+        for pat in urdu_info_patterns:
+            if re.search(pat, lowered):
+                return "nutrition_info"
+
+        # English info query patterns
+        english_info_patterns = [
+            r"\bhow\s+(?:many|much)\s+(?:calories|calorie|protein|carbs?|fat|fiber)\b",
+            r"\b(?:calories?|protein|carbs?|fat|fiber|nutrition(?:al)?)\s+(?:in|of|for)\b",
+            r"\bif\s+i\s+(?:eat|drink|have|consume|walk|run|jog|cycle|swim)\b",
+            r"\bhow\s+(?:many|much)\s+(?:calories?)\s+(?:does?|do|will|would|can)\b.*\bburn\b",
+            r"\b(?:nutritional?|caloric)\s+(?:value|info|information|content|data|facts?)\b",
+            r"\bwhat(?:'s| is| are)\s+(?:the\s+)?(?:calories?|protein|carbs?|fat|nutrition)\b",
+        ]
+        for pat in english_info_patterns:
+            if re.search(pat, lowered):
+                return "nutrition_info"
+
+        # Direct food/exercise info questions (standalone item name + calories keyword)
+        standalone_food_query = re.search(
+            r"\b(?:banana|apple|roti|paratha|biryani|daal|dal|chawal|rice|chicken|egg|anda|"
+            r"bread|naan|lassi|chai|milk|doodh|mango|orange|yogurt|dahi|sabzi|gosht|"
+            r"fish|machli|paneer|chana|rajma|oats|oatmeal|almonds|badam|walnuts|akhrot)\b"
+            r".*\b(?:calories?|protein|carbs?|fat|fiber|nutrition|kitni|kitna)\b",
+            lowered,
+        )
+        if standalone_food_query:
+            return "nutrition_info"
+
+        # Reverse pattern: nutrition keyword first, then food name
+        reverse_food_query = re.search(
+            r"\b(?:calories?|protein|carbs?|fat|fiber|nutrition|kitni|kitna)\b"
+            r".*\b(?:banana|apple|roti|paratha|biryani|daal|dal|chawal|rice|chicken|egg|anda|"
+            r"bread|naan|lassi|chai|milk|doodh|mango|orange|yogurt|dahi|sabzi|gosht|"
+            r"fish|machli|paneer|chana|rajma|oats|oatmeal|almonds|badam|walnuts|akhrot)\b",
+            lowered,
+        )
+        if reverse_food_query:
+            return "nutrition_info"
+
+        # Exercise info queries
+        exercise_info_query = re.search(
+            r"\b(?:walk(?:ing)?|run(?:ning)?|jog(?:ging)?|cycl(?:ing|e)|swim(?:ming)?|"
+            r"pushup|push[- ]?up|squat|plank|yoga|stretching|stairs|jumping)\b"
+            r".*\b(?:calories?|burn|jale|jalega|kitna|kitni|how\s+(?:many|much))\b",
+            lowered,
+        )
+        if exercise_info_query:
+            return "nutrition_info"
+
+        # ── 4. Default: route to plan discussion LLM ─────────────────────
+        return "plan_modification"
