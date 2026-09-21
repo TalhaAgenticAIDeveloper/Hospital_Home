@@ -241,3 +241,95 @@ class EmailService:
             # Do not re-raise in background job so it doesn't crash the scheduler
             return False
 
+    @staticmethod
+    async def send_plan_reminder_email(
+        to_email: str,
+        patient_name: str,
+        plan_title: str,
+        activity_title: str,
+        activity_time: str,
+        category: str,
+        description: str,
+    ) -> bool:
+        """
+        Send a scheduled wellness plan activity reminder email to a patient.
+        """
+        subject = f"🌱 Wellness Reminder: {activity_title} ({activity_time}) — MedTrust"
+        cat_display = category.replace("_", " ").title()
+
+        html_body = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        </head>
+        <body style="margin:0; padding:0; background-color:#f0f4f8; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
+            <div style="max-width:520px; margin:40px auto; background:#ffffff; border-radius:16px; overflow:hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.08);">
+                <div style="background: linear-gradient(135deg, #2563eb 0%, #0284c7 100%); padding:30px 36px; text-align:center;">
+                    <h1 style="color:#ffffff; margin:0; font-size:22px; font-weight:700;">
+                        🌱 MedTrust Daily Wellness
+                    </h1>
+                    <p style="color: rgba(255,255,255,0.9); margin:6px 0 0; font-size:14px;">
+                        Plan: {plan_title}
+                    </p>
+                </div>
+
+                <div style="padding:32px 36px;">
+                    <p style="color:#334155; font-size:15px; line-height:1.6; margin:0 0 16px;">
+                        Hello <strong>{patient_name}</strong>, it's time for your scheduled activity:
+                    </p>
+
+                    <div style="background: #eff6ff; border: 2px solid #bfdbfe; border-radius:12px; padding:18px 22px; margin-bottom:20px;">
+                        <div style="font-size:18px; font-weight:700; color:#1e40af; margin-bottom:6px;">
+                            ⏰ {activity_title}
+                        </div>
+                        <div style="font-size:14px; color:#1d4ed8; line-height:1.5;">
+                            <div><strong>Category:</strong> {cat_display}</div>
+                            <div><strong>Scheduled Time:</strong> {activity_time}</div>
+                        </div>
+                        <div style="margin-top:10px; font-size:13px; color:#334155; line-height:1.4;">
+                            {description}
+                        </div>
+                    </div>
+
+                    <p style="color:#64748b; font-size:13px; margin:0;">
+                        Log your completion anytime from your Patient Portal dashboard.
+                    </p>
+                </div>
+
+                <div style="background:#f8fafc; padding:18px 36px; text-align:center; border-top:1px solid #e2e8f0;">
+                    <p style="color:#94a3b8; font-size:12px; margin:0;">
+                        © {__import__('datetime').datetime.now().year} MedTrust SaaS Platform — Automated Health Reminders
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        msg = MIMEMultipart("alternative")
+        msg["From"] = f"MedTrust Health <{settings.EMAIL_FROM}>"
+        msg["To"] = to_email
+        msg["Subject"] = subject
+
+        plain_text = f"Wellness Reminder for {patient_name}:\n\nActivity: {activity_title}\nTime: {activity_time}\nPlan: {plan_title}\nDetails: {description}"
+        msg.attach(MIMEText(plain_text, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+
+        try:
+            await aiosmtplib.send(
+                msg,
+                hostname=settings.SMTP_SERVER,
+                port=settings.SMTP_PORT,
+                username=settings.SMTP_USERNAME,
+                password=settings.SMTP_PASSWORD,
+                start_tls=True,
+            )
+            logger.info(f"plan_reminder_email_sent: to={to_email} activity={activity_title} time={activity_time}")
+            return True
+        except Exception as e:
+            logger.error(f"plan_reminder_email_failed: to={to_email} activity={activity_title} error={str(e)}")
+            return False
+
+

@@ -4,7 +4,7 @@ at scheduled medicine dosage times.
 """
 
 from datetime import datetime, time
-from typing import Optional
+from typing import Any, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -94,3 +94,73 @@ def schedule_prescription_reminders(
                     )
                 except Exception as e:
                     logger.error(f"failed_to_schedule_reminder: job_id={job_id} error={str(e)}")
+
+
+def schedule_plan_reminders(
+    plan: Any,
+    patient_email: str,
+    patient_name: str,
+):
+    """
+    Schedule daily recurring reminder jobs for each active item in an approved wellness plan.
+    """
+    if not scheduler.running:
+        try:
+            start_scheduler()
+        except Exception as e:
+            logger.warning(f"Could not start scheduler inline: {e}")
+
+    for item in plan.items:
+        if not item.is_active:
+            continue
+
+        try:
+            time_parts = item.time_of_day.split(":")
+            hour = int(time_parts[0])
+            minute = int(time_parts[1])
+        except (ValueError, IndexError):
+            logger.warning(f"Invalid time format on plan item {item.id}: {item.time_of_day}")
+            continue
+
+        job_id = f"plan_remind_{plan.id}_{item.id}"
+
+        try:
+            scheduler.add_job(
+                EmailService.send_plan_reminder_email,
+                trigger=CronTrigger(hour=hour, minute=minute),
+                id=job_id,
+                name=f"Plan Reminder: {item.title} ({item.time_of_day})",
+                args=[
+                    patient_email,
+                    patient_name,
+                    plan.title,
+                    item.title,
+                    item.time_of_day,
+                    item.category,
+                    item.description,
+                ],
+                replace_existing=True,
+            )
+            logger.info(
+                f"scheduled_plan_reminder: job_id={job_id} time={item.time_of_day} title={item.title}"
+            )
+        except Exception as e:
+            logger.error(f"failed_to_schedule_plan_reminder: job_id={job_id} error={str(e)}")
+
+
+def cancel_plan_reminders(plan: Any):
+    """
+    Cancel all scheduled reminder jobs for a paused, completed, or cancelled plan.
+    """
+    if not scheduler.running:
+        return
+
+    for item in plan.items:
+        job_id = f"plan_remind_{plan.id}_{item.id}"
+        try:
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+                logger.info(f"cancelled_plan_reminder: job_id={job_id}")
+        except Exception as e:
+            logger.warning(f"Error removing reminder job {job_id}: {e}")
+
