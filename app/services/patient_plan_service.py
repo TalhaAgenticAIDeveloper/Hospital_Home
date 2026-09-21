@@ -428,6 +428,22 @@ class PatientPlanService:
                 )
             )
 
+        # Enforce single plan per patient rule
+        existing_plans = await PatientPlanRepository.list_plans_by_patient(session, patient_user.id)
+        if existing_plans:
+            existing = existing_plans[0]
+            raise ValidationError(
+                f"You already have an existing plan ('{existing.title}'). "
+                "A patient can only have one plan at a time. "
+                "Please cancel your current plan first to wipe it from the database before starting a new one."
+            )
+
+        # Clear any prior incomplete goal without a plan to keep database clean
+        existing_goal = await PatientPlanRepository.get_latest_in_progress_goal(session, patient_user.id)
+        if existing_goal and not existing_goal.plans:
+            await session.delete(existing_goal)
+            await session.flush()
+
         goal = PatientGoal(
             patient_id=patient_user.id,
             title=PlanValidator.sanitize_text(payload.title, 255),
@@ -602,6 +618,15 @@ class PatientPlanService:
         goal = await PatientPlanRepository.get_goal_by_id(session, goal_id, patient_user.id)
         if not goal:
             raise NotFoundError("Goal not found or does not belong to you.")
+
+        # Enforce single plan per patient rule (ensure no other plans exist outside this goal)
+        existing_plans = await PatientPlanRepository.list_plans_by_patient(session, patient_user.id)
+        conflicting_plans = [p for p in existing_plans if p.goal_id != goal.id]
+        if conflicting_plans:
+            raise ValidationError(
+                f"You already have an existing plan ('{conflicting_plans[0].title}'). "
+                "A patient can only have one plan at a time. Please cancel your existing plan before creating a new one."
+            )
 
         # Idempotency check: if plan already exists in 'ready' or 'active', return existing plan
         for existing in goal.plans:
@@ -971,15 +996,15 @@ class PatientPlanService:
                 await session.refresh(rejection_reply)
                 return cls._format_discussion_response(rejection_reply)
 
-        # 3. Detect Goal Change Request ("I want weight loss instead")
-        if any(phrase in lowered for phrase in ("change my goal", "different goal", "weight loss instead", "weight gain instead", "forget this plan", "new goal")):
+        # 3. Detect Goal Change / Cancel Request ("I want weight loss instead", "cancel plan")
+        if any(phrase in lowered for phrase in ("change my goal", "different goal", "weight loss instead", "weight gain instead", "forget this plan", "new goal", "cancel my plan", "delete my plan", "cancel plan", "delete plan")):
             goal_reply = PatientPlanDiscussion(
                 plan_id=plan.id,
                 role="assistant",
                 content=(
-                    f"Your current plan is configured for **{plan.title}**. "
-                    "If your health objectives have changed, you can click **Start New Goal** from your dashboard "
-                    "to set up a dedicated questionnaire and plan without overwriting your current progress."
+                    f"A patient can only have **one plan at a time**. Your current plan is configured for **{plan.title}**.\n\n"
+                    "If you would like to start a brand new plan, please click **Cancel Plan** at the top of your dashboard. "
+                    "This will completely clear your current plan from the database so you can start fresh with a new goal and questionnaire."
                 ),
             )
             await PatientPlanRepository.add_discussion_message(session, goal_reply)
@@ -1505,19 +1530,27 @@ class PatientPlanService:
         session: AsyncSession,
         patient_user: User,
         plan_id: uuid.UUID,
-    ) -> PatientPlanDetailResponse:
-        """Cancels a plan without deleting historical records or audit trail."""
+    ) -> Dict[str, Any]:
+        """
+        Cancels and completely wipes the plan, its schedule items, discussions,
+        logs, and associated goal from the database so the patient can start fresh.
+        """
         plan = await PatientPlanRepository.get_plan_by_id(session, plan_id, patient_user.id)
-        if not plan:
-            raise NotFoundError("Plan not found.")
+        if plan:
+            # 1. Stop background scheduled reminders
+            try:
+                cancel_plan_reminders(plan)
+            except Exception as e:
+                logger.warning(f"Error cancelling reminders during plan deletion: {e}")
 
-        plan.status = "cancelled"
-        await PatientPlanRepository.update_goal_state(session, plan.goal_id, "CANCELLED")
-        cancel_plan_reminders(plan)
+        # 2. Completely wipe all plans, goals, schedule items, discussions, and logs for this patient
+        await PatientPlanRepository.delete_all_patient_plans_and_goals(session, patient_user.id)
         await session.commit()
 
-        full_plan = await PatientPlanRepository.get_plan_by_id(session, plan.id, patient_user.id)
-        return cls._format_plan_response(full_plan)
+        return {
+            "status": "deleted",
+            "message": "Your plan and all associated data have been completely wiped from the database. You can now create a fresh new plan.",
+        }
 
     # ── Daily Progress Logging ───────────────────────────────────────────────
 

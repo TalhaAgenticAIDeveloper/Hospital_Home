@@ -412,3 +412,33 @@ class PatientPlanRepository:
         session.add(notif)
         await session.flush()
         return notif
+
+    # ── Plan & Goal Complete Deletion ────────────────────────────────────────
+
+    @staticmethod
+    async def delete_all_patient_plans_and_goals(
+        session: AsyncSession,
+        patient_id: uuid.UUID,
+    ) -> int:
+        """
+        Permanently wipes all plans, goals, schedule items, discussions,
+        logs, questions, and answers for a patient from the database.
+        """
+        # 1. Fetch and delete all goals (cascades to questions, answers, plans, items, etc.)
+        goal_query = select(PatientGoal).where(PatientGoal.patient_id == patient_id)
+        goal_result = await session.execute(goal_query)
+        goals = list(goal_result.scalars().all())
+
+        for goal in goals:
+            await session.delete(goal)
+
+        # 2. In case any orphaned plans exist directly tied to patient
+        plan_query = select(PatientPlan).where(PatientPlan.patient_id == patient_id)
+        plan_result = await session.execute(plan_query)
+        plans = list(plan_result.scalars().all())
+
+        for plan in plans:
+            await session.delete(plan)
+
+        await session.flush()
+        return len(goals) + len(plans)

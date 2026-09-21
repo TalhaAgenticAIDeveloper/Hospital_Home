@@ -14,7 +14,7 @@ Provides endpoints for:
 """
 
 import uuid
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -279,14 +279,14 @@ async def resume_plan(
 
 @router.post(
     "/{plan_id}/cancel",
-    response_model=PatientPlanDetailResponse,
-    summary="Cancel a plan (retains historical data for audit)",
+    response_model=Dict[str, Any],
+    summary="Cancel and completely remove plan and goal from database",
 )
 async def cancel_plan(
     plan_id: uuid.UUID,
     user: User = Depends(require_role(UserRole.PATIENT)),
     session: AsyncSession = Depends(get_db),
-) -> PatientPlanDetailResponse:
+) -> Dict[str, Any]:
     return await PatientPlanService.cancel_plan(
         session=session,
         patient_user=user,
