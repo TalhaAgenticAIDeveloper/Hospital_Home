@@ -344,7 +344,9 @@ class PlanValidator:
             if "weight" in question_key:
                 # Check missing unit ambiguity
                 if not unit:
-                    if 20 <= val <= 350:
+                    if expected_unit and any(u in expected_unit.lower() for u in ("kg", "lb", "pound", "kilo")):
+                        unit = "lb" if ("lb" in expected_unit.lower() or "pound" in expected_unit.lower()) else "kg"
+                    elif 20 <= val <= 350:
                         return AnswerValidationResult(
                             status="clarification_needed",
                             message=f"Is that {int(val) if val.is_integer() else val} kg or {int(val) if val.is_integer() else val} lb?",
@@ -409,6 +411,10 @@ class PlanValidator:
 
                 if unit == "m":
                     val_cm = round(val * 100, 1)
+                elif unit in ("ft", "feet"):
+                    val_cm = round(val * 30.48, 1)
+                elif unit in ("in", "inch", "inches"):
+                    val_cm = round(val * 2.54, 1)
                 else:
                     val_cm = round(val, 1)
 
@@ -451,6 +457,19 @@ class PlanValidator:
                     can_proceed=True,
                     extracted_fields={"age": age_val},
                 )
+
+            # Generic numeric question handler (e.g. water intake, steps, hours, or any AI numeric question)
+            final_unit = unit or expected_unit
+            val_display = f"{int(val)}" if val.is_integer() else f"{val}"
+            norm_str = f"{val_display} {final_unit}".strip() if final_unit else val_display
+            return AnswerValidationResult(
+                status="valid",
+                message=None,
+                normalized_value=norm_str,
+                unit=final_unit,
+                can_proceed=True,
+                extracted_fields={question_key: norm_str},
+            )
 
         # 4. Time Question Handling
         if question_type == "time" or "time" in question_key:
@@ -500,10 +519,10 @@ class PlanValidator:
             multi_extracted["age"] = int(a_match.group(1))
 
         # Default text question
-        if len(clean_input) < 2:
+        if len(clean_input) < 1:
             return AnswerValidationResult(
                 status="invalid",
-                message="Answer is too short. Please provide a little more detail.",
+                message="Please enter an answer before continuing.",
                 normalized_value=None,
                 unit=None,
                 can_proceed=False,
