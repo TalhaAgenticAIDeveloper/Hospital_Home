@@ -61,282 +61,41 @@ settings = get_settings()
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 MAX_QUESTION_RETRIES = 3
 
-# ── Goal-Tailored Question Banks (Deterministic & Safe Fallback) ─────────────
-QUESTION_BANKS: Dict[str, List[Dict[str, Any]]] = {
-    "weight_management": [
-        {
-            "question_key": "current_weight",
-            "question_text": "What is your current weight?",
-            "question_type": "number",
-            "unit": "kg",
-            "is_required": True,
-            "help_text": "e.g., 70 kg or 154 lb",
-        },
-        {
-            "question_key": "target_weight",
-            "question_text": "What is your target weight goal?",
-            "question_type": "number",
-            "unit": "kg",
-            "is_required": False,
-            "help_text": "e.g., 65 kg (optional)",
-        },
-        {
-            "question_key": "height",
-            "question_text": "What is your height?",
-            "question_type": "number",
-            "unit": "cm",
-            "is_required": False,
-            "help_text": "e.g., 170 cm or 5'8\"",
-        },
-        {
-            "question_key": "activity_level",
-            "question_text": "How active are you in an average day?",
-            "question_type": "select",
-            "options": ["Sedentary (mostly desk work)", "Lightly active (light walking)", "Moderately active (workout 3-4x/week)", "Very active (daily vigorous exercise)"],
-            "is_required": True,
-            "help_text": "Choose your general activity level",
-        },
-        {
-            "question_key": "wake_up_time",
-            "question_text": "What time do you usually wake up?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 07:00 AM or after Fajr",
-        },
-        {
-            "question_key": "bed_time",
-            "question_text": "What time do you usually go to sleep?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 11:00 PM",
-        },
-        {
-            "question_key": "dietary_restrictions",
-            "question_text": "Do you follow any specific dietary patterns or restrictions?",
-            "question_type": "text",
-            "is_required": False,
-            "help_text": "e.g., Vegetarian, Vegan, Halal, Low sodium, or None",
-        },
-        {
-            "question_key": "food_allergies",
-            "question_text": "Do you have any food allergies or severe intolerances?",
-            "question_type": "text",
-            "is_required": True,
-            "help_text": "e.g., Peanuts, Dairy, Shellfish, Gluten, or None",
-        },
-    ],
-    "sleep_optimization": [
-        {
-            "question_key": "bed_time",
-            "question_text": "What time do you currently go to bed?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 11:30 PM",
-        },
-        {
-            "question_key": "wake_up_time",
-            "question_text": "What time do you usually wake up in the morning?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 07:00 AM",
-        },
-        {
-            "question_key": "sleep_challenge",
-            "question_text": "What is your primary sleep difficulty?",
-            "question_type": "select",
-            "options": ["Difficulty falling asleep", "Waking up repeatedly during night", "Waking up too early and feeling tired", "Irregular sleep schedule"],
-            "is_required": True,
-            "help_text": "Select the main issue you face",
-        },
-        {
-            "question_key": "caffeine_intake",
-            "question_text": "How much caffeine (tea, coffee, energy drinks) do you consume daily?",
-            "question_type": "select",
-            "options": ["None", "1 cup in morning only", "2-3 cups through the day", "Caffeine in the evening or night"],
-            "is_required": True,
-            "help_text": "Select your caffeine habit",
-        },
-        {
-            "question_key": "evening_screen_time",
-            "question_text": "Do you use your phone, laptop, or watch TV within 1 hour of sleep?",
-            "question_type": "select",
-            "options": ["Rarely or never", "Sometimes (15-30 mins)", "Consistently right up to sleep"],
-            "is_required": False,
-            "help_text": "Evening screen habits",
-        },
-        {
-            "question_key": "food_allergies",
-            "question_text": "Do you have any food allergies or food intolerances?",
-            "question_type": "text",
-            "is_required": True,
-            "help_text": "e.g., None, Dairy, Nuts",
-        },
-    ],
-    "fitness_mobility": [
-        {
-            "question_key": "current_fitness_level",
-            "question_text": "What is your current fitness experience level?",
-            "question_type": "select",
-            "options": ["Beginner (little to no exercise)", "Intermediate (regular walks or workouts)", "Advanced (consistent athletic training)"],
-            "is_required": True,
-            "help_text": "Select your fitness level",
-        },
-        {
-            "question_key": "exercise_preference",
-            "question_text": "What types of physical activity do you enjoy most?",
-            "question_type": "select",
-            "options": ["Brisk walking / light jogging", "Bodyweight & home mobility exercises", "Gym weight training", "Yoga, stretching & pilates"],
-            "is_required": True,
-            "help_text": "Choose your preferred activity",
-        },
-        {
-            "question_key": "daily_available_time",
-            "question_text": "How many minutes can you dedicate to physical activity each day?",
-            "question_type": "number",
-            "unit": "minutes",
-            "is_required": True,
-            "help_text": "e.g., 30 minutes",
-        },
-        {
-            "question_key": "physical_limitations",
-            "question_text": "Do you have any joint pain, back pain, or physical limitations?",
-            "question_type": "text",
-            "is_required": False,
-            "help_text": "e.g., Lower back stiffness, knee pain, or None",
-        },
-        {
-            "question_key": "wake_up_time",
-            "question_text": "What time do you wake up?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 06:30 AM",
-        },
-        {
-            "question_key": "food_allergies",
-            "question_text": "Any food allergies or dietary restrictions?",
-            "question_type": "text",
-            "is_required": True,
-            "help_text": "e.g., None, Peanuts, Gluten",
-        },
-    ],
-    "stress_reduction": [
-        {
-            "question_key": "primary_stressor",
-            "question_text": "What are your primary daily stress triggers?",
-            "question_type": "select",
-            "options": ["Work & career demands", "Family & personal responsibilities", "Health worries", "General feeling of overwhelm"],
-            "is_required": True,
-            "help_text": "Select the main stress source",
-        },
-        {
-            "question_key": "daily_relaxation_time",
-            "question_text": "How much downtime or relaxation time do you get daily?",
-            "question_type": "select",
-            "options": ["Almost none (< 15 mins)", "Around 30 minutes", "1 hour or more"],
-            "is_required": True,
-            "help_text": "Choose your average downtime",
-        },
-        {
-            "question_key": "wake_up_time",
-            "question_text": "What time do you usually wake up?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 07:30 AM",
-        },
-        {
-            "question_key": "bed_time",
-            "question_text": "What time do you usually go to bed?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 11:00 PM",
-        },
-        {
-            "question_key": "food_allergies",
-            "question_text": "Do you have any food allergies?",
-            "question_type": "text",
-            "is_required": True,
-            "help_text": "e.g., None, Shellfish, Nuts",
-        },
-    ],
-    "nutrition": [
-        {
-            "question_key": "dietary_pattern",
-            "question_text": "Which dietary pattern best describes your eating habits?",
-            "question_type": "select",
-            "options": ["Omnivore (eats all meats and plants)", "Vegetarian", "Vegan (plant-based only)", "Pescatarian (fish & plants)", "Halal only"],
-            "is_required": True,
-            "help_text": "Select your diet style",
-        },
-        {
-            "question_key": "meals_per_day",
-            "question_text": "How many meals do you typically eat in a day?",
-            "question_type": "select",
-            "options": ["2 meals (often skip breakfast)", "3 regular meals", "3 meals plus snacks"],
-            "is_required": True,
-            "help_text": "Select meal frequency",
-        },
-        {
-            "question_key": "water_intake",
-            "question_text": "How much water do you drink per day?",
-            "question_type": "select",
-            "options": ["Less than 1 liter", "1 to 2 liters", "More than 2 liters"],
-            "is_required": False,
-            "help_text": "Daily hydration level",
-        },
-        {
-            "question_key": "food_allergies",
-            "question_text": "Do you have any food allergies or severe intolerances?",
-            "question_type": "text",
-            "is_required": True,
-            "help_text": "e.g., Peanuts, Dairy, Gluten, Soy, or None",
-        },
-        {
-            "question_key": "food_dislikes",
-            "question_text": "Are there any healthy foods you strongly dislike or avoid?",
-            "question_type": "text",
-            "is_required": False,
-            "help_text": "e.g., Mushrooms, fish, eggs (optional)",
-        },
-        {
-            "question_key": "wake_up_time",
-            "question_text": "What time do you usually wake up?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 07:00 AM",
-        },
-    ],
-    "custom": [
-        {
-            "question_key": "activity_level",
-            "question_text": "How would you describe your daily physical activity?",
-            "question_type": "select",
-            "options": ["Sedentary", "Lightly active", "Moderately active", "Very active"],
-            "is_required": True,
-            "help_text": "Activity level",
-        },
-        {
-            "question_key": "wake_up_time",
-            "question_text": "What time do you typically wake up?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 07:00 AM",
-        },
-        {
-            "question_key": "bed_time",
-            "question_text": "What time do you typically go to sleep?",
-            "question_type": "time",
-            "is_required": True,
-            "help_text": "e.g., 11:00 PM",
-        },
-        {
-            "question_key": "food_allergies",
-            "question_text": "Do you have any food allergies or dietary restrictions?",
-            "question_type": "text",
-            "is_required": True,
-            "help_text": "e.g., Peanuts, Dairy, Gluten, or None",
-        },
-    ],
-}
+# ── Minimal Fallback Questions (used ONLY if AI question generation fails) ────
+FALLBACK_ESSENTIAL_QUESTIONS: List[Dict[str, Any]] = [
+    {
+        "question_key": "food_allergies",
+        "question_text": "Do you have any food allergies or severe intolerances?",
+        "question_type": "text",
+        "is_required": True,
+        "help_text": "e.g., Peanuts, Dairy, Shellfish, Gluten, or None",
+    },
+    {
+        "question_key": "wake_up_time",
+        "question_text": "What time do you usually wake up?",
+        "question_type": "time",
+        "is_required": True,
+        "help_text": "e.g., 07:00 AM or after Fajr",
+    },
+    {
+        "question_key": "bed_time",
+        "question_text": "What time do you usually go to sleep?",
+        "question_type": "time",
+        "is_required": True,
+        "help_text": "e.g., 11:00 PM",
+    },
+    {
+        "question_key": "activity_level",
+        "question_text": "How would you describe your daily physical activity?",
+        "question_type": "select",
+        "options": ["Sedentary (mostly desk work)", "Lightly active (light walking)", "Moderately active (workout 3-4x/week)", "Very active (daily vigorous exercise)"],
+        "is_required": True,
+        "help_text": "Select your general activity level",
+    },
+]
+
+# Valid question_type values the frontend supports
+VALID_QUESTION_TYPES = {"number", "select", "time", "text"}
 
 
 class PatientPlanService:
@@ -397,6 +156,189 @@ class PatientPlanService:
 
             return cleaned or raw_content
 
+    # ── AI Question Generation ─────────────────────────────────────────────
+
+    @classmethod
+    async def _generate_questions_via_ai(
+        cls,
+        category: str,
+        title: str,
+        target_description: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Calls Groq LLM to dynamically generate clinically relevant intake assessment
+        questions tailored to the patient's specific goal, category, and description.
+        Acts as an experienced clinical wellness doctor conducting an initial consultation.
+
+        Returns a list of question dicts ready for PatientGoalQuestion creation.
+        Falls back to FALLBACK_ESSENTIAL_QUESTIONS if AI generation fails.
+        """
+        system_prompt = (
+            "You are an experienced clinical wellness doctor conducting an initial patient intake assessment. "
+            "Based on the patient's health goal and description, generate a focused set of clinically relevant "
+            "questions that a real doctor would ask before creating a personalized wellness plan.\n\n"
+            "RULES:\n"
+            "1. Generate exactly 6 to 10 questions — no more, no fewer.\n"
+            "2. Questions must be medically and clinically relevant to the patient's specific goal.\n"
+            "3. MANDATORY: You MUST always include these safety-critical questions:\n"
+            "   - A food allergy question (question_key MUST be 'food_allergies', question_type: 'text', is_required: true)\n"
+            "   - A wake-up time question (question_key MUST be 'wake_up_time', question_type: 'time', is_required: true)\n"
+            "   - A bed/sleep time question (question_key MUST be 'bed_time', question_type: 'time', is_required: true)\n"
+            "4. Each question must have:\n"
+            "   - question_key: unique snake_case identifier (e.g., 'current_weight', 'dietary_pattern')\n"
+            "   - question_text: clear, compassionate question text\n"
+            "   - question_type: one of 'number', 'select', 'time', 'text'\n"
+            "   - is_required: boolean (true for critical questions, false for optional)\n"
+            "   - help_text: short helpful example or hint\n"
+            "   - unit: string (ONLY for 'number' type, e.g. 'kg', 'cm', 'minutes', 'liters') — omit or set null for other types\n"
+            "   - options: array of 3-5 option strings (ONLY for 'select' type) — omit or set null for other types\n"
+            "5. Use appropriate question_type for each question:\n"
+            "   - 'number' for measurable values (weight, height, age, duration in minutes)\n"
+            "   - 'select' for multiple choice (activity level, diet pattern, frequency)\n"
+            "   - 'time' for time-of-day questions (wake up, sleep, meal times)\n"
+            "   - 'text' for open-ended responses (allergies, medical conditions, preferences)\n"
+            "6. Be culturally sensitive — support South Asian context (Halal, roti/paratha, Fajr prayer timing, etc.)\n"
+            "7. Do NOT ask about medications or prescriptions — only lifestyle, diet, and activity.\n"
+            "8. Keep questions practical and actionable — avoid vague or overly clinical jargon.\n"
+            "9. question_key values must be unique across all questions.\n\n"
+            "OUTPUT: Return ONLY a valid raw JSON array of question objects. No markdown, no explanations, no preamble.\n"
+            "Example format:\n"
+            "[\n"
+            '  {"question_key": "current_weight", "question_text": "What is your current weight?", '
+            '"question_type": "number", "unit": "kg", "is_required": true, '
+            '"help_text": "e.g., 70 kg or 154 lb"},\n'
+            '  {"question_key": "activity_level", "question_text": "How active are you daily?", '
+            '"question_type": "select", "options": ["Sedentary", "Lightly active", "Moderately active", "Very active"], '
+            '"is_required": true, "help_text": "Choose your activity level"}\n'
+            "]"
+        )
+
+        user_prompt = (
+            f"PATIENT GOAL CATEGORY: {category}\n"
+            f"GOAL TITLE: {title}\n"
+            f"PATIENT'S DESCRIPTION: {target_description}\n\n"
+            "Generate the clinical intake assessment questions for this patient now."
+        )
+
+        try:
+            raw_response = await cls._call_groq_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1536,
+            )
+
+            # Extract JSON array from response
+            json_str = raw_response.strip()
+            if "```json" in json_str:
+                json_str = json_str.split("```json", 1)[1].split("```", 1)[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```", 1)[1].split("```", 1)[0].strip()
+
+            questions_raw = json.loads(json_str)
+
+            if not isinstance(questions_raw, list) or len(questions_raw) < 3:
+                logger.warning(f"AI returned insufficient questions ({len(questions_raw) if isinstance(questions_raw, list) else 'non-list'}), falling back.")
+                return FALLBACK_ESSENTIAL_QUESTIONS
+
+            # Validate and sanitize each question
+            validated_questions: List[Dict[str, Any]] = []
+            seen_keys: Set[str] = set()
+
+            for q in questions_raw:
+                if not isinstance(q, dict):
+                    continue
+
+                q_key = str(q.get("question_key", "")).strip().lower().replace(" ", "_")
+                q_text = str(q.get("question_text", "")).strip()
+                q_type = str(q.get("question_type", "text")).strip().lower()
+                q_required = bool(q.get("is_required", True))
+                q_help = str(q.get("help_text", "")).strip() or None
+                q_unit = q.get("unit")
+                q_options = q.get("options")
+
+                # Skip invalid entries
+                if not q_key or not q_text or q_key in seen_keys:
+                    continue
+                if q_type not in VALID_QUESTION_TYPES:
+                    q_type = "text"
+
+                # Ensure unit only for number type
+                if q_type != "number":
+                    q_unit = None
+                elif q_unit:
+                    q_unit = str(q_unit).strip()[:20]
+
+                # Ensure options only for select type and is a valid list
+                if q_type == "select":
+                    if not isinstance(q_options, list) or len(q_options) < 2:
+                        q_type = "text"  # Demote to text if invalid options
+                        q_options = None
+                    else:
+                        q_options = [str(o).strip() for o in q_options if str(o).strip()]
+                else:
+                    q_options = None
+
+                seen_keys.add(q_key)
+                validated_q: Dict[str, Any] = {
+                    "question_key": q_key[:100],
+                    "question_text": q_text[:500],
+                    "question_type": q_type,
+                    "is_required": q_required,
+                    "help_text": q_help[:500] if q_help else None,
+                }
+                if q_unit:
+                    validated_q["unit"] = q_unit
+                if q_options:
+                    validated_q["options"] = q_options
+
+                validated_questions.append(validated_q)
+
+            # Ensure mandatory safety questions are present
+            mandatory_keys = {
+                "food_allergies": {
+                    "question_key": "food_allergies",
+                    "question_text": "Do you have any food allergies or severe intolerances?",
+                    "question_type": "text",
+                    "is_required": True,
+                    "help_text": "e.g., Peanuts, Dairy, Shellfish, Gluten, or None",
+                },
+                "wake_up_time": {
+                    "question_key": "wake_up_time",
+                    "question_text": "What time do you usually wake up?",
+                    "question_type": "time",
+                    "is_required": True,
+                    "help_text": "e.g., 07:00 AM or after Fajr",
+                },
+                "bed_time": {
+                    "question_key": "bed_time",
+                    "question_text": "What time do you usually go to sleep?",
+                    "question_type": "time",
+                    "is_required": True,
+                    "help_text": "e.g., 11:00 PM",
+                },
+            }
+            existing_keys = {q["question_key"] for q in validated_questions}
+            for key, fallback_q in mandatory_keys.items():
+                if key not in existing_keys:
+                    validated_questions.append(fallback_q)
+
+            if len(validated_questions) < 3:
+                logger.warning("AI question validation resulted in too few questions, falling back.")
+                return FALLBACK_ESSENTIAL_QUESTIONS
+
+            # Cap at 12 questions maximum
+            return validated_questions[:12]
+
+        except (json.JSONDecodeError, ValidationError) as exc:
+            logger.error(f"AI question generation failed (parse/validation): {exc}")
+            return FALLBACK_ESSENTIAL_QUESTIONS
+        except Exception as exc:
+            logger.error(f"AI question generation failed (unexpected): {exc}")
+            return FALLBACK_ESSENTIAL_QUESTIONS
+
     # ── Goals & Questionnaire ────────────────────────────────────────────────
 
     @classmethod
@@ -407,11 +349,21 @@ class PatientPlanService:
         payload: CreateGoalRequest,
     ) -> PatientGoalDetailResponse:
         """
-        Creates a new patient goal and seeds the goal-tailored questions.
+        Creates a new patient goal and seeds AI-generated clinical questions.
+        The AI acts as a real doctor, generating relevant intake assessment
+        questions tailored to the patient's specific goal and description.
+        Falls back to essential questions if AI is unavailable.
         Transitions state to QUESTIONNAIRE_ACTIVE.
         """
-        category = payload.category if payload.category in QUESTION_BANKS else "custom"
-        raw_questions = QUESTION_BANKS.get(category, QUESTION_BANKS["custom"])
+        category = payload.category or "custom"
+
+        # Generate questions via AI based on the patient's specific goal
+        raw_questions = await cls._generate_questions_via_ai(
+            category=category,
+            title=payload.title,
+            target_description=payload.target_description,
+        )
+
         question_objects = []
         for idx, q in enumerate(raw_questions):
             question_objects.append(
