@@ -263,6 +263,48 @@ class TranscriptionService:
                     f"elapsed_ms={elapsed_ms}"
                 )
 
+                # ── Auto-chain AI Clinical Extraction ────────────────────────
+                # If audio was transcribed with speech segments, automatically trigger
+                # the clinical extraction pipeline in the background so the draft prescription
+                # is ready for the doctor without requiring manual clicks.
+                if meeting and interleaved and len(interleaved) > 0:
+                    try:
+                        from app.models.consultation_ai_extraction import ConsultationAIExtraction
+                        from app.services.consultation_ai_service import ConsultationAIService
+
+                        # Check if extraction was already generated or is active
+                        existing_extraction = await ConsultationAIRepository.get_latest_extraction(
+                            session, meeting_id
+                        )
+                        if not existing_extraction or existing_extraction.status in ("failed", "cancelled"):
+                            next_version = await ConsultationAIRepository.get_next_extraction_version(
+                                session, meeting_id
+                            )
+                            extraction = ConsultationAIExtraction(
+                                meeting_id=meeting_id,
+                                transcript_id=transcript.id,
+                                doctor_id=meeting.doctor_id,
+                                patient_id=meeting.patient_id,
+                                version=next_version,
+                                status="processing",
+                                llm_model_used=settings.GROQ_MODEL,
+                            )
+                            extraction = await ConsultationAIRepository.create_extraction(session, extraction)
+                            await session.commit()
+
+                            logger.info(
+                                f"auto_chain_extraction_initiated: meeting_id={meeting_id} "
+                                f"extraction_id={extraction.id} version={next_version}"
+                            )
+
+                            # Run extraction LLM pipeline
+                            await ConsultationAIService.run_extraction_pipeline(meeting_id, extraction.id)
+                    except Exception as auto_ex_err:
+                        logger.error(
+                            f"Auto-chain extraction failed for meeting {meeting_id}: {auto_ex_err}",
+                            exc_info=True,
+                        )
+
             except Exception as e:
                 logger.error(f"Transcription pipeline error for meeting {meeting_id}: {e}")
                 try:
