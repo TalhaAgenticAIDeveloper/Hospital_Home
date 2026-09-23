@@ -56,6 +56,16 @@ class SignalingManager:
             await websocket.close(code=4003)
             return False
 
+        # Remove stale connection for same user (e.g. page refresh / duplicate tab)
+        stale = [c for c in self._rooms[room_id] if c.user_id == user_id]
+        for old_conn in stale:
+            self._rooms[room_id].remove(old_conn)
+            logger.info(f"Removed stale connection for user {user_id} in room {room_id}")
+            try:
+                await old_conn.websocket.close(code=4008, reason="Replaced by new connection")
+            except Exception:
+                pass
+
         connection = MeetingConnection(websocket, user_id, role, name)
         self._rooms[room_id].append(connection)
 
