@@ -47,6 +47,17 @@ class SignalingManager:
         if room_id not in self._rooms:
             self._rooms[room_id] = []
 
+        # Remove stale connection for same user or same role first (e.g. page refresh / duplicate tab)
+        stale = [c for c in self._rooms[room_id] if c.user_id == user_id or c.role == role]
+        for old_conn in stale:
+            if old_conn in self._rooms[room_id]:
+                self._rooms[room_id].remove(old_conn)
+            logger.info(f"Removed stale connection for user {user_id} ({role}) in room {room_id}")
+            try:
+                await old_conn.websocket.close(code=4008, reason="Replaced by new connection")
+            except Exception:
+                pass
+
         # Check room capacity (max 2: 1 doctor, 1 patient)
         if len(self._rooms[room_id]) >= 2:
             await websocket.send_text(json.dumps({
@@ -55,16 +66,6 @@ class SignalingManager:
             }))
             await websocket.close(code=4003)
             return False
-
-        # Remove stale connection for same user (e.g. page refresh / duplicate tab)
-        stale = [c for c in self._rooms[room_id] if c.user_id == user_id]
-        for old_conn in stale:
-            self._rooms[room_id].remove(old_conn)
-            logger.info(f"Removed stale connection for user {user_id} in room {room_id}")
-            try:
-                await old_conn.websocket.close(code=4008, reason="Replaced by new connection")
-            except Exception:
-                pass
 
         connection = MeetingConnection(websocket, user_id, role, name)
         self._rooms[room_id].append(connection)
