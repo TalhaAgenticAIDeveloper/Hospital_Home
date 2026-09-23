@@ -410,10 +410,24 @@ class ConsultationAIService:
         transcript = await ConsultationAIRepository.get_transcript_by_meeting_id(
             session, meeting_id
         )
-        if not transcript or transcript.transcription_status != "completed":
+        has_transcript = bool(transcript and transcript.transcription_status == "completed")
+        has_notes = bool(meeting.doctor_notes and meeting.doctor_notes.strip())
+
+        if not has_transcript and not has_notes:
             raise ValidationError(
-                "Transcription must be completed before generating extraction"
+                "A completed audio transcription or doctor clinical notes are required before generating extraction"
             )
+
+        if not transcript:
+            from app.models.consultation_transcript import ConsultationTranscript
+            transcript = ConsultationTranscript(
+                meeting_id=meeting_id,
+                transcription_status="completed" if has_notes else "pending",
+                full_text=f"[DOCTOR NOTES] {meeting.doctor_notes}" if has_notes else None,
+                structured_transcript=[{"speaker": "doctor", "start_time": 0, "text": meeting.doctor_notes}] if has_notes else [],
+            )
+            transcript = await ConsultationAIRepository.create_transcript(session, transcript)
+            await session.commit()
 
         # Create new version
         next_version = await ConsultationAIRepository.get_next_extraction_version(
@@ -464,18 +478,20 @@ class ConsultationAIService:
                 transcript = await ConsultationAIRepository.get_transcript_by_meeting_id(
                     session, meeting_id
                 )
-                if not transcript or not transcript.structured_transcript:
-                    extraction.status = "failed"
-                    extraction.error_message = "No transcript data available"
-                    await session.commit()
-                    return
+                meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
 
                 start_time = time.time()
-                segments = transcript.structured_transcript
+                segments = transcript.structured_transcript if (transcript and transcript.structured_transcript) else []
+                full_text = transcript.full_text if (transcript and transcript.full_text) else ""
 
-                if not isinstance(segments, list) or len(segments) == 0:
+                # If no audio transcript segments, fall back to doctor notes
+                if (not segments or len(segments) == 0) and meeting and meeting.doctor_notes and meeting.doctor_notes.strip():
+                    full_text = f"[DOCTOR CLINICAL NOTES]\n{meeting.doctor_notes.strip()}"
+                    segments = [{"speaker": "doctor", "start_time": 0, "text": meeting.doctor_notes.strip()}]
+
+                if not segments or len(segments) == 0:
                     extraction.status = "failed"
-                    extraction.error_message = "Transcript has no segments"
+                    extraction.error_message = "No dialogue segments or doctor clinical notes available for extraction"
                     await session.commit()
                     return
 
