@@ -112,6 +112,20 @@ class SignalingManager:
 
             if not self._rooms[room_id]:
                 del self._rooms[room_id]
+                try:
+                    import asyncio
+                    from app.services.live_transcription_manager import live_transcription_manager
+                    asyncio.create_task(live_transcription_manager.flush_and_close(room_id))
+                except Exception:
+                    pass
+
+    def get_connection(self, room_id: str, websocket: WebSocket) -> Optional[MeetingConnection]:
+        """Find the MeetingConnection for a given WebSocket in a room."""
+        if room_id in self._rooms:
+            for conn in self._rooms[room_id]:
+                if conn.websocket == websocket:
+                    return conn
+        return None
 
     async def broadcast(self, room_id: str, message: dict, exclude: Optional[WebSocket] = None):
         """Broadcast a message to participants in room, optionally excluding sender."""
@@ -135,12 +149,26 @@ class SignalingManager:
 
         msg_type = data.get("type")
 
+        # ── Real-Time Audio Chunk for Live Groq Whisper Transcription ────────
+        if msg_type == "audio_chunk":
+            connection = self.get_connection(room_id, sender_ws)
+            if connection:
+                from app.services.live_transcription_manager import live_transcription_manager
+                await live_transcription_manager.enqueue_chunk(room_id, connection, data)
+            return
+
         # ── WebRTC Signaling & Custom In-Meeting Events ──────────────────────
         if msg_type in ("offer", "answer", "ice-candidate", "documents-updated", "doc-summary-update", "transcript-segment"):
             await self.broadcast(room_id, data, exclude=sender_ws)
 
         # ── Meeting Ended Signal ─────────────────────────────────────────────
         elif msg_type == "meeting-ended":
+            try:
+                from app.services.live_transcription_manager import live_transcription_manager
+                await live_transcription_manager.flush_and_close(room_id)
+            except Exception as e:
+                logger.warning(f"Error finalizing live transcription on meeting-ended: {e}")
+
             await self.broadcast(room_id, {
                 "type": "meeting-ended",
                 "ended_by": data.get("ended_by", "participant"),
