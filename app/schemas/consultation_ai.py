@@ -242,3 +242,4 @@ class ConsultationAIStatusResponse(BaseModel):
     has_approved_extraction: bool = False
     latest_extraction_version: Optional[int] = None
     prescription_id: Optional[uuid.UUID] = None
+    error_message: Optional[str] = Field(None, description="Combined error from transcription or extraction failure")

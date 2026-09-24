@@ -171,6 +171,7 @@ class ConsultationAIService:
         """
         api_key = settings.groq_api_key
         if not api_key:
+            logger.error("[LLM_ERROR] No Groq API key configured! Check GROQ_API or GROQ_API_KEY env var.")
             raise ValidationError("Groq API key is not configured.")
 
         user_content = ""
@@ -212,10 +213,16 @@ class ConsultationAIService:
 
         for attempt in range(max_retries + 1):
             try:
+                logger.info(
+                    f"[LLM_CALL] model={settings.GROQ_MODEL} timeout={timeout}s "
+                    f"attempt={attempt + 1}/{max_retries + 1} text_length={len(user_content)}"
+                )
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     resp = await client.post(
                         GROQ_CHAT_URL, json=payload, headers=headers
                     )
+
+                logger.info(f"[LLM_RESPONSE] status_code={resp.status_code}")
 
                 if resp.status_code == 429:
                     wait_time = 2 ** (attempt + 1)
@@ -241,15 +248,18 @@ class ConsultationAIService:
                 if "<think>" in cleaned and "</think>" not in cleaned:
                     cleaned = cleaned.split("<think>", 1)[0].strip()
 
-                return cleaned or raw_content
+                final_content = cleaned or raw_content
+                logger.info(f"[LLM_SUCCESS] response_length={len(final_content)}")
+                return final_content
 
             except httpx.TimeoutException as e:
                 last_error = e
                 if attempt < max_retries:
                     wait_time = 2 ** (attempt + 1)
-                    logger.warning(f"LLM timeout, retrying in {wait_time}s")
+                    logger.warning(f"[LLM_TIMEOUT] Timed out after {timeout}s, retrying in {wait_time}s (attempt {attempt + 1})")
                     await asyncio.sleep(wait_time)
                     continue
+                logger.error(f"[LLM_TIMEOUT_FINAL] All {max_retries + 1} attempts timed out")
 
             except ValidationError:
                 raise
@@ -257,8 +267,10 @@ class ConsultationAIService:
             except Exception as e:
                 last_error = e
                 if attempt < max_retries:
+                    logger.warning(f"[LLM_ERROR] attempt={attempt + 1} error={e}, retrying...")
                     await asyncio.sleep(2 ** (attempt + 1))
                     continue
+                logger.error(f"[LLM_ERROR_FINAL] All attempts failed: {e}")
 
         raise ValidationError(f"LLM call failed after {max_retries + 1} attempts: {last_error}")
 
@@ -469,10 +481,13 @@ class ConsultationAIService:
 
         async with async_session_maker() as session:
             try:
+                logger.info(f"[EXTRACTION_START] meeting_id={meeting_id} extraction_id={extraction_id} — Extraction pipeline starting")
+
                 extraction = await ConsultationAIRepository.get_extraction_by_id(
                     session, extraction_id
                 )
                 if not extraction:
+                    logger.warning(f"[EXTRACTION_ABORT] extraction_id={extraction_id} — Extraction record not found in DB, aborting")
                     return
 
                 transcript = await ConsultationAIRepository.get_transcript_by_meeting_id(
@@ -480,16 +495,27 @@ class ConsultationAIService:
                 )
                 meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
 
+                logger.info(
+                    f"[EXTRACTION_STEP_1] meeting_id={meeting_id} — Data loaded. "
+                    f"has_transcript={transcript is not None} "
+                    f"transcript_status={transcript.transcription_status if transcript else 'N/A'} "
+                    f"has_structured={bool(transcript and transcript.structured_transcript)} "
+                    f"has_full_text={bool(transcript and transcript.full_text)} "
+                    f"has_doctor_notes={bool(meeting and meeting.doctor_notes)}"
+                )
+
                 start_time = time.time()
                 segments = transcript.structured_transcript if (transcript and transcript.structured_transcript) else []
                 full_text = transcript.full_text if (transcript and transcript.full_text) else ""
 
                 # If no audio transcript segments, fall back to doctor notes
                 if (not segments or len(segments) == 0) and meeting and meeting.doctor_notes and meeting.doctor_notes.strip():
+                    logger.info(f"[EXTRACTION_STEP_2] meeting_id={meeting_id} — No transcript segments, falling back to doctor notes ({len(meeting.doctor_notes)} chars)")
                     full_text = f"[DOCTOR CLINICAL NOTES]\n{meeting.doctor_notes.strip()}"
                     segments = [{"speaker": "doctor", "start_time": 0, "text": meeting.doctor_notes.strip()}]
 
                 if not segments or len(segments) == 0:
+                    logger.error(f"[EXTRACTION_FAIL] meeting_id={meeting_id} — No segments AND no doctor notes. Cannot extract.")
                     extraction.status = "failed"
                     extraction.error_message = "No dialogue segments or doctor clinical notes available for extraction"
                     await session.commit()
@@ -505,15 +531,25 @@ class ConsultationAIService:
                 max_tokens = settings.AI_CHUNK_MAX_TOKENS
                 overlap_tokens = settings.AI_CHUNK_OVERLAP_TOKENS
 
+                logger.info(
+                    f"[EXTRACTION_STEP_3] meeting_id={meeting_id} — Token estimation done. "
+                    f"segments={len(segments)} full_text_length={len(full_text)} "
+                    f"estimated_tokens={total_tokens} max_tokens={max_tokens} "
+                    f"will_chunk={'YES' if total_tokens > max_tokens else 'NO (single-pass)'}"
+                )
+
                 chunk_results: List[ConsultationExtractionResult] = []
 
                 if total_tokens <= max_tokens:
                     # ── Single-pass extraction ───────────────────────
+                    logger.info(f"[EXTRACTION_STEP_4] meeting_id={meeting_id} — Calling Groq LLM (single-pass)... model={settings.GROQ_MODEL}")
                     raw_response = await cls._call_extraction_llm(full_text)
+                    logger.info(f"[EXTRACTION_STEP_4_LLM_DONE] meeting_id={meeting_id} — LLM response received, length={len(raw_response)}")
                     extraction.raw_llm_response = raw_response
                     extraction.total_chunks = 1
 
                     parsed = cls._parse_llm_json(raw_response)
+                    logger.info(f"[EXTRACTION_STEP_4_PARSED] meeting_id={meeting_id} — JSON parsed. medications={len(parsed.get('medications', []))} diagnoses={len(parsed.get('diagnoses', []))}")
                     result = ConsultationExtractionResult(**parsed)
                     chunk_results.append(result)
 
@@ -587,15 +623,18 @@ class ConsultationAIService:
                 await session.commit()
 
                 logger.info(
-                    f"extraction_completed: meeting_id={meeting_id} "
+                    f"[EXTRACTION_COMPLETE] meeting_id={meeting_id} — Extraction pipeline COMPLETED SUCCESSFULLY. "
                     f"version={extraction.version} chunks={extraction.total_chunks} "
                     f"medications={len(final_result.medications)} "
                     f"diagnoses={len(final_result.diagnoses)} "
+                    f"symptoms={len(final_result.symptoms)} "
+                    f"tests={len(final_result.tests)} "
+                    f"uncertain={len(final_result.uncertain_items)} "
                     f"confidence={avg_confidence:.2f} elapsed_ms={elapsed_ms}"
                 )
 
             except Exception as e:
-                logger.error(f"Extraction pipeline error: {e}")
+                logger.error(f"[EXTRACTION_FATAL_ERROR] meeting_id={meeting_id} extraction_id={extraction_id} — Pipeline CRASHED: {e}", exc_info=True)
                 try:
                     extraction = await ConsultationAIRepository.get_extraction_by_id(
                         session, extraction_id
@@ -604,8 +643,9 @@ class ConsultationAIService:
                         extraction.status = "failed"
                         extraction.error_message = f"{str(e)[:500]}"
                         await session.commit()
-                except Exception:
-                    pass
+                        logger.info(f"[EXTRACTION_MARKED_FAILED] extraction_id={extraction_id} — Marked as failed in DB")
+                except Exception as inner_err:
+                    logger.error(f"[EXTRACTION_DB_ERROR] Could not mark extraction as failed: {inner_err}")
 
     # ── Read Extraction ──────────────────────────────────────────────────
 
@@ -992,6 +1032,14 @@ class ConsultationAIService:
             session, meeting_id
         )
 
+        # Collect error messages from failed stages
+        error_message = None
+        if transcript and transcript.transcription_status == "failed" and transcript.error_message:
+            error_message = f"Transcription: {transcript.error_message}"
+        if extraction and extraction.status == "failed" and extraction.error_message:
+            extraction_err = f"Extraction: {extraction.error_message}"
+            error_message = f"{error_message} | {extraction_err}" if error_message else extraction_err
+
         return ConsultationAIStatusResponse(
             meeting_id=meeting_id,
             transcription_status=transcript.transcription_status if transcript else None,
@@ -1001,4 +1049,5 @@ class ConsultationAIService:
             has_approved_extraction=bool(approved),
             latest_extraction_version=extraction.version if extraction else None,
             prescription_id=approved.prescription_id if approved else None,
+            error_message=error_message,
         )
