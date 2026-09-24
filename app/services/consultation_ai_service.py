@@ -16,7 +16,7 @@ import re
 import time
 import uuid
 from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -399,7 +399,82 @@ class ConsultationAIService:
 
         return merged
 
-    # ── Main Extraction Flow ─────────────────────────────────────────────
+    # ── Live Transcript & Main Extraction Flow ───────────────────────────
+
+    @classmethod
+    async def save_live_transcript(
+        cls,
+        session: AsyncSession,
+        meeting_id: uuid.UUID,
+        user: Any,
+        segments: List[Dict],
+        full_text: Optional[str] = None,
+        doctor_notes: Optional[str] = None,
+    ) -> Tuple[ConsultationAIStatusResponse, Optional[uuid.UUID]]:
+        """
+        Save real-time speech-to-text transcript segments captured in the video call.
+        Auto-completes the transcript and triggers AI Consultation Summary extraction.
+        Returns (status_response, new_extraction_id_or_none).
+        """
+        meeting = await MeetingRepository.get_meeting_by_id(session, meeting_id)
+        if not meeting:
+            raise NotFoundError("Meeting not found")
+
+        if user.id not in (meeting.doctor_id, meeting.patient_id) and getattr(user, "role", None) != UserRole.SAAS_ADMIN:
+            raise AuthorizationError("Only meeting participants can save consultation transcripts")
+
+        if doctor_notes and doctor_notes.strip():
+            meeting.doctor_notes = doctor_notes.strip()
+
+        # Build human-readable full_text if not provided
+        if not full_text and segments:
+            lines = []
+            for s in segments:
+                spk = s.get("speaker", "participant").upper()
+                name = s.get("speakerName") or f"[{spk}]"
+                text = s.get("text", "").strip()
+                if text:
+                    lines.append(f"{name}: {text}")
+            full_text = "\n".join(lines)
+
+        if full_text:
+            meeting.transcript_text = full_text
+
+        from app.models.consultation_transcript import ConsultationTranscript
+        transcript = await ConsultationAIRepository.get_transcript_by_meeting_id(session, meeting_id)
+        if not transcript:
+            transcript = ConsultationTranscript(
+                meeting_id=meeting_id,
+                transcription_status="completed",
+                structured_transcript=segments or [],
+                full_text=full_text,
+                transcription_model="live-web-speech",
+            )
+            transcript = await ConsultationAIRepository.create_transcript(session, transcript)
+        else:
+            transcript.transcription_status = "completed"
+            transcript.transcription_model = "live-web-speech"
+            if segments:
+                transcript.structured_transcript = segments
+            if full_text:
+                transcript.full_text = full_text
+            transcript.error_message = None
+
+        await session.commit()
+        logger.info(f"[LIVE_TRANSCRIPT_SAVED] meeting_id={meeting_id} segments={len(segments)} text_len={len(full_text or '')}")
+
+        # Check if an extraction is already in progress or completed
+        latest_ext = await ConsultationAIRepository.get_latest_extraction(session, meeting_id)
+        new_extraction_id = None
+        if not latest_ext or latest_ext.status in ("failed", "pending"):
+            try:
+                extraction = await cls.generate_extraction(session, meeting_id, user)
+                new_extraction_id = extraction.id
+            except Exception as e:
+                logger.warning(f"[AUTO_EXTRACTION_INIT_WARN] meeting_id={meeting_id}: {e}")
+
+        status_res = await cls.get_consultation_ai_status(session, meeting_id, user)
+        return status_res, new_extraction_id
 
     @classmethod
     async def generate_extraction(
@@ -416,13 +491,19 @@ class ConsultationAIService:
         if not meeting:
             raise NotFoundError("Meeting not found")
 
-        if user.id != meeting.doctor_id:
-            raise AuthorizationError("Only the assigned doctor can generate extractions")
+        if user.id not in (meeting.doctor_id, meeting.patient_id) and getattr(user, "role", None) != UserRole.SAAS_ADMIN:
+            raise AuthorizationError("Only meeting participants can generate extractions")
 
         transcript = await ConsultationAIRepository.get_transcript_by_meeting_id(
             session, meeting_id
         )
-        has_transcript = bool(transcript and transcript.transcription_status == "completed")
+        has_transcript = bool(
+            transcript and (
+                transcript.transcription_status == "completed"
+                or (transcript.structured_transcript and len(transcript.structured_transcript) > 0)
+                or (transcript.full_text and transcript.full_text.strip())
+            )
+        )
         has_notes = bool(meeting.doctor_notes and meeting.doctor_notes.strip())
 
         if not has_transcript and not has_notes:
@@ -673,16 +754,10 @@ class ConsultationAIService:
         if not extraction:
             raise NotFoundError("No extraction found for this meeting")
 
-        # Authorization: unapproved → doctor only; approved → doctor, patient, admin
-        if not extraction.is_approved:
-            if user.id != meeting.doctor_id:
-                raise AuthorizationError(
-                    "Only the assigned doctor can view unapproved extractions"
-                )
-        else:
-            if user.id not in (meeting.doctor_id, meeting.patient_id):
-                if user.role != UserRole.SAAS_ADMIN:
-                    raise AuthorizationError("Not authorized to view this extraction")
+        # Authorization: Both doctor and patient participating in the meeting can view the consultation summary
+        if user.id not in (meeting.doctor_id, meeting.patient_id):
+            if getattr(user, "role", None) != UserRole.SAAS_ADMIN:
+                raise AuthorizationError("Not authorized to view this consultation summary")
 
         extraction_data = None
         if extraction.extraction_data:

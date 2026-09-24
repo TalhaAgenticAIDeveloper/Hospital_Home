@@ -232,6 +232,13 @@ class ApproveExtractionRequest(BaseModel):
     )
 
 
+class SaveLiveTranscriptRequest(BaseModel):
+    """Payload containing live transcript segments recorded during the video call."""
+    segments: List[dict] = Field(default_factory=list, description="List of speech segments with speaker, text, timestamp")
+    full_text: Optional[str] = Field(None, description="Concatenated transcript text")
+    doctor_notes: Optional[str] = Field(None, description="Optional doctor notes entered at end of meeting")
+
+
 class ConsultationAIStatusResponse(BaseModel):
     """Combined status of transcription and extraction for a meeting."""
     meeting_id: uuid.UUID

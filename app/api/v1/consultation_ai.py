@@ -26,6 +26,7 @@ from app.schemas.consultation_ai import (
     ConsultationAIStatusResponse,
     ExtractionResponse,
     ExtractionVersionsResponse,
+    SaveLiveTranscriptRequest,
     TranscriptResponse,
     TranscriptionStatusResponse,
 )
@@ -118,6 +119,43 @@ async def get_transcript(
         meeting_id=meeting_id,
         user=user,
     )
+
+
+# ── Live Transcript Ingestion ────────────────────────────────────────────────
+
+
+@router.post(
+    "/consultation-ai/{meeting_id}/live-transcript",
+    response_model=ConsultationAIStatusResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Save live transcript recorded during call and auto-trigger AI summary",
+)
+async def save_live_transcript(
+    meeting_id: uuid.UUID,
+    payload: SaveLiveTranscriptRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db),
+) -> ConsultationAIStatusResponse:
+    """
+    Save real-time speech-to-text transcript segments captured in the video call.
+    Auto-completes the transcript and triggers AI Consultation Summary extraction in background.
+    """
+    status_res, new_extraction_id = await ConsultationAIService.save_live_transcript(
+        session=session,
+        meeting_id=meeting_id,
+        user=user,
+        segments=payload.segments,
+        full_text=payload.full_text,
+        doctor_notes=payload.doctor_notes,
+    )
+    if new_extraction_id:
+        background_tasks.add_task(
+            ConsultationAIService.run_extraction_pipeline,
+            meeting_id,
+            new_extraction_id,
+        )
+    return status_res
 
 
 # ── AI Extraction ───────────────────────────────────────────────────────────
