@@ -8,6 +8,7 @@ Provides:
 - Speaker-labeled structured transcript generation.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -297,8 +298,13 @@ class TranscriptionService:
                                 f"extraction_id={extraction.id} version={next_version}"
                             )
 
-                            # Run extraction LLM pipeline
-                            await ConsultationAIService.run_extraction_pipeline(meeting_id, extraction.id)
+                            # Run extraction LLM pipeline in the background
+                            # IMPORTANT: Do NOT await — the LLM call can take 90s+
+                            # with retries, which would block the transcription
+                            # pipeline and cause the frontend to appear stuck.
+                            asyncio.create_task(
+                                ConsultationAIService.run_extraction_pipeline(meeting_id, extraction.id)
+                            )
                     except Exception as auto_ex_err:
                         logger.error(
                             f"Auto-chain extraction failed for meeting {meeting_id}: {auto_ex_err}",
