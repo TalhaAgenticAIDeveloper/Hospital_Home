@@ -347,12 +347,40 @@ class GroqQueueService:
                 "Groq API key is not configured. Please set GROQ_API or GROQ_API_KEY in backend .env."
             )
 
-        primary_model = model or settings.GROQ_MODEL or "openai/gpt-oss-20b"
-        # Fast fallback models available on this API key
-        candidate_models = [primary_model]
-        for fallback in ["openai/gpt-oss-20b", "qwen/qwen3.8-27b"]:
-            if fallback not in candidate_models:
-                candidate_models.append(fallback)
+        # Check if the request contains image content (Vision / Multimodal OCR request)
+        is_vision_request = any(
+            isinstance(m.get("content"), list)
+            and any(isinstance(item, dict) and item.get("type") == "image_url" for item in m["content"])
+            for m in messages
+            if isinstance(m, dict)
+        )
+
+        if is_vision_request:
+            # For Vision requests, ONLY route to Vision-capable models (e.g. qwen/qwen3.8-27b).
+            # Never route or fall back to text-only models (e.g. gpt-oss-120b/20b) because Groq rejects
+            # them with HTTP 400: 'messages[0].content must be a string'.
+            text_only_models = {
+                "openai/gpt-oss-120b",
+                "openai/gpt-oss-20b",
+                "llama-3.3-70b-versatile",
+                "llama-3.1-8b-instant",
+                "gemma2-9b-it",
+                "mixtral-8x7b-32768",
+            }
+            target_model = model if (model and model not in text_only_models and ("vision" in model.lower() or "qwen" in model.lower())) else None
+            vision_primary = target_model or settings.groq_scan_model or "qwen/qwen3.8-27b"
+            candidate_models = []
+            for v_mod in [vision_primary, settings.groq_scan_model, "qwen/qwen3.8-27b"]:
+                if v_mod and v_mod not in text_only_models and v_mod not in candidate_models:
+                    candidate_models.append(v_mod)
+            if not candidate_models:
+                candidate_models = ["qwen/qwen3.8-27b"]
+        else:
+            primary_model = model or settings.GROQ_MODEL or "openai/gpt-oss-120b"
+            candidate_models = [primary_model]
+            for fallback in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]:
+                if fallback not in candidate_models:
+                    candidate_models.append(fallback)
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -391,10 +419,14 @@ class GroqQueueService:
 
                         if resp.status_code != 200:
                             err_text = resp.text[:300]
-                            # If model not found or decommissioned, try next candidate
-                            if resp.status_code in (400, 404) and ("not exist" in err_text or "decommissioned" in err_text):
-                                logger.warning(f"[GROQ_MODEL_UNAVAILABLE] Model {cur_model} unavailable, trying fallback: {err_text}")
-                                last_model_err = ValidationError(f"Model unavailable: {err_text}")
+                            # If model not found, decommissioned, or text-only model rejected image payload, try next candidate
+                            if resp.status_code in (400, 404) and (
+                                "not exist" in err_text
+                                or "decommissioned" in err_text
+                                or "content must be a string" in err_text
+                            ):
+                                logger.warning(f"[GROQ_MODEL_FALLBACK] Model {cur_model} failed ({err_text}), trying next fallback...")
+                                last_model_err = ValidationError(f"Model unavailable or incompatible: {err_text}")
                                 continue
 
                             logger.error(f"[GROQ_API_ERR] status={resp.status_code} model={cur_model} caller={caller}: {err_text}")

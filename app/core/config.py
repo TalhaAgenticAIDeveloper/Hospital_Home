@@ -102,7 +102,7 @@ class Settings(BaseSettings):
             return self.GROQ_SCAN_MODEL.strip()
         if self.GROQ_VISION_MODEL and self.GROQ_VISION_MODEL.strip() and "llama-3.2-11b-vision-preview" not in self.GROQ_VISION_MODEL:
             return self.GROQ_VISION_MODEL.strip()
-        return "qwen/qwen3.6-27b"
+        return "qwen/qwen3.8-27b"
 
     @property
     def cors_origins_list(self) -> List[str]:
