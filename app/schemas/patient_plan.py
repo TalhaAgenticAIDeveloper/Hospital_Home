@@ -24,11 +24,10 @@ class CreateGoalRequest(BaseModel):
         ...,
         description="Goal category (weight_management, sleep_optimization, fitness_mobility, stress_reduction, nutrition, custom)",
     )
-    target_description: str = Field(
-        ...,
-        min_length=5,
+    target_description: Optional[str] = Field(
+        default="",
         max_length=2000,
-        description="What the patient wishes to accomplish in their own words",
+        description="Optional description of what the patient wishes to accomplish in their own words",
     )
     timezone: str = Field(default="UTC", max_length=100, description="Patient's local timezone name (e.g. UTC, Asia/Karachi, America/New_York)")
     target_duration_weeks: int = Field(default=4, ge=1, le=52, description="Target timeline in weeks")
@@ -38,6 +37,7 @@ class QuestionnaireAnswerRequest(BaseModel):
     question_id: uuid.UUID
     raw_input: str = Field(..., max_length=2000, description="Raw user input response")
     is_skipped: bool = Field(default=False, description="Flag indicating if the user explicitly chose to skip")
+    allow_warning: bool = Field(default=False, description="Flag indicating user confirmed an advisory warning (e.g. age under 18)")
 
 
 class QuestionAnswerResponse(BaseModel):
@@ -45,7 +45,7 @@ class QuestionAnswerResponse(BaseModel):
 
     question_id: uuid.UUID
     question_key: str
-    validation_status: str  # valid, clarification_needed, invalid, skipped
+    validation_status: str  # valid, clarification_needed, warning, invalid, skipped
     clarification_message: Optional[str] = None
     normalized_value: Optional[str] = None
     unit: Optional[str] = None
@@ -76,7 +76,7 @@ class PatientGoalDetailResponse(BaseModel):
     id: uuid.UUID
     title: str
     category: str
-    target_description: str
+    target_description: Optional[str] = ""
     workflow_state: str
     timezone: str
     target_duration_weeks: int
@@ -133,10 +133,11 @@ class GeneratedPlanPayload(BaseModel):
 class ProposedModificationSchema(BaseModel):
     item_id: Optional[str] = None
     original_title: Optional[str] = None
-    proposed_title: str
-    proposed_description: str
+    proposed_title: Optional[str] = None
+    proposed_description: Optional[str] = None
     proposed_time: Optional[str] = None
     proposed_category: Optional[str] = None
+    action_type: str = "swap"  # swap, add, remove, reschedule
     status: str = "pending"  # pending, applied, rejected
     calories: Optional[int] = None
     protein_g: Optional[float] = None
@@ -144,6 +145,8 @@ class ProposedModificationSchema(BaseModel):
     fat_g: Optional[float] = None
     fiber_g: Optional[float] = None
     calories_burned: Optional[int] = None
+    impact_summary: Optional[str] = None
+    disliked_item_added: Optional[str] = None
 
 
 class PlanDiscussionMessageRequest(BaseModel):
@@ -202,6 +205,7 @@ class PatientPlanDetailResponse(BaseModel):
     discussions: List[PlanDiscussionMessageResponse]
     today_logs: List[PlanLogResponse]
     daily_nutrition_summary: Optional[Dict[str, Any]] = None
+    disliked_items: Optional[List[str]] = None
     created_at: datetime
     updated_at: datetime
 

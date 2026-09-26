@@ -8,6 +8,7 @@ Implements multi-layer clinical and business rule validation:
 - Plan safety checks (strict prescription medication blocker, allergy conflict scanner, schedule sanity)
 """
 
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -153,6 +154,74 @@ class PlanValidator:
         clean = text.replace("\x00", "").strip()
         # Truncate to maximum allowed length defensively
         return clean[:max_length]
+
+    @classmethod
+    def extract_and_parse_json(cls, raw_text: str) -> Any:
+        """
+        Robust JSON extractor and parser for LLM responses.
+        Handles:
+        - Markdown fences (```json ... ``` or ``` ...)
+        - Surrounding preambles and post-scripts
+        - Unicode non-breaking characters (\u202f, \u00a0, \u2011, \u2013, \u2014)
+        - Smart quotes (\u201c, \u201d, \u2018, \u2019)
+        - Trailing commas before closing braces/brackets
+        - Incomplete/truncated brackets repair
+        """
+        if not raw_text or not raw_text.strip():
+            raise ValueError("AI response was empty.")
+
+        # 1. Clean think tags if reasoning model leaked
+        cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+        if "<think>" in cleaned and "</think>" not in cleaned:
+            cleaned = cleaned.split("<think>", 1)[0].strip()
+        text = cleaned or raw_text
+
+        # 2. Normalize problematic unicode characters
+        text = text.replace("\u202f", " ").replace("\u00a0", " ").replace("\u200b", "")
+        text = text.replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
+        text = text.replace("\u201c", '"').replace("\u201d", '"')
+        text = text.replace("\u2018", "'").replace("\u2019", "'")
+
+        # 3. Extract code fence if present
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+        candidate = fence_match.group(1).strip() if fence_match else text.strip()
+
+        # 4. Find outermost object { ... } or array [ ... ]
+        first_brace = candidate.find("{")
+        last_brace = candidate.rfind("}")
+        first_bracket = candidate.find("[")
+        last_bracket = candidate.rfind("]")
+
+        if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+            if last_brace != -1 and last_brace > first_brace:
+                candidate = candidate[first_brace : last_brace + 1]
+            else:
+                candidate = candidate[first_brace:]
+        elif first_bracket != -1:
+            if last_bracket != -1 and last_bracket > first_bracket:
+                candidate = candidate[first_bracket : last_bracket + 1]
+            else:
+                candidate = candidate[first_bracket:]
+
+        # 5. Strip trailing commas
+        cleaned_json = re.sub(r",\s*([\]\}])", r"\1", candidate)
+
+        try:
+            return json.loads(cleaned_json)
+        except Exception:
+            # 6. Attempt repair of unclosed strings / brackets for slightly truncated responses
+            s = cleaned_json.strip()
+            quote_count = s.count('"')
+            if quote_count % 2 != 0:
+                s += '"'
+            s = s.rstrip(", \t\n\r")
+            open_braces = s.count("{") - s.count("}")
+            open_brackets = s.count("[") - s.count("]")
+            if open_braces > 0 or open_brackets > 0:
+                s += ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
+                s = re.sub(r",\s*([\]\}])", r"\1", s)
+                return json.loads(s)
+            raise
 
     @classmethod
     def check_for_prompt_injection(cls, text: str) -> bool:
@@ -448,6 +517,15 @@ class PlanValidator:
                         unit=None,
                         can_proceed=False,
                         extracted_fields={},
+                    )
+                if age_val < 18:
+                    return AnswerValidationResult(
+                        status="warning",
+                        message="We recommend you to be at least 18 years old before following an independent wellness regimen. If you still wish to continue, you may proceed.",
+                        normalized_value=str(age_val),
+                        unit="years",
+                        can_proceed=False,
+                        extracted_fields={"age": age_val},
                     )
                 return AnswerValidationResult(
                     status="valid",

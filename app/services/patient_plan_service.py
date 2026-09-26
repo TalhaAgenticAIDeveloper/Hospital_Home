@@ -154,7 +154,10 @@ class PatientPlanService:
             if "<think>" in cleaned and "</think>" not in cleaned:
                 cleaned = cleaned.split("<think>", 1)[0].strip()
 
-            return cleaned or raw_content
+            result = cleaned or raw_content
+            # Normalize unicode spaces and hyphens for Windows terminal and database safety
+            result = result.replace("\u202f", " ").replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "--").replace("\u00a0", " ")
+            return result
 
     # ── AI Question Generation ─────────────────────────────────────────────
 
@@ -230,14 +233,8 @@ class PatientPlanService:
                 max_tokens=1536,
             )
 
-            # Extract JSON array from response
-            json_str = raw_response.strip()
-            if "```json" in json_str:
-                json_str = json_str.split("```json", 1)[1].split("```", 1)[0].strip()
-            elif "```" in json_str:
-                json_str = json_str.split("```", 1)[1].split("```", 1)[0].strip()
-
-            questions_raw = json.loads(json_str)
+            # Extract JSON array from response using robust parser
+            questions_raw = PlanValidator.extract_and_parse_json(raw_response)
 
             if not isinstance(questions_raw, list) or len(questions_raw) < 3:
                 logger.warning(f"AI returned insufficient questions ({len(questions_raw) if isinstance(questions_raw, list) else 'non-list'}), falling back.")
@@ -357,11 +354,13 @@ class PatientPlanService:
         """
         category = payload.category or "custom"
 
+        target_desc = payload.target_description or ""
+
         # Generate questions via AI based on the patient's specific goal
         raw_questions = await cls._generate_questions_via_ai(
             category=category,
             title=payload.title,
-            target_description=payload.target_description,
+            target_description=target_desc,
         )
 
         question_objects = []
@@ -400,7 +399,7 @@ class PatientPlanService:
             patient_id=patient_user.id,
             title=PlanValidator.sanitize_text(payload.title, 255),
             category=category,
-            target_description=PlanValidator.sanitize_text(payload.target_description, 2000),
+            target_description=PlanValidator.sanitize_text(target_desc, 2000),
             timezone=PlanValidator.sanitize_text(payload.timezone, 100) or "UTC",
             target_duration_weeks=payload.target_duration_weeks,
             workflow_state="QUESTIONNAIRE_ACTIVE",
@@ -426,6 +425,165 @@ class PatientPlanService:
         return cls._format_goal_response(goal)
 
     @classmethod
+    async def _verify_answer_via_ai(
+        cls,
+        goal_title: str,
+        goal_category: str,
+        goal_description: Optional[str],
+        question_text: str,
+        question_key: str,
+        question_type: str,
+        expected_unit: Optional[str],
+        options: Optional[List[str]],
+        raw_input: str,
+        retry_count: int = 0,
+        allow_warning: bool = False,
+    ) -> Any:
+        """
+        Intelligent Clinical Intake Verification Agent.
+        - Evaluates patient input against goal, description, and question context.
+        - Rejects impossible / absurd values (e.g. adult weight 5kg) with a polite, educational message.
+        - Requests missing units for measurable parameters (e.g. 40 -> kindly enter kg or lb).
+        - Issues advisory warning for minors under 18 with option to continue anyway.
+        - Extracts normalized values for valid answers.
+        - Falls back to PlanValidator deterministic safety rules if AI call fails.
+        """
+        clean_input = PlanValidator.sanitize_text(raw_input).strip()
+        lowered = clean_input.lower()
+
+        # 1. User confirmed an advisory warning (e.g. age < 18) and opted to proceed
+        if allow_warning:
+            return PlanValidator.validate_question_answer(
+                question_key=question_key,
+                question_type=question_type,
+                raw_input=clean_input,
+                is_skipped=False,
+                retry_count=retry_count,
+                expected_unit=expected_unit,
+            )
+
+        # 2. Empty string check
+        if not clean_input:
+            from app.services.plan_validator import AnswerValidationResult
+            return AnswerValidationResult(
+                status="invalid",
+                message="Please enter your answer before continuing.",
+                normalized_value=None,
+                unit=None,
+                can_proceed=False,
+                extracted_fields={},
+            )
+
+        # 3. LLM Verification Agent invocation
+        system_prompt = (
+            "You are an intelligent, compassionate Clinical Intake Verification Agent for a digital health & wellness clinic.\n"
+            "Your job is to verify a patient's answer to an intake questionnaire question before their personalized wellness plan is generated.\n"
+            "The patient may write in English, Urdu, Roman Urdu, or informal conversational phrasing.\n\n"
+            "EVALUATION DIRECTIVES:\n"
+            "1. DETECT SKIPPED OR UNCERTAIN ANSWERS (status: 'skipped'):\n"
+            "   - If the patient explicitly asks to skip, or indicates that they do not know, have no idea, cannot answer, or prefer not to answer "
+            "(in English, Urdu, Roman Urdu, or slang, e.g., 'skip', 'idk', 'pass', 'mujhe nahi pata', 'pata nahi', 'maloom nahi', 'chhor do', 'not sure', 'dont know', 'no clue', 'prefer not to say').\n"
+            "   - Output status 'skipped', message 'Question skipped. Continuing with standard recommendations.', and normalized_value 'Not provided (skipped)'.\n\n"
+            "2. REJECT IMPOSSIBLE OR ABSURD ANSWERS (status: 'invalid'):\n"
+            "   - If the answer contains physically impossible, absurd, or unsafe numbers (e.g., human weight of 5kg or 500kg, height of 10cm or 300cm, age of 200, sleeping for 25 hours).\n"
+            "   - Or completely irrelevant nonsense / gibberish (e.g., answering 'cricket' or 'watching movies' when asked about weight or breakfast).\n"
+            "   - Provide a POLITE, helpful explanatory message pointing out why this seems incorrect and what a realistic entry looks like.\n\n"
+            "3. CLARIFY MISSING UNITS (status: 'clarification_needed'):\n"
+            "   - If the question asks for a measurable physical metric (weight, height, liquid) and the user provides just a bare number without specifying the unit (e.g., '40' or '70' for weight):\n"
+            "   - Politely ask: 'Kindly specify the unit as well (e.g. is that 40 kg or 40 lb?) so we can calculate your nutrition and plan accurately.'\n\n"
+            "4. ADVISORY WARNING FOR MINORS (status: 'warning'):\n"
+            "   - If the question asks about age and the user indicates an age under 18 years (e.g., 15, 16, 17):\n"
+            "   - Output polite advisory message: 'We recommend you to be at least 18 years old before following an independent wellness regimen. If you still wish to continue with gentle lifestyle guidance, you may proceed.'\n\n"
+            "5. VALID ANSWERS (status: 'valid'):\n"
+            "   - If the answer is realistic, plausible, and addresses the question clearly:\n"
+            "   - Output status 'valid', with clean normalized_value and unit.\n\n"
+            "OUTPUT FORMAT:\n"
+            "Return ONLY a valid raw JSON object matching:\n"
+            "{\n"
+            '  "status": "valid" | "clarification_needed" | "warning" | "invalid" | "skipped",\n'
+            '  "message": "Polite explanatory message for user if invalid, clarification_needed, warning, or skipped (null if valid)",\n'
+            '  "normalized_value": "Clean standardized string representation",\n'
+            '  "unit": "Unit string if applicable or null"\n'
+            "}"
+        )
+
+        user_content = (
+            f"PATIENT GOAL: {goal_title} ({goal_category})\n"
+            f"GOAL DESCRIPTION: {goal_description or 'None provided'}\n"
+            f"QUESTION: {question_text} (key: {question_key}, type: {question_type})\n"
+            f"EXPECTED UNIT: {expected_unit or 'None'}\n"
+            f"SUGGESTED OPTIONS: {options or 'None'}\n"
+            f"PATIENT ANSWER: \"{clean_input}\"\n\n"
+            "Evaluate this answer now."
+        )
+
+        try:
+            raw_eval = await cls._call_groq_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.1,
+                max_tokens=600,
+            )
+            parsed = PlanValidator.extract_and_parse_json(raw_eval)
+            if isinstance(parsed, dict) and "status" in parsed:
+                eval_status = parsed.get("status", "valid").lower()
+                eval_msg = parsed.get("message")
+                norm_val = parsed.get("normalized_value") or clean_input
+                eval_unit = parsed.get("unit") or expected_unit
+
+                from app.services.plan_validator import AnswerValidationResult
+                if eval_status == "skipped":
+                    return AnswerValidationResult(
+                        status="skipped",
+                        message=eval_msg or "Question skipped. Continuing with standard recommendations.",
+                        normalized_value="Not provided (skipped)",
+                        unit=None,
+                        can_proceed=True,
+                        extracted_fields={},
+                    )
+                elif eval_status in ("invalid", "clarification_needed"):
+                    return AnswerValidationResult(
+                        status=eval_status,
+                        message=eval_msg or "Please verify your input format.",
+                        normalized_value=None,
+                        unit=None,
+                        can_proceed=False,
+                        extracted_fields={},
+                    )
+                elif eval_status == "warning":
+                    return AnswerValidationResult(
+                        status="warning",
+                        message=eval_msg or "Please review this advisory before continuing.",
+                        normalized_value=norm_val,
+                        unit=eval_unit,
+                        can_proceed=False,
+                        extracted_fields={question_key: norm_val},
+                    )
+                else:
+                    return AnswerValidationResult(
+                        status="valid",
+                        message=eval_msg,
+                        normalized_value=norm_val,
+                        unit=eval_unit,
+                        can_proceed=True,
+                        extracted_fields={question_key: norm_val},
+                    )
+        except Exception as exc:
+            logger.warning(f"AI answer verification failed ({exc}), falling back to deterministic rules.")
+
+        # Deterministic fallback
+        return PlanValidator.validate_question_answer(
+            question_key=question_key,
+            question_type=question_type,
+            raw_input=clean_input,
+            is_skipped=False,
+            retry_count=retry_count,
+            expected_unit=expected_unit,
+        )
+
+    @classmethod
     async def answer_question(
         cls,
         session: AsyncSession,
@@ -434,13 +592,11 @@ class PatientPlanService:
         payload: QuestionnaireAnswerRequest,
     ) -> QuestionAnswerResponse:
         """
-        Processes and validates an answer to a goal questionnaire question.
-        Handles:
-        - Missing unit detection ("55" -> "Is that 55 kg or 55 lb?")
-        - Bounds checking, irrelevant answers, and natural language
-        - Retry counting with MAX_QUESTION_RETRIES
-        - Multi-field extraction
-        - Automatic questionnaire completion state transition
+        Processes and validates an answer to a goal questionnaire question using the
+        intelligent Clinical Intake Verification Agent:
+        - Detects impossible answers & missing units
+        - Advises minors under 18 with option to continue
+        - Auto-completes questionnaire when all required questions are valid
         """
         goal = await PatientPlanRepository.get_goal_by_id(session, goal_id, patient_user.id)
         if not goal:
@@ -450,20 +606,23 @@ class PatientPlanService:
         if not question or question.goal_id != goal.id:
             raise NotFoundError("Question not found for this goal.")
 
-        # Run multi-layer validator
-        val_res = PlanValidator.validate_question_answer(
+        # Run AI Verification Agent
+        val_res = await cls._verify_answer_via_ai(
+            goal_title=goal.title,
+            goal_category=goal.category,
+            goal_description=goal.target_description,
+            question_text=question.question_text,
             question_key=question.question_key,
             question_type=question.question_type,
-            raw_input=payload.raw_input,
-            is_skipped=payload.is_skipped,
-            retry_count=question.retry_count,
             expected_unit=question.unit,
+            options=question.options.get("items") if isinstance(question.options, dict) else question.options,
+            raw_input=payload.raw_input,
+            retry_count=question.retry_count,
+            allow_warning=payload.allow_warning,
         )
 
         if val_res.status in ("invalid", "clarification_needed"):
-            # Increment retry counter on question
             new_retries = await PatientPlanRepository.increment_question_retry(session, question.id)
-            # Save clarification answer record
             await PatientPlanRepository.upsert_answer(
                 session=session,
                 goal_id=goal.id,
@@ -488,6 +647,31 @@ class PatientPlanService:
                 can_proceed=False,
             )
 
+        if val_res.status == "warning":
+            await PatientPlanRepository.upsert_answer(
+                session=session,
+                goal_id=goal.id,
+                question_id=question.id,
+                raw_input=payload.raw_input,
+                normalized_value=val_res.normalized_value,
+                unit=val_res.unit,
+                is_skipped=False,
+                validation_status="warning",
+                clarification_message=val_res.message,
+            )
+            await session.commit()
+            return QuestionAnswerResponse(
+                question_id=question.id,
+                question_key=question.question_key,
+                validation_status="warning",
+                clarification_message=val_res.message,
+                normalized_value=val_res.normalized_value,
+                unit=val_res.unit,
+                retry_count=question.retry_count,
+                is_skipped=False,
+                can_proceed=False,
+            )
+
         # Valid or safely skipped answer
         saved_answer = await PatientPlanRepository.upsert_answer(
             session=session,
@@ -501,8 +685,7 @@ class PatientPlanService:
             clarification_message=val_res.message,
         )
 
-        # If multi-field answer extracted extra values (e.g. weight and height in one sentence),
-        # fill out other questions automatically if present!
+        # Multi-field extraction auto-fill if present
         if val_res.extracted_fields:
             for extra_key, extra_val in val_res.extracted_fields.items():
                 matching_q = next((q for q in goal.questions if q.question_key == extra_key and q.id != question.id), None)
@@ -521,7 +704,6 @@ class PatientPlanService:
 
         # Check questionnaire completion
         await session.flush()
-        # Reload goal with updated answers
         refreshed_goal = await PatientPlanRepository.get_goal_by_id(session, goal.id, patient_user.id)
         answered_keys = {
             a.question_id for a in refreshed_goal.answers
@@ -696,17 +878,10 @@ class PatientPlanService:
                         {"role": "user", "content": user_prompt},
                     ],
                     temperature=0.2,
-                    max_tokens=2048,
+                    max_tokens=6000,
                 )
 
-                # Extract JSON block
-                json_str = raw_response.strip()
-                if "```json" in json_str:
-                    json_str = json_str.split("```json", 1)[1].split("```", 1)[0].strip()
-                elif "```" in json_str:
-                    json_str = json_str.split("```", 1)[1].split("```", 1)[0].strip()
-
-                parsed_dict = json.loads(json_str)
+                parsed_dict = PlanValidator.extract_and_parse_json(raw_response)
                 plan_payload = GeneratedPlanPayload(**parsed_dict)
 
                 # Clinical safety validation
@@ -749,6 +924,7 @@ class PatientPlanService:
                 lifestyle_guidelines={"items": plan_payload.lifestyle_guidelines},
                 precautions={"items": plan_payload.precautions},
                 daily_nutrition_summary=plan_payload.daily_nutrition_summary,
+                disliked_items={"items": []},
                 version=1,
                 status="ready",
             )
@@ -810,6 +986,264 @@ class PatientPlanService:
     # ── Plan Discussions & Deterministic Refinement ──────────────────────────
 
     @classmethod
+    def _add_disliked_item(cls, plan: PatientPlan, item_name: str) -> bool:
+        """Helper to safely record a disliked/excluded item in the plan's persistent list."""
+        if not item_name or not str(item_name).strip():
+            return False
+        clean_name = str(item_name).strip().lower()
+
+        current_data = plan.disliked_items or {}
+        if not isinstance(current_data, dict):
+            current_data = {"items": []}
+        items_list = current_data.get("items", [])
+        if not isinstance(items_list, list):
+            items_list = []
+
+        if clean_name not in [str(i).lower() for i in items_list]:
+            items_list.append(clean_name)
+            current_data["items"] = items_list
+            plan.disliked_items = current_data
+            flag_modified(plan, "disliked_items")
+            logger.info("Added '%s' to disliked_items for plan %s. All disliked: %s", clean_name, plan.id, items_list)
+            return True
+        return False
+
+    @classmethod
+    def _get_disliked_items(cls, plan: PatientPlan) -> List[str]:
+        """Return list of disliked item strings for a plan."""
+        if not plan.disliked_items:
+            return []
+        if isinstance(plan.disliked_items, dict):
+            return plan.disliked_items.get("items", [])
+        if isinstance(plan.disliked_items, list):
+            return plan.disliked_items
+        return []
+
+    @classmethod
+    def _parse_proposed_mod_from_text(cls, text: str) -> Optional[Dict[str, Any]]:
+        """Extract and parse PROPOSED_MODIFICATION JSON block from LLM output."""
+        if "PROPOSED_MODIFICATION:" not in text:
+            return None
+        parts = text.split("PROPOSED_MODIFICATION:", 1)
+        mod_json_str = parts[1].strip()
+
+        # Strip markdown code fences if LLM wrapped JSON in ```json ... ```
+        mod_json_str = re.sub(r"^```(?:json)?\s*", "", mod_json_str)
+        mod_json_str = re.sub(r"\s*```\s*$", "", mod_json_str.strip())
+
+        # Try to extract JSON array or object
+        json_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", mod_json_str)
+        if json_match:
+            mod_json_str = json_match.group(0)
+
+        try:
+            parsed_mod = json.loads(mod_json_str)
+            if isinstance(parsed_mod, list):
+                mod_dict = {"status": "pending", "items": parsed_mod}
+            elif isinstance(parsed_mod, dict):
+                mod_dict = dict(parsed_mod)
+                mod_dict["status"] = "pending"
+                for alt_key in ("modifications", "schedule_items", "adjustments", "changes"):
+                    if alt_key in mod_dict and isinstance(mod_dict[alt_key], list):
+                        mod_dict["items"] = mod_dict.pop(alt_key)
+                        break
+            else:
+                mod_dict = None
+
+            if mod_dict:
+                # Verify proposed modification does not contain medications
+                mod_corpus = json.dumps(mod_dict)
+                is_mod_unsafe, _ = PlanValidator.contains_blocked_medication(mod_corpus)
+                if not is_mod_unsafe:
+                    return mod_dict
+                else:
+                    logger.warning("Proposed modification contained medication terms. Dropping modification.")
+        except Exception as e:
+            logger.warning("Failed to parse PROPOSED_MODIFICATION JSON: %s", e)
+        return None
+
+    @classmethod
+    async def _generate_next_alternative_reply(
+        cls,
+        session: AsyncSession,
+        plan: PatientPlan,
+        declined_title: str,
+        original_title: str,
+    ) -> PatientPlanDiscussion:
+        """
+        When patient declines a proposed alternative, automatically calls Groq LLM
+        to suggest the next distinct alternative while respecting all disliked items.
+        """
+        disliked_list = cls._get_disliked_items(plan)
+        disliked_str = ", ".join(disliked_list) if disliked_list else "None"
+
+        schedule_summary = "\n".join(
+            f"- [{item.id}] {item.time_of_day} ({item.category}): {item.title} — {item.description}"
+            for item in plan.items if item.is_active
+        )
+
+        prompt = (
+            f"The patient is customizing their wellness plan titled '{plan.title}'.\n"
+            f"Current Schedule:\n{schedule_summary}\n\n"
+            f"The patient needs an alternative to replace '{original_title}'.\n"
+            f"The previous suggestion '{declined_title}' was DECLINED by the patient.\n"
+            f"CURRENTLY DISLIKED / EXCLUDED ITEMS: {disliked_str}.\n\n"
+            f"CRITICAL DIRECTIVES:\n"
+            f"1. You MUST suggest a fresh, healthy, and appetizing alternative for '{original_title}'.\n"
+            f"2. You are strictly forbidden from suggesting any item in the excluded list ({disliked_str}) or '{declined_title}'.\n"
+            f"3. In your friendly message (in Roman Urdu if user writes in Urdu/Roman Urdu, or English with English letters only; NO Nastaliq/Arabic characters):\n"
+            f"   - Acknowledge that they didn't like '{declined_title}'.\n"
+            f"   - Suggest a new alternative and explain why it's a great fit.\n"
+            f"   - Nutritional Comparison: What '{original_title}' provided vs what this new alternative provides (calories, protein, carbs, vitamins).\n"
+            f"   - The overall effect on their daily plan and health goal.\n"
+            f"4. End your message with exactly one PROPOSED_MODIFICATION JSON:\n"
+            f"   PROPOSED_MODIFICATION: {{\"action_type\": \"swap\", \"original_title\": \"{original_title}\", \"proposed_title\": \"<new option>\", \"proposed_description\": \"<description with nutrients and goal impact>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 160, \"protein_g\": 4.0, \"carbs_g\": 30.0, \"fat_g\": 2.0, \"fiber_g\": 3.5, \"calories_burned\": null, \"impact_summary\": \"<effect on daily plan>\", \"disliked_item_added\": \"{declined_title}\"}}\n"
+            f"5. NO MEDICATIONS: strictly forbidden from mentioning medications."
+        )
+
+        messages = [
+            {"role": "system", "content": "You are an empathetic, clinical wellness advisor specializing in tailored meal and fitness alternatives."},
+            {"role": "user", "content": prompt},
+        ]
+
+        try:
+            ai_text = await cls._call_groq_api(messages, temperature=0.3, max_tokens=1800)
+        except Exception as e:
+            logger.error("Error generating next alternative: %s", e)
+            ai_text = f"Understood! I've noted that you don't like {declined_title}. Would you prefer another healthy option instead?"
+
+        # Parse proposed modification if present
+        proposed_mod = cls._parse_proposed_mod_from_text(ai_text)
+        if proposed_mod and "PROPOSED_MODIFICATION:" in ai_text:
+            ai_text = ai_text.split("PROPOSED_MODIFICATION:")[0].strip()
+
+        msg = PatientPlanDiscussion(
+            plan_id=plan.id,
+            role="assistant",
+            content=ai_text,
+            proposed_modifications=proposed_mod,
+        )
+        return await PatientPlanRepository.add_discussion_message(session, msg)
+
+    @classmethod
+    async def _analyze_chat_intent_via_ai(
+        cls,
+        plan: PatientPlan,
+        clean_text: str,
+        pending_data: Optional[Dict[str, Any]] = None,
+        recent_discussions: Optional[List[PatientPlanDiscussion]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Intelligent multi-lingual intent analyzer for plan chat interactions.
+        Uses the LLM to understand what the patient wants in context of their active plan
+        and any pending modification. Eliminates all hardcoded keyword lists.
+
+        Returns a dict:
+        {
+            "intent": "CONFIRM_MODIFICATION" | "REJECT_ALTERNATIVE" | "CANCEL_KEEP_ORIGINAL" |
+                      "CHANGE_GOAL" | "NUTRITION_INFO_QUERY" | "PLAN_DISCUSSION_OR_MODIFY",
+            "rejected_item": Optional[str],
+            "is_medication_inquiry": bool,
+            "explanation": str
+        }
+        """
+        active_items = [f"- {i.time_of_day} ({i.category}): {i.title}" for i in plan.items if i.is_active]
+        schedule_ctx = "\n".join(active_items) if active_items else "No items currently scheduled."
+
+        if pending_data:
+            action_type = pending_data.get("action_type", "swap")
+            orig_t = pending_data.get("original_title") or "None"
+            prop_t = pending_data.get("proposed_title") or "None"
+            pending_desc = (
+                f"ACTIVE PENDING PROPOSAL WAITING FOR PATIENT CONFIRMATION:\n"
+                f"- Action: {action_type}\n"
+                f"- Original Item: {orig_t}\n"
+                f"- Proposed Alternative: {prop_t}\n"
+                f"- Impact Summary: {pending_data.get('impact_summary', 'N/A')}\n"
+                f"Note: An alternative or adjustment is currently proposed. The patient may approve it, decline it for another option, or cancel."
+            )
+        else:
+            pending_desc = "NO PENDING MODIFICATION IS CURRENTLY WAITING."
+
+        recent_msgs_text = ""
+        if recent_discussions:
+            snippets = []
+            for d in recent_discussions[-4:]:
+                if d.role in ("user", "assistant"):
+                    snippets.append(f"{d.role.capitalize()}: {d.content[:150]}")
+            if snippets:
+                recent_msgs_text = "Recent Chat History:\n" + "\n".join(snippets)
+
+        system_prompt = (
+            "You are an intelligent clinical intent classifier and dialogue router for a digital health wellness platform.\n"
+            "Your task is to analyze the patient's incoming chat message in the context of their active wellness plan and any pending modification.\n"
+            "The patient may write in English, Urdu, Roman Urdu, or informal slang/colloquial phrasing "
+            "(e.g., 'theek hy done karo', 'ye nahi khana dusra do', 'mujhe maza nahi dega koi aur batao', "
+            "'rehne do purana hi sahi tha', '1 katori daal me kitna protein ha', 'chalo laga do', 'ab weight gain karna hai').\n\n"
+            f"PLAN TITLE: {plan.title}\n\n"
+            f"ACTIVE SCHEDULE:\n{schedule_ctx}\n\n"
+            f"{pending_desc}\n\n"
+            f"{recent_msgs_text}\n\n"
+            "ANALYZE CAREFULLY AND SELECT ONE OF THE FOLLOWING 6 INTENTS:\n\n"
+            "1. 'CONFIRM_MODIFICATION':\n"
+            "   - APPLIES ONLY IF there is an active pending modification waiting for confirmation.\n"
+            "   - The user accepts, agrees with, confirms, or approves applying the proposed change.\n"
+            "   - Examples (in English, Urdu, Roman Urdu, etc.): 'yes', 'confirm', 'apply', 'looks good', 'theek hai', 'haan kr do', 'done karo', 'yehi final karo', 'bilkul chalega', 'laga do bhai', 'sounds great do it', 'apply this', 'sure', 'approved'.\n\n"
+            "2. 'REJECT_ALTERNATIVE':\n"
+            "   - APPLIES ONLY IF there is an active pending modification.\n"
+            "   - The user declines, dislikes, or rejects the suggested alternative and wants ANOTHER / DIFFERENT healthy option or suggestion.\n"
+            "   - Examples: 'no', 'reject', 'don't want this', 'ye nahi khana', 'ye maza nahi dega koi aur batao', 'dusra option do', 'kuch aur dikhao', 'not this one', 'nahi pasand', 'give another choice', 'hate oats give something else'.\n\n"
+            "3. 'CANCEL_KEEP_ORIGINAL':\n"
+            "   - APPLIES IF there is a pending modification.\n"
+            "   - The user wants to cancel or drop the proposed modification entirely and keep their original schedule intact without asking for any new alternative.\n"
+            "   - Examples: 'rehne do purana hi theek tha', 'never mind keep original', 'cancel changes', 'chhor do kuch mat badlo', 'leave it as is', 'keep current plan'.\n\n"
+            "4. 'CHANGE_GOAL':\n"
+            "   - The user wants to change their high-level overall health goal (e.g. switch from weight loss to muscle gain), restart from scratch, or delete/wipe/cancel their entire wellness plan.\n"
+            "   - Examples: 'change my goal', 'different goal', 'ab weight gain karna hai', 'cancel my whole plan', 'delete plan', 'start over with a new goal', 'reset my plan'.\n\n"
+            "5. 'NUTRITION_INFO_QUERY':\n"
+            "   - The user is asking a standalone informational question about food, calories, nutrients, vitamins, recipes, exercises, or metabolism (and is NOT asking to edit/modify their daily routine).\n"
+            "   - Can mention ANY food or exercise in the world (e.g., haleem, biryani, matcha, chia seeds, paratha, banana, walking, cycling, etc.).\n"
+            "   - Examples: '1 plate biryani mein kitni calories hoti hain?', 'how many calories in 2 boiled eggs?', 'running 30 mins burns how much?', 'is avocado good for cholesterol?', 'benefits of green tea', 'daal me kitna protein hota hai'.\n\n"
+            "6. 'PLAN_DISCUSSION_OR_MODIFY':\n"
+            "   - The user is asking to modify their plan schedule (swap meals, add a new snack/workout, remove an item, adjust timings/routine due to work or schedule constraints), OR asking questions specific to why something is in their daily schedule.\n"
+            "   - Examples: 'I don't like banana in my breakfast', 'add green tea at 4pm', 'remove evening jog', 'I work 9 to 5 reschedule my meals', 'replace eggs with vegetarian option', 'why did you put oats in breakfast?'.\n\n"
+            "OUTPUT FORMAT:\n"
+            "Return ONLY a valid JSON object matching:\n"
+            "{\n"
+            '  "intent": "CONFIRM_MODIFICATION" | "REJECT_ALTERNATIVE" | "CANCEL_KEEP_ORIGINAL" | "CHANGE_GOAL" | "NUTRITION_INFO_QUERY" | "PLAN_DISCUSSION_OR_MODIFY",\n'
+            '  "rejected_item": "Specific food or exercise the user disliked or rejected if applicable (or null)",\n'
+            '  "is_medication_inquiry": true | false,\n'
+            '  "explanation": "Brief 1-sentence reasoning"\n'
+            "}"
+        )
+
+        try:
+            raw_eval = await cls._call_groq_api(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f'Patient message: "{clean_text}"'},
+                ],
+                temperature=0.0,
+                max_tokens=250,
+            )
+            parsed = PlanValidator.extract_and_parse_json(raw_eval)
+            if isinstance(parsed, dict) and "intent" in parsed:
+                return parsed
+        except Exception as e:
+            logger.warning("AI intent analysis failed (%s), using safe semantic fallback.", e)
+
+        # Safe fallback only if AI call fails
+        lowered = clean_text.lower().strip()
+        if pending_data:
+            if any(w in lowered for w in ("yes", "apply", "theek", "haan", "done", "confirm")):
+                return {"intent": "CONFIRM_MODIFICATION", "rejected_item": None, "is_medication_inquiry": False}
+            if any(w in lowered for w in ("keep", "rehne do", "original", "leave it")):
+                return {"intent": "CANCEL_KEEP_ORIGINAL", "rejected_item": None, "is_medication_inquiry": False}
+            if any(w in lowered for w in ("no", "nahi", "reject", "aur", "dusra", "different")):
+                return {"intent": "REJECT_ALTERNATIVE", "rejected_item": pending_data.get("proposed_title"), "is_medication_inquiry": False}
+        return {"intent": "PLAN_DISCUSSION_OR_MODIFY", "rejected_item": None, "is_medication_inquiry": False}
+
+    @classmethod
     async def chat_with_plan(
         cls,
         session: AsyncSession,
@@ -820,10 +1254,12 @@ class PatientPlanService:
         """
         Interactive discussion about the plan.
         Features:
-        - Deterministic confirmation ('yes', 'accept', 'sure') directly applies pending modifications without LLM cost
-        - Rejection ('no', 'cancel') clears pending modification
-        - Complete goal change requests redirected safely
-        - Rejects medication prescription attempts
+        - Intelligent LLM-based intent analysis for any phrasing/language (English, Roman Urdu, slang)
+        - Applies pending modifications dynamically when confirmed
+        - Chained alternative proposals with dislike tracking when an alternative is rejected
+        - Safely redirects complete goal changes
+        - Handles standalone nutrition & exercise inquiries seamlessly
+        - Rejects medication prescription attempts and offers natural alternatives
         - Grounds answers in current database plan state
         """
         plan = await PatientPlanRepository.get_plan_by_id(session, plan_id, patient_user.id)
@@ -843,15 +1279,23 @@ class PatientPlanService:
         await PatientPlanRepository.add_discussion_message(session, user_msg)
         plan.discussions.append(user_msg)
 
-        lowered = clean_text.lower()
+        # Find any pending modification on the plan
+        item_mod_pairs, pending_data, pending_disc = cls._find_pending_modification(plan)
 
-        # 0. Smart Intent Detection — Route nutrition info queries to NutritionInfoService
-        intent = cls._classify_chat_intent(clean_text)
-        if intent == "nutrition_info":
-            # Lazy import to avoid circular dependency
+        # Intelligent Intent & Decision Analysis via LLM
+        analysis = await cls._analyze_chat_intent_via_ai(
+            plan=plan,
+            clean_text=clean_text,
+            pending_data=pending_data,
+            recent_discussions=plan.discussions[-6:] if len(plan.discussions) > 6 else plan.discussions,
+        )
+        intent = analysis.get("intent", "PLAN_DISCUSSION_OR_MODIFY")
+        is_med_inquiry = bool(analysis.get("is_medication_inquiry")) or PlanValidator.is_medication_inquiry(clean_text)
+
+        # 1. Nutrition Information Queries (standalone nutrition/exercise questions)
+        if intent == "NUTRITION_INFO_QUERY":
             from app.services.nutrition_info_service import NutritionInfoService
 
-            # Build conversation context from recent plan discussions
             recent_msgs = plan.discussions[-6:] if len(plan.discussions) > 6 else plan.discussions
             conv_history = [
                 {"role": m.role, "content": m.content}
@@ -865,7 +1309,6 @@ class PatientPlanService:
                 conversation_history=conv_history,
             )
 
-            # Save nutrition info response as a discussion message in the plan chat (seamless UX)
             assistant_msg = PatientPlanDiscussion(
                 plan_id=plan.id,
                 role="assistant",
@@ -877,85 +1320,114 @@ class PatientPlanService:
             await session.refresh(assistant_msg)
             return cls._format_discussion_response(assistant_msg)
 
-        # 1. Deterministic Positive Confirmation
-        is_positive_confirmation = (
-            lowered in (
-                "yes", "accept", "sure", "okay", "ok", "confirm", "apply", "change it",
-                "yes please", "do it", "go ahead", "sounds good", "perfect",
-                "theek hai", "theek hy", "haan", "haan theek hy", "haan theek hai",
-                "kr do", "kar do", "haan kr do", "haan kar do", "apply it", "apply changes",
-                "apply all", "adjust it", "adjust all", "adjust them",
+        # 2. Positive Confirmation of Pending Modification
+        if intent == "CONFIRM_MODIFICATION" and item_mod_pairs and pending_data:
+            applied_msg = await cls._apply_modification_internal(
+                session=session,
+                plan=plan,
+                item_mod_pairs=item_mod_pairs,
+                mod_data=pending_data,
+                user_author=patient_user,
+                pending_disc=pending_disc,
             )
-            or (lowered.startswith("yes") and any(w in lowered for w in ("apply", "change", "please", "do it", "sure")))
-            or ("apply" in lowered and any(w in lowered for w in ("change", "this", "modification", "it", "plan", "all", "these")))
-            or ("adjust" in lowered and any(w in lowered for w in ("all", "it", "them", "these", "plan")))
-            or any(u in lowered for u in ("theek hai", "theek hy", "kr do", "kar do", "haan kr"))
-            or lowered.startswith("confirm")
-            or lowered.startswith("accept")
-        )
-        if is_positive_confirmation:
-            item_mod_pairs, pending_data, pending_disc = cls._find_pending_modification(plan)
-            if item_mod_pairs and pending_data:
-                applied_msg = await cls._apply_modification_internal(
+            for d in plan.discussions:
+                if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                    d_mod = dict(d.proposed_modifications)
+                    d_mod["status"] = "applied"
+                    d.proposed_modifications = d_mod
+                    flag_modified(d, "proposed_modifications")
+            plan.discussions.append(applied_msg)
+            await session.commit()
+            await session.refresh(applied_msg)
+            return cls._format_discussion_response(applied_msg)
+
+        # 3. Rejection of Proposed Alternative (with alternative chaining)
+        if intent == "REJECT_ALTERNATIVE" and pending_data:
+            pending_data["status"] = "rejected"
+            if pending_disc and pending_disc.proposed_modifications:
+                p_mod = dict(pending_disc.proposed_modifications)
+                p_mod["status"] = "rejected"
+                pending_disc.proposed_modifications = p_mod
+                flag_modified(pending_disc, "proposed_modifications")
+            for d in plan.discussions:
+                if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                    d_mod = dict(d.proposed_modifications)
+                    d_mod["status"] = "rejected"
+                    d.proposed_modifications = d_mod
+                    flag_modified(d, "proposed_modifications")
+
+            prop_title = pending_data.get("proposed_title")
+            orig_title = pending_data.get("original_title")
+            action_type = pending_data.get("action_type", "swap")
+            rejected_item = analysis.get("rejected_item") or prop_title
+
+            # Persist rejected alternative to disliked items so it won't be suggested again
+            if rejected_item:
+                cls._add_disliked_item(plan, rejected_item)
+            if prop_title and prop_title != rejected_item:
+                cls._add_disliked_item(plan, prop_title)
+            if pending_data.get("disliked_item_added"):
+                cls._add_disliked_item(plan, pending_data["disliked_item_added"])
+
+            # If user declined a suggested swap alternative, automatically suggest the next alternative
+            if action_type == "swap" and orig_title:
+                alt_reply = await cls._generate_next_alternative_reply(
                     session=session,
                     plan=plan,
-                    item_mod_pairs=item_mod_pairs,
-                    mod_data=pending_data,
-                    user_author=patient_user,
-                    pending_disc=pending_disc,
+                    declined_title=rejected_item or prop_title or "this option",
+                    original_title=orig_title,
                 )
-                for d in plan.discussions:
-                    if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
-                        d_mod = dict(d.proposed_modifications)
-                        d_mod["status"] = "applied"
-                        d.proposed_modifications = d_mod
-                        flag_modified(d, "proposed_modifications")
-                plan.discussions.append(applied_msg)
+                plan.discussions.append(alt_reply)
                 await session.commit()
-                await session.refresh(applied_msg)
-                return cls._format_discussion_response(applied_msg)
+                await session.refresh(alt_reply)
+                return cls._format_discussion_response(alt_reply)
 
-        # 2. Deterministic Rejection
-        is_rejection = (
-            lowered in ("no", "cancel", "never mind", "reject", "keep it", "don't change", "leave it", "no thanks", "no please")
-            or (lowered.startswith("no") and any(w in lowered for w in ("change", "thanks", "keep", "cancel", "don't")))
-            or lowered.startswith("cancel")
-            or lowered.startswith("reject")
-        )
-        if is_rejection:
-            item_mod_pairs, pending_data, pending_disc = cls._find_pending_modification(plan)
-            if pending_data:
-                pending_data["status"] = "rejected"
-                if pending_disc and pending_disc.proposed_modifications:
-                    p_mod = dict(pending_disc.proposed_modifications)
-                    p_mod["status"] = "rejected"
-                    pending_disc.proposed_modifications = p_mod
-                    flag_modified(pending_disc, "proposed_modifications")
-                for d in plan.discussions:
-                    if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
-                        d_mod = dict(d.proposed_modifications)
-                        d_mod["status"] = "rejected"
-                        d.proposed_modifications = d_mod
-                        flag_modified(d, "proposed_modifications")
-                rejection_reply = PatientPlanDiscussion(
-                    plan_id=plan.id,
-                    role="assistant",
-                    content="No problem! I have kept your current plan unchanged.",
-                )
-                await PatientPlanRepository.add_discussion_message(session, rejection_reply)
-                plan.discussions.append(rejection_reply)
-                await session.commit()
-                await session.refresh(rejection_reply)
-                return cls._format_discussion_response(rejection_reply)
+            # Explicit cancellation
+            rejection_reply = PatientPlanDiscussion(
+                plan_id=plan.id,
+                role="assistant",
+                content="No problem! I have cancelled this proposed change and kept your schedule unchanged.",
+            )
+            await PatientPlanRepository.add_discussion_message(session, rejection_reply)
+            plan.discussions.append(rejection_reply)
+            await session.commit()
+            await session.refresh(rejection_reply)
+            return cls._format_discussion_response(rejection_reply)
 
-        # 3. Detect Goal Change / Cancel Request ("I want weight loss instead", "cancel plan")
-        if any(phrase in lowered for phrase in ("change my goal", "different goal", "weight loss instead", "weight gain instead", "forget this plan", "new goal", "cancel my plan", "delete my plan", "cancel plan", "delete plan")):
+        # 4. Explicit Cancel & Keep Original Plan
+        if intent == "CANCEL_KEEP_ORIGINAL" and pending_data:
+            pending_data["status"] = "rejected"
+            if pending_disc and pending_disc.proposed_modifications:
+                p_mod = dict(pending_disc.proposed_modifications)
+                p_mod["status"] = "rejected"
+                pending_disc.proposed_modifications = p_mod
+                flag_modified(pending_disc, "proposed_modifications")
+            for d in plan.discussions:
+                if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                    d_mod = dict(d.proposed_modifications)
+                    d_mod["status"] = "rejected"
+                    d.proposed_modifications = d_mod
+                    flag_modified(d, "proposed_modifications")
+
+            keep_reply = PatientPlanDiscussion(
+                plan_id=plan.id,
+                role="assistant",
+                content="No problem! I have kept your current plan unchanged.",
+            )
+            await PatientPlanRepository.add_discussion_message(session, keep_reply)
+            plan.discussions.append(keep_reply)
+            await session.commit()
+            await session.refresh(keep_reply)
+            return cls._format_discussion_response(keep_reply)
+
+        # 5. Goal Change / Cancel Entire Plan Request
+        if intent == "CHANGE_GOAL":
             goal_reply = PatientPlanDiscussion(
                 plan_id=plan.id,
                 role="assistant",
                 content=(
                     f"A patient can only have **one plan at a time**. Your current plan is configured for **{plan.title}**.\n\n"
-                    "If you would like to start a brand new plan, please click **Cancel Plan** at the top of your dashboard. "
+                    "If you would like to start a brand new plan with a different goal, please click **Cancel Plan** at the top of your dashboard. "
                     "This will completely clear your current plan from the database so you can start fresh with a new goal and questionnaire."
                 ),
             )
@@ -995,11 +1467,16 @@ class PatientPlanService:
                 "4. Respond in English for English inquiries, or in Roman Urdu (using English letters) if the patient writes in Urdu/Roman Urdu. Never use Arabic/Urdu script.\n"
             )
 
+        disliked_items_list = cls._get_disliked_items(plan)
+        disliked_str = ", ".join(disliked_items_list) if disliked_items_list else "None"
+
         chat_system_prompt = (
             "You are an empathetic, expert wellness assistant discussing the patient's daily health plan.\n\n"
             f"PLAN TITLE: {plan.title}\n"
             f"SUMMARY: {plan.summary}\n\n"
             f"CURRENT SCHEDULE:\n{schedule_summary}\n\n"
+            f"CURRENTLY DISLIKED / EXCLUDED ITEMS: {disliked_str}\n"
+            "CRITICAL: You are strictly forbidden from suggesting any food, ingredient, or activity from this excluded list.\n\n"
             "CRITICAL RULES:\n"
             "1. NO MEDICATIONS: You are strictly forbidden from prescribing, recommending, or suggesting pharmaceutical drugs, pills, tablets, or clinical dosages.\n"
             "2. POLITELY DECLINE & OFFER NATURAL ALTERNATIVES: If the patient asks for any medicine or prescription, politely decline by explaining that you cannot prescribe medications and advise them to consult a licensed doctor, and provide safe natural, dietary, and lifestyle alternatives instead.\n"
@@ -1009,26 +1486,34 @@ class PatientPlanService:
             "   - If the patient writes in Urdu, Roman Urdu, or Hindi, reply STRICTLY in Roman Urdu (using Latin/English alphabet, e.g. 'Aap ke plan mein breakfast ko update kar diya gaya hai...').\n"
             "   - NEVER write in traditional Urdu script (اردو رسم الخط / Arabic script). Absolutely NO Nastaliq/Arabic characters. Even if the patient writes in Urdu script, your response MUST be in Roman Urdu with English letters.\n\n"
             "HOW TO HANDLE DIFFERENT REQUEST TYPES:\n\n"
-            "A) SINGLE ITEM SWAP (e.g. 'swap my breakfast', 'change workout time'):\n"
-            "   Explain the swap briefly and end your response with exactly ONE proposed modification in this format:\n"
-            "   PROPOSED_MODIFICATION: {\"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<new description including weight gain/loss caloric impact>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\", \"calories\": 350, \"protein_g\": 15.0, \"carbs_g\": 45.0, \"fat_g\": 8.0, \"fiber_g\": 5.0, \"calories_burned\": null}\n"
-            "   IMPORTANT: Always include proposed_time (24-hour HH:MM format) if the time is changing. Always include proposed_category if the time-of-day category changes.\n"
-            "   IMPORTANT: For meals, include accurate nutritional estimates (calories, protein_g, carbs_g, fat_g, fiber_g) and in proposed_description explicitly state the caloric surplus/deficit impact (weight gain or loss). For exercise items, set calories to null and provide calories_burned.\n\n"
-            "B) SCHEDULE / LIFESTYLE CONSTRAINTS & UNAVAILABILITY (e.g. 'I work 9-5', 'I have no time between 10 am and 5 pm', 'I am busy from 10:00 to 17:00'):\n"
-            "   This is CRITICAL. When the patient specifies an unavailable window or work hours:\n"
+            "A) DISLIKING AN ITEM OR ASKING FOR AN ALTERNATIVE (e.g. 'I don't like banana', 'mujhe kela pasand nahi', 'replace eggs with vegetarian', 'change workout'):\n"
+            "   1. Identify the disliked item and the corresponding schedule item.\n"
+            f"   2. Suggest a healthy, delicious alternative that is NOT in the excluded list ({disliked_str}).\n"
+            "   3. In your response, clearly provide:\n"
+            "      - Nutritional Comparison: What the original item provided (calories, protein, carbs, vitamins) vs. what the new alternative provides.\n"
+            "      - Plan Impact: How this swap affects their daily caloric intake, macro balance, and goal.\n"
+            "   4. End your response with exactly ONE proposed modification in this format:\n"
+            "      PROPOSED_MODIFICATION: {\"action_type\": \"swap\", \"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<new description including caloric/macro details>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\", \"calories\": 350, \"protein_g\": 15.0, \"carbs_g\": 45.0, \"fat_g\": 8.0, \"fiber_g\": 5.0, \"calories_burned\": null, \"impact_summary\": \"<summary of impact on daily plan>\", \"disliked_item_added\": \"<name of disliked item>\"}\n\n"
+            "B) USER ASKING TO ADD AN ITEM (e.g. 'Add green tea at 4pm', 'Add 20 min walk', 'Can I add 15 almonds at 5pm?'):\n"
+            "   1. Explain what nutrients this added item provides (calories, protein, carbs, fat, fiber) OR how many calories it burns (for workouts).\n"
+            "   2. Explain the overall effect on their daily plan and goals (e.g. caloric impact, hydration, energy).\n"
+            "   3. Ask if they want to confirm adding it, and end your response with:\n"
+            "      PROPOSED_MODIFICATION: {\"action_type\": \"add\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<description>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 105, \"protein_g\": 4.0, \"carbs_g\": 3.0, \"fat_g\": 9.0, \"fiber_g\": 2.0, \"calories_burned\": null, \"impact_summary\": \"+105 kcal, 4g protein added to daily intake\"}\n\n"
+            "C) USER ASKING TO COMPLETELY REMOVE AN ITEM WITHOUT ALTERNATIVE (e.g. 'Remove evening snack completely', 'delete morning jog'):\n"
+            "   1. Explain clearly the consequences and overall impact on their plan (e.g. caloric deficit increase, potential fatigue, missing protein target).\n"
+            "   2. Ask if they are sure they want to remove it, and end your response with:\n"
+            "      PROPOSED_MODIFICATION: {\"action_type\": \"remove\", \"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old title>\", \"impact_summary\": \"Reduces daily intake by 220 kcal and 8g protein\"}\n\n"
+            "D) SCHEDULE / LIFESTYLE CONSTRAINTS & UNAVAILABILITY (e.g. 'I work 9-5', 'I have no time between 10 am and 5 pm', 'I am busy from 10:00 to 17:00'):\n"
             "   1. Identify EVERY SINGLE schedule item currently scheduled within or overlapping that unavailable window.\n"
-            "   2. Reschedule ALL of those items to suitable times outside that window (e.g. move lunch to before work or appropriate break, move afternoon activities/snacks to evening after work).\n"
+            "   2. Reschedule ALL of those items to suitable times outside that window.\n"
             "   3. In your chat message, clearly list each moved item: old time -> new time.\n"
             "   4. YOU MUST output ALL of the adjusted items together in PROPOSED_MODIFICATION as a JSON array:\n"
             "   PROPOSED_MODIFICATION: [\n"
-            "     {\"item_id\": \"<uuid-1>\", \"original_title\": \"<title 1>\", \"proposed_title\": \"<new title 1>\", \"proposed_description\": \"<desc 1>\", \"proposed_time\": \"09:30\", \"proposed_category\": \"lunch\", \"calories\": 450, \"protein_g\": 20.0, \"carbs_g\": 60.0, \"fat_g\": 12.0, \"fiber_g\": 6.0, \"calories_burned\": null},\n"
-            "     {\"item_id\": \"<uuid-2>\", \"original_title\": \"<title 2>\", \"proposed_title\": \"<new title 2>\", \"proposed_description\": \"<desc 2>\", \"proposed_time\": \"18:00\", \"proposed_category\": \"evening_activity\", \"calories\": null, \"protein_g\": null, \"carbs_g\": null, \"fat_g\": null, \"fiber_g\": null, \"calories_burned\": 200}\n"
-            "   ]\n"
-            "   CRITICAL DIRECTIVE: NEVER adjust only one item and leave other items conflicting in the user's unavailable hours! You MUST include ALL conflicting items in the JSON array so the user's entire schedule becomes conflict-free in one click!\n\n"
-            "C) GENERAL QUESTIONS (e.g. 'why this food?', 'is brown rice good?', 'how much water should I drink?'):\n"
+            "     {\"item_id\": \"<uuid-1>\", \"original_title\": \"<title 1>\", \"proposed_title\": \"<new title 1>\", \"proposed_description\": \"<desc 1>\", \"proposed_time\": \"09:30\", \"proposed_category\": \"lunch\", \"action_type\": \"reschedule\", \"calories\": 450, \"protein_g\": 20.0, \"carbs_g\": 60.0, \"fat_g\": 12.0, \"fiber_g\": 6.0, \"calories_burned\": null},\n"
+            "     {\"item_id\": \"<uuid-2>\", \"original_title\": \"<title 2>\", \"proposed_title\": \"<new title 2>\", \"proposed_description\": \"<desc 2>\", \"proposed_time\": \"18:00\", \"proposed_category\": \"evening_activity\", \"action_type\": \"reschedule\", \"calories\": null, \"protein_g\": null, \"carbs_g\": null, \"fat_g\": null, \"fiber_g\": null, \"calories_burned\": 200}\n"
+            "   ]\n\n"
+            "E) GENERAL QUESTIONS (e.g. 'why this food?', 'is brown rice good?', 'how much water should I drink?'):\n"
             "   Answer helpfully grounded in their plan. No modification needed.\n\n"
-            "D) VAGUE FEEDBACK (e.g. 'this is too much', 'I can't do all this', 'make it easier'):\n"
-            "   Ask 1-2 specific clarifying questions about which parts feel difficult, then suggest practical lighter alternatives.\n\n"
             "Keep your replies concise and friendly (3-6 sentences). Always be practical and specific, never generic."
             f"{med_guidance}"
         )
@@ -1054,49 +1539,15 @@ class PatientPlanService:
             ai_response_text = PlanValidator.get_safe_natural_alternative_fallback()
 
         # Parse proposed modification if present
-        proposed_mod = None
-        if "PROPOSED_MODIFICATION:" in ai_response_text:
-            parts = ai_response_text.split("PROPOSED_MODIFICATION:", 1)
-            ai_response_text = parts[0].strip()
-            mod_json_str = parts[1].strip()
+        proposed_mod = cls._parse_proposed_mod_from_text(ai_response_text)
+        if proposed_mod and "PROPOSED_MODIFICATION:" in ai_response_text:
+            ai_response_text = ai_response_text.split("PROPOSED_MODIFICATION:")[0].strip()
 
-            # Strip markdown code fences if LLM wrapped JSON in ```json ... ```
-            mod_json_str = re.sub(r"^```(?:json)?\s*", "", mod_json_str)
-            mod_json_str = re.sub(r"\s*```\s*$", "", mod_json_str.strip())
-
-            # Try to extract JSON array or object
-            json_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", mod_json_str)
-            if json_match:
-                mod_json_str = json_match.group(0)
-
-            try:
-                parsed_mod = json.loads(mod_json_str)
-                if isinstance(parsed_mod, list):
-                    mod_dict = {"status": "pending", "items": parsed_mod}
-                elif isinstance(parsed_mod, dict):
-                    mod_dict = dict(parsed_mod)
-                    mod_dict["status"] = "pending"
-                    for alt_key in ("modifications", "schedule_items", "adjustments", "changes"):
-                        if alt_key in mod_dict and isinstance(mod_dict[alt_key], list):
-                            mod_dict["items"] = mod_dict.pop(alt_key)
-                            break
-                else:
-                    mod_dict = None
-
-                if mod_dict:
-                    # Verify proposed modification does not contain medications
-                    mod_corpus = json.dumps(mod_dict)
-                    is_mod_unsafe, _ = PlanValidator.contains_blocked_medication(mod_corpus)
-                    if not is_mod_unsafe:
-                        proposed_mod = mod_dict
-                        item_count = len(mod_dict.get("items", [])) if "items" in mod_dict else 1
-                        logger.info("Successfully parsed PROPOSED_MODIFICATION with %s item(s)", item_count)
-                    else:
-                        logger.warning("Proposed modification contained medication terms. Dropping modification.")
-            except json.JSONDecodeError as je:
-                logger.warning("Failed to parse PROPOSED_MODIFICATION JSON: %s | Raw: %s", je, mod_json_str[:300])
-            except Exception as e:
-                logger.warning("Unexpected error parsing PROPOSED_MODIFICATION: %s", e)
+        # Record any disliked item identified by LLM
+        if proposed_mod:
+            disliked_add = proposed_mod.get("disliked_item_added")
+            if disliked_add:
+                cls._add_disliked_item(plan, disliked_add)
 
         assistant_msg = PatientPlanDiscussion(
             plan_id=plan.id,
@@ -1116,6 +1567,10 @@ class PatientPlanService:
         cls, plan: PatientPlan, mod_item: Dict[str, Any], exclude_ids: Optional[Set[uuid.UUID]] = None
     ) -> Optional[PatientPlanItem]:
         """Find matching PatientPlanItem by item_id, original_time, or title with distinct item resolution."""
+        # For addition requests, there is no existing item to match
+        if mod_item.get("action_type") == "add":
+            return None
+
         candidates = [i for i in plan.items if exclude_ids is None or i.id not in exclude_ids]
         if not candidates:
             return None
@@ -1167,7 +1622,7 @@ class PatientPlanService:
     @classmethod
     def _find_pending_modification(
         cls, plan: PatientPlan
-    ) -> Tuple[List[Tuple[PatientPlanItem, Dict[str, Any]]], Optional[Dict[str, Any]], Optional[PatientPlanDiscussion]]:
+    ) -> Tuple[List[Tuple[Optional[PatientPlanItem], Dict[str, Any]]], Optional[Dict[str, Any]], Optional[PatientPlanDiscussion]]:
         """
         Finds any pending modification in the discussion history.
         Returns (item_mod_pairs, mod_data, disc).
@@ -1180,18 +1635,25 @@ class PatientPlanService:
                     item_mod_pairs = []
                     used_ids: Set[uuid.UUID] = set()
                     for m in mod["items"]:
-                        target = cls._find_item_for_mod(plan, m, exclude_ids=used_ids)
-                        if target:
-                            used_ids.add(target.id)
-                            item_mod_pairs.append((target, m))
+                        action = m.get("action_type", "swap")
+                        if action == "add":
+                            item_mod_pairs.append((None, m))
+                        else:
+                            target = cls._find_item_for_mod(plan, m, exclude_ids=used_ids)
+                            if target:
+                                used_ids.add(target.id)
+                                item_mod_pairs.append((target, m))
                     if item_mod_pairs:
                         return item_mod_pairs, mod, disc
                 else:
                     # Single item modification
+                    action = mod.get("action_type", "swap")
+                    if action == "add":
+                        return [(None, mod)], mod, disc
                     target = cls._find_item_for_mod(plan, mod)
-                    if not target and plan.items:
+                    if not target and plan.items and action != "add":
                         target = plan.items[0]
-                    if target:
+                    if target or action == "add":
                         return [(target, mod)], mod, disc
         return [], None, None
 
@@ -1200,59 +1662,111 @@ class PatientPlanService:
         cls,
         session: AsyncSession,
         plan: PatientPlan,
-        item_mod_pairs: List[Tuple[PatientPlanItem, Dict[str, Any]]],
+        item_mod_pairs: List[Tuple[Optional[PatientPlanItem], Dict[str, Any]]],
         mod_data: Dict[str, Any],
         user_author: User,
         pending_disc: Optional[PatientPlanDiscussion] = None,
     ) -> PatientPlanDiscussion:
-        """Internal helper to apply approved modifications with atomic versioning."""
+        """Internal helper to apply approved modifications (swap, add, remove, reschedule) with atomic versioning."""
         valid_categories = {"morning_routine", "breakfast", "lunch", "evening_activity", "dinner", "night_routine", "snack", "exercise", "hydration"}
         changes_summaries = []
         revision_items = []
 
         for item, m in item_mod_pairs:
-            old_title = item.title
-            old_time = item.time_of_day
-            old_category = item.category
+            action_type = m.get("action_type", "swap")
 
-            if m.get("proposed_title"):
-                item.title = PlanValidator.sanitize_text(m["proposed_title"], 255)
-            if m.get("proposed_description"):
-                item.description = PlanValidator.sanitize_text(m["proposed_description"], 1000)
+            # Persist any disliked item associated with this modification
+            disliked_item = m.get("disliked_item_added")
+            if disliked_item:
+                cls._add_disliked_item(plan, disliked_item)
 
-            proposed_time = m.get("proposed_time")
-            if proposed_time and re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", proposed_time):
-                item.time_of_day = proposed_time
-                logger.info("Updating item time: %s -> %s", old_time, proposed_time)
+            if action_type == "add":
+                # Create a new scheduled plan item
+                proposed_cat = m.get("proposed_category", "general")
+                if proposed_cat not in valid_categories:
+                    proposed_cat = "snack"
 
-            proposed_category = m.get("proposed_category")
-            if proposed_category and proposed_category.lower() in valid_categories:
-                item.category = proposed_category.lower()
-                logger.info("Updating item category: %s -> %s", old_category, proposed_category)
+                new_item = PatientPlanItem(
+                    plan_id=plan.id,
+                    time_of_day=m.get("proposed_time") or "12:00",
+                    category=proposed_cat,
+                    title=PlanValidator.sanitize_text(m.get("proposed_title") or "New Activity", 255),
+                    description=PlanValidator.sanitize_text(m.get("proposed_description") or "", 1000),
+                    order_index=len(plan.items),
+                    is_active=True,
+                    calories=int(m["calories"]) if m.get("calories") is not None else None,
+                    protein_g=float(m["protein_g"]) if m.get("protein_g") is not None else None,
+                    carbs_g=float(m["carbs_g"]) if m.get("carbs_g") is not None else None,
+                    fat_g=float(m["fat_g"]) if m.get("fat_g") is not None else None,
+                    fiber_g=float(m["fiber_g"]) if m.get("fiber_g") is not None else None,
+                    calories_burned=int(m["calories_burned"]) if m.get("calories_burned") is not None else None,
+                )
+                session.add(new_item)
+                plan.items.append(new_item)
 
-            # Update nutritional metadata if present in modification
-            if "calories" in m and m["calories"] is not None:
-                item.calories = int(m["calories"])
-            if "protein_g" in m and m["protein_g"] is not None:
-                item.protein_g = float(m["protein_g"])
-            if "carbs_g" in m and m["carbs_g"] is not None:
-                item.carbs_g = float(m["carbs_g"])
-            if "fat_g" in m and m["fat_g"] is not None:
-                item.fat_g = float(m["fat_g"])
-            if "fiber_g" in m and m["fiber_g"] is not None:
-                item.fiber_g = float(m["fiber_g"])
-            if "calories_burned" in m and m["calories_burned"] is not None:
-                item.calories_burned = int(m["calories_burned"])
+                changes_summaries.append(f"Added **{new_item.title}** at **{new_item.time_of_day}**")
+                revision_items.append({
+                    "action": "add",
+                    "new_title": new_item.title,
+                    "new_time": new_item.time_of_day,
+                })
 
-            time_change = f" moved from **{old_time}** to **{item.time_of_day}**" if old_time != item.time_of_day else ""
-            changes_summaries.append(f"**{item.title}**{time_change}")
-            revision_items.append({
-                "item_id": str(item.id),
-                "previous_title": old_title,
-                "new_title": item.title,
-                "previous_time": old_time,
-                "new_time": item.time_of_day,
-            })
+            elif action_type == "remove":
+                if item:
+                    item.is_active = False
+                    changes_summaries.append(f"Removed **{item.title}** from your daily schedule")
+                    revision_items.append({
+                        "action": "remove",
+                        "item_id": str(item.id),
+                        "removed_title": item.title,
+                    })
+
+            else:
+                # Default: swap, reschedule, or update existing item
+                if item:
+                    old_title = item.title
+                    old_time = item.time_of_day
+                    old_category = item.category
+
+                    if m.get("proposed_title"):
+                        item.title = PlanValidator.sanitize_text(m["proposed_title"], 255)
+                    if m.get("proposed_description"):
+                        item.description = PlanValidator.sanitize_text(m["proposed_description"], 1000)
+
+                    proposed_time = m.get("proposed_time")
+                    if proposed_time and re.match(r"^(?:[01]\d|2[0-3]):[0-5]\d$", proposed_time):
+                        item.time_of_day = proposed_time
+                        logger.info("Updating item time: %s -> %s", old_time, proposed_time)
+
+                    proposed_category = m.get("proposed_category")
+                    if proposed_category and proposed_category.lower() in valid_categories:
+                        item.category = proposed_category.lower()
+                        logger.info("Updating item category: %s -> %s", old_category, proposed_category)
+
+                    # Update nutritional metadata if present in modification
+                    if "calories" in m:
+                        item.calories = int(m["calories"]) if m["calories"] is not None else None
+                    if "protein_g" in m:
+                        item.protein_g = float(m["protein_g"]) if m["protein_g"] is not None else None
+                    if "carbs_g" in m:
+                        item.carbs_g = float(m["carbs_g"]) if m["carbs_g"] is not None else None
+                    if "fat_g" in m:
+                        item.fat_g = float(m["fat_g"]) if m["fat_g"] is not None else None
+                    if "fiber_g" in m:
+                        item.fiber_g = float(m["fiber_g"]) if m["fiber_g"] is not None else None
+                    if "calories_burned" in m:
+                        item.calories_burned = int(m["calories_burned"]) if m["calories_burned"] is not None else None
+
+                    time_change = f" moved from **{old_time}** to **{item.time_of_day}**" if old_time != item.time_of_day else ""
+                    changes_summaries.append(f"**{item.title}**{time_change}")
+                    revision_items.append({
+                        "action": "modify",
+                        "item_id": str(item.id),
+                        "previous_title": old_title,
+                        "new_title": item.title,
+                        "previous_time": old_time,
+                        "new_time": item.time_of_day,
+                    })
 
         # Recalculate daily nutrition summary with updated items
         updated_summary = cls._calculate_daily_nutrition_summary(plan)
@@ -1287,7 +1801,7 @@ class PatientPlanService:
             reply_content = f"✅ Done! I've updated your daily plan: {changes_summaries[0]} has been applied."
         else:
             items_list = "\n".join(f"- {s}" for s in changes_summaries)
-            reply_content = f"✅ Done! I've updated your daily plan with all {len(item_mod_pairs)} schedule adjustments:\n{items_list}\nhave been successfully applied."
+            reply_content = f"✅ Done! I've updated your daily plan with all {len(item_mod_pairs)} adjustments:\n{items_list}\nhave been successfully applied."
 
         reply = PatientPlanDiscussion(
             plan_id=plan.id,
@@ -1358,13 +1872,34 @@ class PatientPlanService:
                 p_mod["status"] = "rejected"
                 pending_disc.proposed_modifications = p_mod
                 flag_modified(pending_disc, "proposed_modifications")
-            reject_msg = PatientPlanDiscussion(
-                plan_id=plan.id,
-                role="assistant",
-                content="Modification declined. Your plan remains unchanged.",
-            )
-            await PatientPlanRepository.add_discussion_message(session, reject_msg)
-            plan.discussions.append(reject_msg)
+
+            prop_title = pending_data.get("proposed_title")
+            orig_title = pending_data.get("original_title")
+            action_type = pending_data.get("action_type", "swap")
+
+            # Persist rejected alternative to disliked items so it won't be suggested again
+            if prop_title:
+                cls._add_disliked_item(plan, prop_title)
+            if pending_data.get("disliked_item_added"):
+                cls._add_disliked_item(plan, pending_data["disliked_item_added"])
+
+            # If user declined a suggested alternative swap, automatically suggest the NEXT alternative!
+            if action_type == "swap" and orig_title:
+                alt_reply = await cls._generate_next_alternative_reply(
+                    session=session,
+                    plan=plan,
+                    declined_title=prop_title or "this option",
+                    original_title=orig_title,
+                )
+                plan.discussions.append(alt_reply)
+            else:
+                reject_msg = PatientPlanDiscussion(
+                    plan_id=plan.id,
+                    role="assistant",
+                    content="Modification declined. Your plan remains unchanged.",
+                )
+                await PatientPlanRepository.add_discussion_message(session, reject_msg)
+                plan.discussions.append(reject_msg)
 
         # Mark all pending modifications in discussions as resolved
         for d in plan.discussions:
@@ -1699,6 +2234,7 @@ class PatientPlanService:
             discussions=discussions,
             today_logs=resolved_today_logs,
             daily_nutrition_summary=plan.daily_nutrition_summary or cls._calculate_daily_nutrition_summary(plan),
+            disliked_items=cls._get_disliked_items(plan),
             created_at=plan.created_at,
             updated_at=plan.updated_at,
         )
@@ -1759,102 +2295,12 @@ class PatientPlanService:
             created_at=d.created_at,
         )
 
-    # ── Smart Intent Classifier ──────────────────────────────────────────────
-
+    # ── Legacy Intent Classifier Stub (backward compatibility) ────────────────
     @classmethod
     def _classify_chat_intent(cls, text: str) -> str:
         """
-        Deterministic intent classifier for plan chat messages.
-
-        Returns:
-        - "nutrition_info"      → standalone food/exercise information query
-        - "plan_modification"   → plan change request or general plan discussion (default)
-
-        The classifier is conservative: if there's ANY hint the user wants to
-        modify their plan, it falls through to the existing plan chat logic.
-        Only clearly standalone info queries are routed to the nutrition agent.
+        Legacy fallback stub. All plan chat intent classification is now handled
+        dynamically and intelligently via cls._analyze_chat_intent_via_ai.
         """
-        lowered = text.lower().strip()
-
-        # ── 1. Plan modification verbs → always plan_modification ─────────
-        plan_mod_verbs = (
-            "change", "swap", "shift", "replace", "move", "adjust", "switch",
-            "remove", "add", "update", "modify", "edit", "reschedule",
-            "badal", "badlo", "hatao", "hata do", "laga do", "daal do",
-            "time change", "time badal", "time shift",
-        )
-        for verb in plan_mod_verbs:
-            if verb in lowered:
-                return "plan_modification"
-
-        # ── 2. Plan item references → plan_modification ───────────────────
-        plan_item_refs = (
-            "my breakfast", "my lunch", "my dinner", "my workout",
-            "my plan", "my schedule", "mera plan", "mera breakfast",
-            "mera lunch", "mera dinner", "mera workout",
-            "morning routine", "evening routine", "sleep routine",
-        )
-        for ref in plan_item_refs:
-            if ref in lowered:
-                return "plan_modification"
-
-        # ── 3. Clear nutrition info queries → nutrition_info ──────────────
-
-        # Pattern: "X mein/ma/me kitni/kitna/kitne calories/protein/..."
-        urdu_info_patterns = [
-            r"\b(?:mein|ma|me|mai)\s+(?:kitni|kitna|kitne)\b",
-            r"\b(?:kitni|kitna|kitne)\s+(?:calories|calorie|protein|carbs?|fat|fiber)\b",
-            r"\b(?:agar|agr)\s+(?:main|mein|ma)\b.*\b(?:khaon|khaun|khata|khati|peeta|peeti|piyon)\b",
-            r"\b(?:se|sy)\s+(?:kitna|kitni|kitne)\s+(?:burn|jale|jalega|jalein|milega|milein)\b",
-        ]
-        for pat in urdu_info_patterns:
-            if re.search(pat, lowered):
-                return "nutrition_info"
-
-        # English info query patterns
-        english_info_patterns = [
-            r"\bhow\s+(?:many|much)\s+(?:calories|calorie|protein|carbs?|fat|fiber)\b",
-            r"\b(?:calories?|protein|carbs?|fat|fiber|nutrition(?:al)?)\s+(?:in|of|for)\b",
-            r"\bif\s+i\s+(?:eat|drink|have|consume|walk|run|jog|cycle|swim)\b",
-            r"\bhow\s+(?:many|much)\s+(?:calories?)\s+(?:does?|do|will|would|can)\b.*\bburn\b",
-            r"\b(?:nutritional?|caloric)\s+(?:value|info|information|content|data|facts?)\b",
-            r"\bwhat(?:'s| is| are)\s+(?:the\s+)?(?:calories?|protein|carbs?|fat|nutrition)\b",
-        ]
-        for pat in english_info_patterns:
-            if re.search(pat, lowered):
-                return "nutrition_info"
-
-        # Direct food/exercise info questions (standalone item name + calories keyword)
-        standalone_food_query = re.search(
-            r"\b(?:banana|apple|roti|paratha|biryani|daal|dal|chawal|rice|chicken|egg|anda|"
-            r"bread|naan|lassi|chai|milk|doodh|mango|orange|yogurt|dahi|sabzi|gosht|"
-            r"fish|machli|paneer|chana|rajma|oats|oatmeal|almonds|badam|walnuts|akhrot)\b"
-            r".*\b(?:calories?|protein|carbs?|fat|fiber|nutrition|kitni|kitna)\b",
-            lowered,
-        )
-        if standalone_food_query:
-            return "nutrition_info"
-
-        # Reverse pattern: nutrition keyword first, then food name
-        reverse_food_query = re.search(
-            r"\b(?:calories?|protein|carbs?|fat|fiber|nutrition|kitni|kitna)\b"
-            r".*\b(?:banana|apple|roti|paratha|biryani|daal|dal|chawal|rice|chicken|egg|anda|"
-            r"bread|naan|lassi|chai|milk|doodh|mango|orange|yogurt|dahi|sabzi|gosht|"
-            r"fish|machli|paneer|chana|rajma|oats|oatmeal|almonds|badam|walnuts|akhrot)\b",
-            lowered,
-        )
-        if reverse_food_query:
-            return "nutrition_info"
-
-        # Exercise info queries
-        exercise_info_query = re.search(
-            r"\b(?:walk(?:ing)?|run(?:ning)?|jog(?:ging)?|cycl(?:ing|e)|swim(?:ming)?|"
-            r"pushup|push[- ]?up|squat|plank|yoga|stretching|stairs|jumping)\b"
-            r".*\b(?:calories?|burn|jale|jalega|kitna|kitni|how\s+(?:many|much))\b",
-            lowered,
-        )
-        if exercise_info_query:
-            return "nutrition_info"
-
-        # ── 4. Default: route to plan discussion LLM ─────────────────────
         return "plan_modification"
+

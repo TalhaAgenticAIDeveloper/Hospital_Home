@@ -275,6 +275,10 @@ class PatientPlan(TimestampMixin, Base):
     #        "total_fat_g": 65, "total_fiber_g": 30, "total_calories_burned": 350, "net_calories": 1750}
     daily_nutrition_summary: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=None)
 
+    # Disliked / excluded items tracked across refinements
+    # e.g. {"items": ["banana", "apple"]}
+    disliked_items: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True, default=lambda: {"items": []})
+
     # Optimistic locking version
     version: Mapped[int] = mapped_column(
         Integer, default=1, server_default="1", nullable=False
