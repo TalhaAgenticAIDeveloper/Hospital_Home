@@ -653,3 +653,30 @@ async def test_truncated_json_repair_and_decline_chaining(client: AsyncClient):
         assert new_alt_disc["proposed_modifications"]["proposed_title"] == "Quinoa & Berry Bowl"
         assert "PROPOSED_MODIFICATION:" not in new_alt_disc["content"]
 
+
+@pytest.mark.asyncio
+async def test_concrete_food_alternatives_and_parser_flexibility():
+    """Verify that alternatives and parser always produce concrete dishes with portions, never generic placeholders."""
+    from app.services.patient_plan_service import PatientPlanService
+
+    # 1. Test parser with markdown bolding and title case: **PROPOSED_MODIFICATION:**
+    bold_input = (
+        "Here is a great alternative for you.\n\n"
+        '**PROPOSED_MODIFICATION:** {"action_type":"swap","proposed_title":"2 Boiled Eggs with Whole-Wheat Toast","proposed_description":"2 eggs, 1 slice toast, spinach (~240 kcal)"}'
+    )
+    mod = PatientPlanService._parse_proposed_mod_from_text(bold_input)
+    assert mod is not None
+    assert mod["proposed_title"] == "2 Boiled Eggs with Whole-Wheat Toast"
+
+    # 2. Test fallback synthesizer when LLM produces no JSON block
+    title, desc = PatientPlanService._synthesize_concrete_alternative(
+        original_title="Protein-Rich Breakfast",
+        declined_title="Greek Yogurt",
+        disliked_list=["Greek Yogurt"],
+    )
+    assert "Healthy Alternative" not in title
+    assert "Tailored nutrient-dense" not in desc
+    assert any(food in title for food in ["Eggs", "Toast", "Oatmeal", "Chickpea", "Tofu"])
+    assert "kcal" in desc
+
+

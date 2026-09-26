@@ -801,6 +801,19 @@ class PatientPlanService:
             "2. STRICT ALLERGY RESPECT: Never include any food, ingredient, or snack that conflicts with the patient's declared allergies.\n"
             "3. REALISTIC & GROUNDED: Every activity must have realistic timing, sensible nutrition, and manageable habits.\n"
             "4. OUTPUT FORMAT: You must return ONLY valid, raw JSON matching the required schema. Do NOT include markdown fences, preambles, or explanations.\n\n"
+            "CONCRETE FOOD ITEMS & PORTION SIZES MANDATORY (STRICT):\n"
+            "For EVERY meal/food schedule item (breakfast, lunch, snack, dinner):\n"
+            "1. 'title' MUST name the SPECIFIC DISH, FOODS, and PORTIONS! NEVER use vague or generic titles like 'Protein-Rich Breakfast', 'Healthy Lunch', 'Nutritious Dinner', or 'Post-Workout Snack'.\n"
+            "   - BAD titles: 'Protein-Rich Breakfast', 'Healthy Lunch', 'Nutritious Dinner', 'Evening Snack'\n"
+            "   - GOOD titles: '2 Boiled Eggs with 1 Slice Whole-Wheat Toast & Sautéed Spinach', 'Grilled Chicken Salad (150g) with Quinoa & Lemon Dressing', 'Lentil Soup (1.5 cups) with Brown Rice & Steamed Veggies', 'Greek Yogurt (1 cup) with Sliced Banana & 10 Almonds'\n"
+            "2. 'description' MUST clearly and explicitly specify:\n"
+            "   - Exactly what foods to eat and their quantities/weights/measurements (e.g. '2 large whole eggs, 1 slice 100% whole-wheat bread, 1 cup baby spinach sautéed with 1 tsp olive oil').\n"
+            "   - How to prepare or consume it simply.\n"
+            "   - Caloric and macronutrient breakdown (e.g. 'Provides ~280 kcal, 18g protein, 15g carbs, 12g fat').\n"
+            "   - The patient must read the description and immediately know EXACTLY what to purchase, cook, and put on their plate without any guesswork.\n\n"
+            "For EVERY workout/exercise schedule item:\n"
+            "1. 'title' MUST name the specific exercise and duration (e.g. '30-Minute Brisk Walking Outdoors', '20-Minute Core & Lower-Body Mobility Routine').\n"
+            "2. 'description' MUST specify the routine steps, intensity, and estimated calories burned.\n\n"
             "NUTRITIONAL DATA & WEIGHT IMPACT REQUIREMENT:\n"
             "For EVERY meal/food schedule item, you MUST include accurate nutritional estimates:\n"
             "- calories (integer, kcal for the described meal/snack)\n"
@@ -831,8 +844,8 @@ class PatientPlanService:
             '    {\n'
             '      "time_of_day": "HH:MM",\n'
             '      "category": "morning_routine | breakfast | workout | lunch | evening_activity | dinner | sleep_routine",\n'
-            '      "title": "Actionable title",\n'
-            '      "description": "Clear guidance and dietary instructions",\n'
+            '      "title": "Specific dish or activity with portion (e.g. 2 Boiled Eggs with Whole-Wheat Toast & Spinach)",\n'
+            '      "description": "Exact ingredients, portions, preparation, and goal/caloric details",\n'
             '      "calories": 350,\n'
             '      "protein_g": 12.0,\n'
             '      "carbs_g": 55.0,\n'
@@ -1020,10 +1033,21 @@ class PatientPlanService:
     @classmethod
     def _parse_proposed_mod_from_text(cls, text: str) -> Optional[Dict[str, Any]]:
         """Extract and parse PROPOSED_MODIFICATION JSON block from LLM output, with robust repair for truncated JSON."""
-        if "PROPOSED_MODIFICATION:" not in text:
-            return None
-        parts = text.split("PROPOSED_MODIFICATION:", 1)
-        mod_json_str = parts[1].strip()
+        # Flexible match for PROPOSED_MODIFICATION (case-insensitive, optional markdown bolding / headers)
+        match = re.search(r"(?:\*\*|#+)?\s*PROPOSED[ _-]?MODIFICATION\s*(?:\*\*)?\s*:\s*", text, flags=re.IGNORECASE)
+        if match:
+            mod_json_str = text[match.end():].strip()
+        else:
+            # Fallback: check if the text contains a raw JSON block with action_type or proposed_title
+            brace_idx = text.find('{"action_type"')
+            if brace_idx == -1:
+                brace_idx = text.find('{"proposed_title"')
+            if brace_idx == -1:
+                brace_idx = text.find('[{"action_type"')
+            if brace_idx != -1:
+                mod_json_str = text[brace_idx:].strip()
+            else:
+                return None
 
         # Clean think tags if reasoning model leaked
         mod_json_str = re.sub(r"<think>.*?</think>", "", mod_json_str, flags=re.DOTALL).strip()
@@ -1092,6 +1116,69 @@ class PatientPlanService:
         return None
 
     @classmethod
+    def _synthesize_concrete_alternative(
+        cls,
+        original_title: str,
+        declined_title: str,
+        disliked_list: List[str],
+        ai_text: str = "",
+    ) -> Tuple[str, str]:
+        """
+        Creates a concrete, delicious meal or activity alternative with tangible foods
+        if the LLM output failed to produce the JSON block. Guarantees no generic placeholders.
+        """
+        disliked_lower = {d.lower().strip() for d in disliked_list if d}
+        if declined_title:
+            disliked_lower.add(declined_title.lower().strip())
+
+        orig_lower = original_title.lower()
+
+        # Check meal category
+        if any(w in orig_lower for w in ("breakfast", "morning")):
+            candidates = [
+                ("2 Boiled Eggs with Whole-Wheat Toast & Sautéed Spinach", "2 large boiled eggs (12g protein) with 1 slice whole-wheat toast (15g carbs) and a handful of baby spinach cooked in 1 tsp olive oil (~240 kcal)."),
+                ("Oatmeal Bowl with Chia Seeds, Almonds & Honey", "1/2 cup rolled oats cooked in water or unsweetened almond milk, topped with 1 tbsp chia seeds, 10 crushed almonds, and 1 tsp honey (~260 kcal, 8g protein, 6g fiber)."),
+                ("Chickpea & Avocado Mash on Whole-Wheat Toast", "1 slice toasted whole-wheat bread topped with 1/3 mashed avocado, 1/3 cup boiled chickpeas, cherry tomatoes, and lemon juice (~230 kcal, 7g protein, 7g fiber)."),
+                ("Vegetable Tofu Scramble with Whole-Wheat Toast", "150g firm tofu scrambled with turmeric, diced bell peppers, onions, and spinach, served with 1 slice toast (~250 kcal, 16g protein)."),
+            ]
+        elif any(w in orig_lower for w in ("lunch", "afternoon")):
+            candidates = [
+                ("Grilled Chicken Salad with Quinoa & Olive Oil", "150g grilled chicken breast on a bed of mixed greens, cucumber, and 1/2 cup cooked quinoa with 1 tbsp olive oil dressing (~380 kcal, 35g protein)."),
+                ("Lentil Soup with Brown Rice & Steamed Broccoli", "1.5 cups brown lentil soup served with 1/2 cup cooked brown rice and steamed broccoli florets (~340 kcal, 18g protein, 9g fiber)."),
+                ("Tuna & Chickpea Salad with Lemon Dressing", "1 can light tuna in water drained and tossed with 1/2 cup chickpeas, chopped red onion, parsley, and lemon juice (~290 kcal, 32g protein)."),
+            ]
+        elif any(w in orig_lower for w in ("dinner", "evening meal", "night")):
+            candidates = [
+                ("Baked Salmon with Steamed Asparagus & Sweet Potato", "140g baked salmon fillet seasoned with herbs, served with 1 small baked sweet potato and steamed asparagus (~410 kcal, 34g protein)."),
+                ("Spiced Lentil Dal with Sautéed Spinach & Quinoa", "1 cup yellow lentil dal prepared with cumin and ginger, served with 1/2 cup quinoa and sautéed spinach (~320 kcal, 15g protein)."),
+                ("Grilled Chicken Breast with Stir-Fried Mixed Veggies", "150g seasoned chicken breast with broccoli, bell peppers, and zucchini stir-fried in 1 tsp sesame oil (~310 kcal, 36g protein)."),
+            ]
+        elif any(w in orig_lower for w in ("snack", "tea")):
+            candidates = [
+                ("Handful of Raw Almonds & Walnuts (30g) with Green Tea", "A 30g mix of raw almonds and walnuts paired with an unsweetened cup of green tea (~180 kcal, 5g protein, healthy fats)."),
+                ("Apple Slices with 1 Tbsp Natural Peanut Butter", "1 medium crisp apple sliced and dipped in 1 tbsp unsweetened natural peanut butter (~170 kcal, 4g protein, 4g fiber)."),
+                ("Roasted Spiced Chickpeas (1/2 cup)", "1/2 cup crunchy oven-roasted chickpeas seasoned with paprika and cumin (~130 kcal, 6g protein, 5g fiber)."),
+            ]
+        elif any(w in orig_lower for w in ("walk", "workout", "exercise", "jog", "cardio", "gym")):
+            candidates = [
+                ("30-Minute Brisk Walking in Fresh Air", "A steady, brisk 30-minute outdoor walk at a moderate pace to support cardiovascular health and burn ~150-180 kcal."),
+                ("20-Minute Core & Lower-Body Mobility Circuit", "Gentle bodyweight circuit including squats, glute bridges, bird-dogs, and hamstring stretches to build mobility and burn ~100 kcal."),
+            ]
+        else:
+            candidates = [
+                ("Fresh Fruit & Nut Plate (Apple, Walnuts & Chia)", "1 sliced apple with 1 tbsp chia seeds and 10 raw walnuts (~200 kcal, 4g fiber, rich in antioxidants)."),
+                ("Wholesome Veggie & Protein Plate", "Freshly prepared mixed vegetables with a lean protein portion tailored to your daily nutritional goal (~250 kcal, 18g protein)."),
+            ]
+
+        # Pick the first candidate whose title doesn't conflict with any disliked item
+        for title, desc in candidates:
+            title_lower = title.lower()
+            if not any(d in title_lower for d in disliked_lower):
+                return title, desc
+
+        return candidates[0]
+
+    @classmethod
     async def _generate_next_alternative_reply(
         cls,
         session: AsyncSession,
@@ -1114,19 +1201,21 @@ class PatientPlanService:
         prompt = (
             f"The patient is customizing their wellness plan titled '{plan.title}'.\n"
             f"Current Schedule:\n{schedule_summary}\n\n"
-            f"The patient needs an alternative to replace '{original_title}'.\n"
+            f"The patient needs a specific, delicious, tangible alternative to replace '{original_title}'.\n"
             f"The previous suggestion '{declined_title}' was DECLINED by the patient.\n"
             f"CURRENTLY DISLIKED / EXCLUDED ITEMS: {disliked_str}.\n\n"
             f"CRITICAL DIRECTIVES:\n"
-            f"1. You MUST suggest a fresh, healthy, and appetizing alternative for '{original_title}'.\n"
+            f"1. YOU MUST SUGGEST A SPECIFIC, TANGIBLE MEAL OR EXERCISE. NEVER use vague terms like 'Healthy Alternative', 'Nutrient-Dense Option', or 'Protein Breakfast'.\n"
+            f"   - BAD proposed_title: 'Healthy Alternative for {original_title}', 'Nutritious Breakfast'\n"
+            f"   - GOOD proposed_title: '2 Scrambled Eggs + 1 Slice Whole-Wheat Toast & Spinach', 'Oatmeal (1 cup) with Chia Seeds, Almonds & Honey', 'Lentil Soup (1.5 cups) with Steamed Broccoli'\n"
             f"2. You are strictly forbidden from suggesting any item in the excluded list ({disliked_str}) or '{declined_title}'.\n"
             f"3. In your friendly message (in Roman Urdu if user writes in Urdu/Roman Urdu, or English with English letters only; NO Nastaliq/Arabic characters):\n"
-            f"   - Acknowledge that they didn't like '{declined_title}'.\n"
-            f"   - Suggest a new alternative and explain why it's a great fit.\n"
-            f"   - Nutritional Comparison: What '{original_title}' provided vs what this new alternative provides (calories, protein, carbs, vitamins).\n"
+            f"   - Acknowledge that they declined '{declined_title}'.\n"
+            f"   - Name the exact new dish/meal you are proposing and explain what ingredients it contains and why it's delicious and effective.\n"
+            f"   - Nutritional Comparison: Compare what '{original_title}' provided vs what this new meal provides (calories, protein, carbs, vitamins).\n"
             f"   - The overall effect on their daily plan and health goal.\n"
-            f"4. End your message with exactly one PROPOSED_MODIFICATION JSON:\n"
-            f"   PROPOSED_MODIFICATION: {{\"action_type\": \"swap\", \"original_title\": \"{original_title}\", \"proposed_title\": \"<new option>\", \"proposed_description\": \"<description with nutrients and goal impact>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 160, \"protein_g\": 4.0, \"carbs_g\": 30.0, \"fat_g\": 2.0, \"fiber_g\": 3.5, \"calories_burned\": null, \"impact_summary\": \"<effect on daily plan>\", \"disliked_item_added\": \"{declined_title}\"}}\n"
+            f"4. You MUST end your message with a PROPOSED_MODIFICATION JSON block. In 'proposed_title' and 'proposed_description', describe the EXACT meal, portion sizes, ingredients, and preparation:\n"
+            f"   PROPOSED_MODIFICATION: {{\"action_type\": \"swap\", \"original_title\": \"{original_title}\", \"proposed_title\": \"<EXACT DISH NAME & PORTION>\", \"proposed_description\": \"<EXACT ingredients, preparation instructions, calories, and macro details>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 240, \"protein_g\": 16.0, \"carbs_g\": 22.0, \"fat_g\": 8.0, \"fiber_g\": 4.0, \"calories_burned\": null, \"impact_summary\": \"<effect on daily plan>\", \"disliked_item_added\": \"{declined_title}\"}}\n"
             f"5. NO MEDICATIONS: strictly forbidden from mentioning medications."
         )
 
@@ -1148,19 +1237,28 @@ class PatientPlanService:
 
         # Parse proposed modification if present
         proposed_mod = cls._parse_proposed_mod_from_text(ai_text)
-        
+
         # ALWAYS strip PROPOSED_MODIFICATION protocol text from user-facing message
-        if "PROPOSED_MODIFICATION:" in ai_text:
+        match = re.search(r"(?:\*\*|#+)?\s*PROPOSED[ _-]?MODIFICATION\s*(?:\*\*)?\s*:.*", ai_text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            ai_text = ai_text[:match.start()].strip()
+        elif "PROPOSED_MODIFICATION:" in ai_text:
             ai_text = ai_text.split("PROPOSED_MODIFICATION:")[0].strip()
 
-        # If LLM failed to output JSON, synthesize a fallback proposed modification
-        # so the user ALWAYS gets the interactive card with Accept/Decline action buttons
+        # If LLM failed to output JSON, synthesize a realistic, concrete proposed modification
+        # so the user ALWAYS gets the interactive card with exact food items and portions
         if not proposed_mod:
+            concrete_title, concrete_desc = cls._synthesize_concrete_alternative(
+                original_title=original_title,
+                declined_title=declined_title,
+                disliked_list=disliked_list,
+                ai_text=ai_text,
+            )
             proposed_mod = {
                 "action_type": "swap",
                 "original_title": original_title,
-                "proposed_title": f"Healthy Alternative for {original_title}",
-                "proposed_description": f"Tailored nutrient-dense alternative replacing {original_title}.",
+                "proposed_title": concrete_title,
+                "proposed_description": concrete_desc,
                 "status": "pending",
                 "disliked_item_added": declined_title,
             }
@@ -1567,17 +1665,22 @@ class PatientPlanService:
             "HOW TO HANDLE DIFFERENT REQUEST TYPES:\n\n"
             "A) DISLIKING AN ITEM OR ASKING FOR AN ALTERNATIVE (e.g. 'I don't like banana', 'mujhe kela pasand nahi', 'replace eggs with vegetarian', 'change workout'):\n"
             "   1. Identify the disliked item and the corresponding schedule item.\n"
-            f"   2. Suggest a healthy, delicious alternative that is NOT in the excluded list ({disliked_str}).\n"
-            "   3. In your response, clearly provide:\n"
+            f"   2. Suggest a healthy, delicious, tangible alternative that is NOT in the excluded list ({disliked_str}).\n"
+            "   3. CRITICAL - CONCRETE FOOD & PORTION REQUIRED: NEVER use generic labels like 'Healthy Alternative', 'Nutrient-Dense Option', 'Protein Breakfast'.\n"
+            "      - BAD proposed_title: 'Healthy Alternative for Breakfast', 'Nutritious Lunch'\n"
+            "      - GOOD proposed_title: '2 Boiled Eggs with 1 Slice Whole-Wheat Toast & Sautéed Spinach', 'Oatmeal (1 cup) with Chia Seeds, Almonds & Honey', 'Lentil Soup (1.5 cups) with Steamed Broccoli'\n"
+            "      - In proposed_description, explicitly state what to eat, ingredients, portions, preparation, calories, and macros so the patient knows exactly what to eat.\n"
+            "   4. In your response, clearly provide:\n"
             "      - Nutritional Comparison: What the original item provided (calories, protein, carbs, vitamins) vs. what the new alternative provides.\n"
             "      - Plan Impact: How this swap affects their daily caloric intake, macro balance, and goal.\n"
-            "   4. End your response with exactly ONE proposed modification in this format:\n"
-            "      PROPOSED_MODIFICATION: {\"action_type\": \"swap\", \"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<new description including caloric/macro details>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\", \"calories\": 350, \"protein_g\": 15.0, \"carbs_g\": 45.0, \"fat_g\": 8.0, \"fiber_g\": 5.0, \"calories_burned\": null, \"impact_summary\": \"<summary of impact on daily plan>\", \"disliked_item_added\": \"<name of disliked item>\"}\n\n"
+            "   5. End your response with exactly ONE proposed modification in this format:\n"
+            "      PROPOSED_MODIFICATION: {\"action_type\": \"swap\", \"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<EXACT DISH & PORTION>\", \"proposed_description\": \"<EXACT ingredients, portions, preparation instructions, calories, and macros>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\", \"calories\": 350, \"protein_g\": 15.0, \"carbs_g\": 45.0, \"fat_g\": 8.0, \"fiber_g\": 5.0, \"calories_burned\": null, \"impact_summary\": \"<summary of impact on daily plan>\", \"disliked_item_added\": \"<name of disliked item>\"}\n\n"
             "B) USER ASKING TO ADD AN ITEM (e.g. 'Add green tea at 4pm', 'Add 20 min walk', 'Can I add 15 almonds at 5pm?'):\n"
-            "   1. Explain what nutrients this added item provides (calories, protein, carbs, fat, fiber) OR how many calories it burns (for workouts).\n"
-            "   2. Explain the overall effect on their daily plan and goals (e.g. caloric impact, hydration, energy).\n"
-            "   3. Ask if they want to confirm adding it, and end your response with:\n"
-            "      PROPOSED_MODIFICATION: {\"action_type\": \"add\", \"proposed_title\": \"<new title>\", \"proposed_description\": \"<description>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 105, \"protein_g\": 4.0, \"carbs_g\": 3.0, \"fat_g\": 9.0, \"fiber_g\": 2.0, \"calories_burned\": null, \"impact_summary\": \"+105 kcal, 4g protein added to daily intake\"}\n\n"
+            "   1. In proposed_title, state the exact tangible item/food and quantity (e.g. '15 Raw Almonds + 1 Cup Green Tea').\n"
+            "   2. Explain what nutrients this added item provides (calories, protein, carbs, fat, fiber) OR how many calories it burns (for workouts).\n"
+            "   3. Explain the overall effect on their daily plan and goals (e.g. caloric impact, hydration, energy).\n"
+            "   4. Ask if they want to confirm adding it, and end your response with:\n"
+            "      PROPOSED_MODIFICATION: {\"action_type\": \"add\", \"proposed_title\": \"<EXACT ITEM & QUANTITY>\", \"proposed_description\": \"<EXACT ingredients, portions, calories, and macros>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 105, \"protein_g\": 4.0, \"carbs_g\": 3.0, \"fat_g\": 9.0, \"fiber_g\": 2.0, \"calories_burned\": null, \"impact_summary\": \"+105 kcal, 4g protein added to daily intake\"}\n\n"
             "C) USER ASKING TO COMPLETELY REMOVE AN ITEM WITHOUT ALTERNATIVE (e.g. 'Remove evening snack completely', 'delete morning jog'):\n"
             "   1. Explain clearly the consequences and overall impact on their plan (e.g. caloric deficit increase, potential fatigue, missing protein target).\n"
             "   2. Ask if they are sure they want to remove it, and end your response with:\n"
@@ -1625,9 +1728,12 @@ class PatientPlanService:
 
         # Parse proposed modification if present
         proposed_mod = cls._parse_proposed_mod_from_text(ai_response_text)
-        
+
         # ALWAYS strip PROPOSED_MODIFICATION protocol text from user-facing message, even if parsing failed!
-        if "PROPOSED_MODIFICATION:" in ai_response_text:
+        match = re.search(r"(?:\*\*|#+)?\s*PROPOSED[ _-]?MODIFICATION\s*(?:\*\*)?\s*:.*", ai_response_text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            ai_response_text = ai_response_text[:match.start()].strip()
+        elif "PROPOSED_MODIFICATION:" in ai_response_text:
             ai_response_text = ai_response_text.split("PROPOSED_MODIFICATION:")[0].strip()
 
         # Record any disliked item identified by LLM
