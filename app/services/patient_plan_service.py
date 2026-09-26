@@ -334,8 +334,17 @@ class PatientPlanService:
         Transitions state to QUESTIONNAIRE_ACTIVE.
         """
         category = payload.category or "custom"
-
         target_desc = payload.target_description or ""
+
+        # Enforce single plan per patient rule FIRST before making expensive AI calls
+        existing_plans = await PatientPlanRepository.list_plans_by_patient(session, patient_user.id)
+        if existing_plans:
+            existing = existing_plans[0]
+            raise ValidationError(
+                f"You already have an existing plan ('{existing.title}'). "
+                "A patient can only have one plan at a time. "
+                "Please cancel your current plan first to wipe it from the database before starting a new one."
+            )
 
         # Generate questions via AI based on the patient's specific goal
         raw_questions = await cls._generate_questions_via_ai(
@@ -358,16 +367,6 @@ class PatientPlanService:
                     retry_count=0,
                     help_text=q.get("help_text"),
                 )
-            )
-
-        # Enforce single plan per patient rule
-        existing_plans = await PatientPlanRepository.list_plans_by_patient(session, patient_user.id)
-        if existing_plans:
-            existing = existing_plans[0]
-            raise ValidationError(
-                f"You already have an existing plan ('{existing.title}'). "
-                "A patient can only have one plan at a time. "
-                "Please cancel your current plan first to wipe it from the database before starting a new one."
             )
 
         # Clear any prior incomplete goal without a plan to keep database clean

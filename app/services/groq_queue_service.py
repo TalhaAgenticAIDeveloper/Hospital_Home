@@ -74,17 +74,19 @@ class GroqQueueService:
     def __init__(
         self,
         max_size: int = 500,
-        inter_request_delay: float = 0.25,
+        concurrency: int = 1,
+        inter_request_delay: float = 0.0,
         default_enqueue_retries: int = 3,
         default_exec_retries: int = 3,
     ):
         self.max_size = max_size
+        self.concurrency = concurrency
         self.inter_request_delay = inter_request_delay
         self.default_enqueue_retries = default_enqueue_retries
         self.default_exec_retries = default_exec_retries
 
         self._queue: Optional[asyncio.PriorityQueue] = None
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_tasks: List[asyncio.Task] = []
         self._running: bool = False
         self._sequence_counter: int = 0
         self._lock: Optional[asyncio.Lock] = None
@@ -108,30 +110,35 @@ class GroqQueueService:
         return self._sequence_counter
 
     async def start_worker(self) -> None:
-        """Start the background worker task if not already running."""
+        """Start the background worker tasks if not already running."""
         self._init_internals()
-        if self._running and self._worker_task and not self._worker_task.done():
+        active_tasks = [t for t in self._worker_tasks if not t.done()]
+        if self._running and len(active_tasks) == self.concurrency:
             return
 
         self._running = True
-        self._worker_task = asyncio.create_task(self._worker_loop(), name="groq_queue_worker")
-        logger.info("[GROQ_QUEUE] Background worker started successfully.")
+        self._worker_tasks = []
+        for i in range(self.concurrency):
+            t = asyncio.create_task(self._worker_loop(worker_id=i), name=f"groq_queue_worker_{i}")
+            self._worker_tasks.append(t)
+        logger.info(f"[GROQ_QUEUE] Background worker pool started ({self.concurrency} concurrent workers).")
 
     async def stop_worker(self) -> None:
-        """Gracefully stop the background worker task."""
+        """Gracefully stop all background worker tasks."""
         self._running = False
-        if self._worker_task and not self._worker_task.done():
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-        logger.info("[GROQ_QUEUE] Background worker stopped.")
+        for t in self._worker_tasks:
+            if not t.done():
+                t.cancel()
+        if self._worker_tasks:
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+        self._worker_tasks.clear()
+        logger.info("[GROQ_QUEUE] Background worker pool stopped.")
 
     async def ensure_worker(self) -> None:
-        """Ensures that the internal queue and background worker are active on the current loop."""
+        """Ensures that the internal queue and background workers are active on the current loop."""
         self._init_internals()
-        if not self._running or self._worker_task is None or self._worker_task.done():
+        active_tasks = [t for t in self._worker_tasks if not t.done()]
+        if not self._running or len(active_tasks) < self.concurrency:
             await self.start_worker()
 
     # ── Job Submission & Enqueue Retries ──────────────────────────────────────
@@ -211,48 +218,47 @@ class GroqQueueService:
 
     # ── Worker Loop & Execution Retries ──────────────────────────────────────
 
-    async def _worker_loop(self) -> None:
-        """Background coroutine that sequentially dequeues and processes Groq jobs."""
-        logger.info("[GROQ_QUEUE_WORKER] Processing loop started.")
+    async def _worker_loop(self, worker_id: int = 0) -> None:
+        """Background coroutine that dequeues and processes Groq jobs concurrently."""
+        logger.info(f"[GROQ_QUEUE_WORKER_{worker_id}] Processing loop started.")
         while self._running:
             try:
                 priority, seq, job = await self._queue.get()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"[GROQ_QUEUE_WORKER_ERROR] Unexpected queue get error: {e}")
-                await asyncio.sleep(0.5)
+                logger.error(f"[GROQ_QUEUE_WORKER_{worker_id}_ERROR] Unexpected queue get error: {e}")
+                await asyncio.sleep(0.1)
                 continue
 
             try:
                 logger.info(
-                    f"[GROQ_QUEUE_START] job_id={job.job_id} caller={job.caller} "
+                    f"[GROQ_QUEUE_START] worker={worker_id} job_id={job.job_id} caller={job.caller} "
                     f"priority={priority} remaining_in_queue={self._queue.qsize()}"
                 )
                 result = await self._execute_with_retries(job)
                 self.total_processed += 1
                 if not job.future.done():
                     job.future.set_result(result)
-                logger.info(f"[GROQ_QUEUE_SUCCESS] job_id={job.job_id} caller={job.caller}")
+                logger.info(f"[GROQ_QUEUE_SUCCESS] worker={worker_id} job_id={job.job_id} caller={job.caller}")
             except asyncio.CancelledError:
                 if not job.future.done():
                     job.future.cancel()
                 break
             except Exception as exc:
                 self.total_failed += 1
-                logger.error(f"[GROQ_QUEUE_ERROR] job_id={job.job_id} caller={job.caller} failed: {exc}")
+                logger.error(f"[GROQ_QUEUE_ERROR] worker={worker_id} job_id={job.job_id} caller={job.caller} failed: {exc}")
                 if not job.future.done():
                     job.future.set_exception(exc)
             finally:
                 self._queue.task_done()
-                # Inter-request delay ensures Groq rate limits (token bucket) do not burst
                 if self.inter_request_delay > 0:
                     await asyncio.sleep(self.inter_request_delay)
 
     async def _execute_with_retries(self, job: GroqJob) -> Any:
         """
         Executes a job's async function with up to `job.max_retries` retries
-        with exponential backoff and 429 Retry-After header parsing.
+        with fast exponential backoff and rate-limit delay capping.
         """
         max_retries = job.max_retries
         last_exc: Optional[Exception] = None
@@ -285,17 +291,21 @@ class GroqQueueService:
     @staticmethod
     def _is_retryable_error(exc: Exception) -> bool:
         """Determines if the encountered error qualifies for execution retry."""
+        err_msg = str(exc).lower()
+
+        # Hard daily token limits / quota exhaustion cannot succeed in seconds — fail immediately!
+        if "tokens per day" in err_msg or "tpd" in err_msg or "daily limit" in err_msg or "service tier" in err_msg:
+            return False
+
         if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError, httpx.ReadTimeout)):
             return True
         if isinstance(exc, GroqRateLimitError):
             return True
 
-        # Check HTTP response status codes if wrapped
         status_code = getattr(exc, "status_code", None)
         if status_code in (429, 500, 502, 503, 504):
             return True
 
-        err_msg = str(exc).lower()
         if "429" in err_msg or "rate limit" in err_msg or "too many requests" in err_msg:
             return True
         if "timeout" in err_msg or "temporarily busy" in err_msg or "service unavailable" in err_msg:
@@ -305,14 +315,13 @@ class GroqQueueService:
 
     @staticmethod
     def _calculate_backoff(attempt: int, exc: Exception) -> float:
-        """Calculates backoff delay, respecting Groq 429 Retry-After if provided."""
+        """Calculates backoff delay, strictly capped to prevent blocking workers."""
         if isinstance(exc, GroqRateLimitError) and exc.retry_after and exc.retry_after > 0:
-            return exc.retry_after + 0.5
+            # Never block a worker for more than 3 seconds
+            return min(exc.retry_after, 3.0)
 
-        # Exponential backoff: 2s, 4s, 8s with small jitter
-        base_backoff = 2.0 ** (attempt + 1)
-        jitter = (attempt * 0.25)
-        return min(base_backoff + jitter, 15.0)
+        # Fast backoff: 0.2s, 0.4s, 0.8s
+        return min(0.2 * (2.0 ** attempt), 1.5)
 
     # ── High-Level Convenience Methods ────────────────────────────────────────
 
@@ -324,12 +333,13 @@ class GroqQueueService:
         max_tokens: int = 2048,
         priority: int = GroqPriority.NORMAL,
         caller: str = "ChatCompletion",
-        timeout: float = 90.0,
+        timeout: float = 45.0,
         enqueue_retries: int = 3,
         max_retries: int = 3,
     ) -> str:
         """
-        Dispatches a Chat Completions call through the Groq queue with cleanup of reasoning tags.
+        Dispatches a Chat Completions call through the Groq queue with cleanup of reasoning tags
+        and automatic lightweight model fallback if primary model quota is exhausted.
         """
         api_key = settings.groq_api_key
         if not api_key:
@@ -337,46 +347,82 @@ class GroqQueueService:
                 "Groq API key is not configured. Please set GROQ_API or GROQ_API_KEY in backend .env."
             )
 
-        model_name = model or settings.GROQ_MODEL or "llama-3.3-70b-versatile"
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
+        primary_model = model or settings.GROQ_MODEL or "openai/gpt-oss-20b"
+        # Fast fallback models available on this API key
+        candidate_models = [primary_model]
+        for fallback in ["openai/gpt-oss-20b", "qwen/qwen3.8-27b"]:
+            if fallback not in candidate_models:
+                candidate_models.append(fallback)
+
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
         async def _call_api() -> str:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
+            last_model_err: Optional[Exception] = None
 
-                if resp.status_code == 429:
-                    retry_header = resp.headers.get("retry-after")
-                    retry_val = float(retry_header) if retry_header and retry_header.isdigit() else 2.5
-                    raise GroqRateLimitError(f"Groq API rate limit exceeded (429): {resp.text[:200]}", retry_val)
+            for cur_model in candidate_models:
+                cur_payload = {
+                    "model": cur_model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                try:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=cur_payload, headers=headers)
 
-                if resp.status_code != 200:
-                    err_text = resp.text[:300]
-                    logger.error(f"[GROQ_API_ERR] status={resp.status_code} caller={caller}: {err_text}")
-                    if resp.status_code >= 500:
-                        raise httpx.HTTPStatusError(f"Groq 5xx Server Error ({resp.status_code})", request=resp.request, response=resp)
-                    raise ValidationError(f"Groq AI service error ({resp.status_code}): {err_text}")
+                        if resp.status_code == 429:
+                            err_body = resp.text.lower()
+                            # If daily limit / TPD, immediately switch to next model candidate!
+                            if "tokens per day" in err_body or "tpd" in err_body or "daily limit" in err_body:
+                                logger.warning(
+                                    f"[GROQ_TPD_QUOTA_EXCEEDED] Model {cur_model} daily quota exhausted, "
+                                    f"attempting fast fallback model..."
+                                )
+                                last_model_err = GroqRateLimitError(f"Daily quota exceeded for {cur_model}", 0.0)
+                                continue
 
-                data = resp.json()
-                choices = data.get("choices", [])
-                if not choices:
-                    raise ValidationError("Groq AI returned an empty response.")
+                            retry_header = resp.headers.get("retry-after")
+                            retry_val = float(retry_header) if retry_header and retry_header.isdigit() else 1.0
+                            retry_val = min(retry_val, 3.0)
+                            raise GroqRateLimitError(f"Groq API rate limit exceeded (429): {resp.text[:200]}", retry_val)
 
-                raw_content = choices[0].get("message", {}).get("content", "").strip()
-                # Clean <think>...</think> tags if reasoning model
-                cleaned_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-                if "<think>" in cleaned_content and "</think>" not in cleaned_content:
-                    cleaned_content = cleaned_content.split("<think>", 1)[0].strip()
+                        if resp.status_code != 200:
+                            err_text = resp.text[:300]
+                            # If model not found or decommissioned, try next candidate
+                            if resp.status_code in (400, 404) and ("not exist" in err_text or "decommissioned" in err_text):
+                                logger.warning(f"[GROQ_MODEL_UNAVAILABLE] Model {cur_model} unavailable, trying fallback: {err_text}")
+                                last_model_err = ValidationError(f"Model unavailable: {err_text}")
+                                continue
 
-                return cleaned_content or raw_content
+                            logger.error(f"[GROQ_API_ERR] status={resp.status_code} model={cur_model} caller={caller}: {err_text}")
+                            if resp.status_code >= 500:
+                                raise httpx.HTTPStatusError(f"Groq 5xx Server Error ({resp.status_code})", request=resp.request, response=resp)
+                            raise ValidationError(f"Groq AI service error ({resp.status_code}): {err_text}")
+
+                        data = resp.json()
+                        choices = data.get("choices", [])
+                        if not choices:
+                            raise ValidationError("Groq AI returned an empty response.")
+
+                        raw_content = choices[0].get("message", {}).get("content", "").strip()
+                        cleaned_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
+                        if "<think>" in cleaned_content and "</think>" not in cleaned_content:
+                            cleaned_content = cleaned_content.split("<think>", 1)[0].strip()
+
+                        return cleaned_content or raw_content
+
+                except GroqRateLimitError as rle:
+                    # If quota exhausted (retry_after == 0.0), continue to next model candidate
+                    if rle.retry_after == 0.0:
+                        continue
+                    raise rle
+
+            if last_model_err:
+                raise last_model_err
+            raise ValidationError("All candidate Groq AI models failed.")
 
         return await self.submit(
             fn=_call_api,
@@ -461,8 +507,11 @@ class GroqQueueService:
     def get_status(self) -> Dict[str, Any]:
         """Returns current operational telemetry of the Groq queue."""
         q_size = self._queue.qsize() if self._queue is not None else 0
+        active_worker_count = len([t for t in self._worker_tasks if not t.done()])
         return {
             "worker_running": self._running,
+            "concurrency": self.concurrency,
+            "active_workers": active_worker_count,
             "current_queue_depth": q_size,
             "total_enqueued": self.total_enqueued,
             "total_processed": self.total_processed,
