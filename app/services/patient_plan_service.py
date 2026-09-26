@@ -1321,25 +1321,37 @@ class PatientPlanService:
             return cls._format_discussion_response(assistant_msg)
 
         # 2. Positive Confirmation of Pending Modification
-        if intent == "CONFIRM_MODIFICATION" and item_mod_pairs and pending_data:
-            applied_msg = await cls._apply_modification_internal(
-                session=session,
-                plan=plan,
-                item_mod_pairs=item_mod_pairs,
-                mod_data=pending_data,
-                user_author=patient_user,
-                pending_disc=pending_disc,
-            )
-            for d in plan.discussions:
-                if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
-                    d_mod = dict(d.proposed_modifications)
-                    d_mod["status"] = "applied"
-                    d.proposed_modifications = d_mod
-                    flag_modified(d, "proposed_modifications")
-            plan.discussions.append(applied_msg)
-            await session.commit()
-            await session.refresh(applied_msg)
-            return cls._format_discussion_response(applied_msg)
+        if intent == "CONFIRM_MODIFICATION" and pending_data:
+            if not item_mod_pairs:
+                action = pending_data.get("action_type", "swap")
+                if action == "add":
+                    item_mod_pairs = [(None, pending_data)]
+                else:
+                    target = cls._find_item_for_mod(plan, pending_data)
+                    if not target and plan.items:
+                        target = plan.items[0]
+                    if target:
+                        item_mod_pairs = [(target, pending_data)]
+
+            if item_mod_pairs:
+                applied_msg = await cls._apply_modification_internal(
+                    session=session,
+                    plan=plan,
+                    item_mod_pairs=item_mod_pairs,
+                    mod_data=pending_data,
+                    user_author=patient_user,
+                    pending_disc=pending_disc,
+                )
+                for d in plan.discussions:
+                    if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                        d_mod = dict(d.proposed_modifications)
+                        d_mod["status"] = "applied"
+                        d.proposed_modifications = d_mod
+                        flag_modified(d, "proposed_modifications")
+                plan.discussions.append(applied_msg)
+                await session.commit()
+                await session.refresh(applied_msg)
+                return cls._format_discussion_response(applied_msg)
 
         # 3. Rejection of Proposed Alternative (with alternative chaining)
         if intent == "REJECT_ALTERNATIVE" and pending_data:
@@ -1617,6 +1629,13 @@ class PatientPlanService:
             if matched:
                 return matched
 
+        # Fallback: match by category if available
+        prop_cat = mod_item.get("proposed_category") or mod_item.get("category")
+        if prop_cat:
+            matched = next((i for i in candidates if i.category.lower() == str(prop_cat).lower()), None)
+            if matched:
+                return matched
+
         return None
 
     @classmethod
@@ -1628,33 +1647,37 @@ class PatientPlanService:
         Returns (item_mod_pairs, mod_data, disc).
         """
         for disc in reversed(plan.discussions):
-            if disc.proposed_modifications and disc.proposed_modifications.get("status") == "pending":
-                mod = disc.proposed_modifications
-                # Multi-item modification
-                if "items" in mod and isinstance(mod["items"], list):
-                    item_mod_pairs = []
-                    used_ids: Set[uuid.UUID] = set()
-                    for m in mod["items"]:
-                        action = m.get("action_type", "swap")
+            if disc.proposed_modifications:
+                mod_status = disc.proposed_modifications.get("status", "pending")
+                if mod_status == "pending":
+                    mod = disc.proposed_modifications
+                    # Multi-item modification
+                    if "items" in mod and isinstance(mod["items"], list):
+                        item_mod_pairs = []
+                        used_ids: Set[uuid.UUID] = set()
+                        for m in mod["items"]:
+                            action = m.get("action_type", "swap")
+                            if action == "add":
+                                item_mod_pairs.append((None, m))
+                            else:
+                                target = cls._find_item_for_mod(plan, m, exclude_ids=used_ids)
+                                if not target and plan.items:
+                                    target = next((i for i in plan.items if i.id not in used_ids), plan.items[0])
+                                if target:
+                                    used_ids.add(target.id)
+                                    item_mod_pairs.append((target, m))
+                        if item_mod_pairs:
+                            return item_mod_pairs, mod, disc
+                    else:
+                        # Single item modification
+                        action = mod.get("action_type", "swap")
                         if action == "add":
-                            item_mod_pairs.append((None, m))
-                        else:
-                            target = cls._find_item_for_mod(plan, m, exclude_ids=used_ids)
-                            if target:
-                                used_ids.add(target.id)
-                                item_mod_pairs.append((target, m))
-                    if item_mod_pairs:
-                        return item_mod_pairs, mod, disc
-                else:
-                    # Single item modification
-                    action = mod.get("action_type", "swap")
-                    if action == "add":
-                        return [(None, mod)], mod, disc
-                    target = cls._find_item_for_mod(plan, mod)
-                    if not target and plan.items and action != "add":
-                        target = plan.items[0]
-                    if target or action == "add":
-                        return [(target, mod)], mod, disc
+                            return [(None, mod)], mod, disc
+                        target = cls._find_item_for_mod(plan, mod)
+                        if not target and plan.items and action != "add":
+                            target = plan.items[0]
+                        if target or action == "add":
+                            return [(target, mod)], mod, disc
         return [], None, None
 
     @classmethod
@@ -1832,55 +1855,83 @@ class PatientPlanService:
             plan_id, plan.version, payload.expected_version, payload.action,
         )
 
-        if plan.version != payload.expected_version:
+        if payload.expected_version is not None and plan.version != payload.expected_version:
             logger.warning(
                 "Version mismatch: plan.version=%s != expected=%s",
                 plan.version, payload.expected_version,
             )
             raise ConflictError("This plan was modified in another session. Please refresh to view the latest version.")
 
+        # 1. Search for pending modification in discussions
         item_mod_pairs, pending_data, pending_disc = cls._find_pending_modification(plan)
-        logger.info(
-            "apply_modification: found %s items to modify, pending_data=%s",
-            len(item_mod_pairs),
-            bool(pending_data),
-        )
-        if not pending_data or not item_mod_pairs:
-            logger.warning("No pending modification found. Discussion count: %s", len(plan.discussions))
-            for d in plan.discussions[-3:]:
-                logger.warning(
-                    "  Discussion id=%s role=%s has_mods=%s mod_status=%s",
-                    d.id, d.role,
-                    bool(d.proposed_modifications),
-                    d.proposed_modifications.get("status") if d.proposed_modifications else "N/A",
-                )
-            raise NotFoundError("No pending modification found to apply.")
 
-        if payload.action == "accept":
-            await cls._apply_modification_internal(
-                session=session,
-                plan=plan,
-                item_mod_pairs=item_mod_pairs,
-                mod_data=pending_data,
-                user_author=patient_user,
-                pending_disc=pending_disc,
-            )
-        else:
-            pending_data["status"] = "rejected"
+        # 2. Fallback to payload.modification if not found in DB discussions
+        if not pending_data and payload.modification:
+            raw_mod = payload.modification
+            if hasattr(raw_mod, "model_dump"):
+                pending_data = raw_mod.model_dump(exclude_unset=True)
+            elif isinstance(raw_mod, dict):
+                pending_data = dict(raw_mod)
+
+            if pending_data:
+                logger.info("apply_modification: using fallback payload.modification: %s", pending_data.get("proposed_title"))
+                prop_t = pending_data.get("proposed_title")
+                for d in reversed(plan.discussions):
+                    if d.proposed_modifications:
+                        d_prop = d.proposed_modifications.get("proposed_title")
+                        if prop_t and d_prop == prop_t:
+                            pending_disc = d
+                            break
+                if not pending_disc:
+                    for d in reversed(plan.discussions):
+                        if d.proposed_modifications:
+                            pending_disc = d
+                            break
+
+        # 3. Resolve item_mod_pairs if pending_data is present but item_mod_pairs was empty
+        if pending_data and not item_mod_pairs:
+            if "items" in pending_data and isinstance(pending_data["items"], list):
+                used_ids: Set[uuid.UUID] = set()
+                for m in pending_data["items"]:
+                    action = m.get("action_type", "swap")
+                    if action == "add":
+                        item_mod_pairs.append((None, m))
+                    else:
+                        target = cls._find_item_for_mod(plan, m, exclude_ids=used_ids)
+                        if not target and plan.items:
+                            target = next((i for i in plan.items if i.id not in used_ids), plan.items[0])
+                        if target:
+                            used_ids.add(target.id)
+                            item_mod_pairs.append((target, m))
+            else:
+                action = pending_data.get("action_type", "swap")
+                if action == "add":
+                    item_mod_pairs = [(None, pending_data)]
+                else:
+                    target = cls._find_item_for_mod(plan, pending_data)
+                    if not target and plan.items:
+                        target = plan.items[0]
+                    if target:
+                        item_mod_pairs = [(target, pending_data)]
+
+        # 4. Handle REJECT action (Declining should never fail or raise 404)
+        if payload.action == "reject":
+            if pending_data:
+                pending_data["status"] = "rejected"
             if pending_disc and pending_disc.proposed_modifications:
                 p_mod = dict(pending_disc.proposed_modifications)
                 p_mod["status"] = "rejected"
                 pending_disc.proposed_modifications = p_mod
                 flag_modified(pending_disc, "proposed_modifications")
 
-            prop_title = pending_data.get("proposed_title")
-            orig_title = pending_data.get("original_title")
-            action_type = pending_data.get("action_type", "swap")
+            prop_title = pending_data.get("proposed_title") if pending_data else None
+            orig_title = pending_data.get("original_title") if pending_data else None
+            action_type = pending_data.get("action_type", "swap") if pending_data else "swap"
 
             # Persist rejected alternative to disliked items so it won't be suggested again
             if prop_title:
                 cls._add_disliked_item(plan, prop_title)
-            if pending_data.get("disliked_item_added"):
+            if pending_data and pending_data.get("disliked_item_added"):
                 cls._add_disliked_item(plan, pending_data["disliked_item_added"])
 
             # If user declined a suggested alternative swap, automatically suggest the NEXT alternative!
@@ -1901,17 +1952,56 @@ class PatientPlanService:
                 await PatientPlanRepository.add_discussion_message(session, reject_msg)
                 plan.discussions.append(reject_msg)
 
+            # Mark all pending modifications in discussions as resolved
+            for d in plan.discussions:
+                if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                    d_mod = dict(d.proposed_modifications)
+                    d_mod["status"] = "rejected"
+                    d.proposed_modifications = d_mod
+                    flag_modified(d, "proposed_modifications")
+
+            target_plan_id = plan.id
+            target_user_id = patient_user.id
+            await session.commit()
+            session.expire_all()
+            full_plan = await PatientPlanRepository.get_plan_by_id(session, target_plan_id, target_user_id)
+            return cls._format_plan_response(full_plan)
+
+        # 5. Handle ACCEPT action
+        if not pending_data or not item_mod_pairs:
+            # Check if this modification was already applied (idempotent success)
+            for d in reversed(plan.discussions):
+                if d.proposed_modifications and d.proposed_modifications.get("status") == "applied":
+                    logger.info("apply_modification: modification was already applied.")
+                    return cls._format_plan_response(plan)
+
+            logger.warning("No pending modification found to apply. Discussions count: %s", len(plan.discussions))
+            raise NotFoundError("No pending modification found to apply.")
+
+        await cls._apply_modification_internal(
+            session=session,
+            plan=plan,
+            item_mod_pairs=item_mod_pairs,
+            mod_data=pending_data,
+            user_author=patient_user,
+            pending_disc=pending_disc,
+        )
+
         # Mark all pending modifications in discussions as resolved
         for d in plan.discussions:
-            if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
-                d_mod = dict(d.proposed_modifications)
-                d_mod["status"] = "applied" if payload.action == "accept" else "rejected"
-                d.proposed_modifications = d_mod
-                flag_modified(d, "proposed_modifications")
+            if d.proposed_modifications:
+                status = d.proposed_modifications.get("status")
+                if status == "pending" or (pending_disc and d.id == pending_disc.id):
+                    d_mod = dict(d.proposed_modifications)
+                    d_mod["status"] = "applied"
+                    d.proposed_modifications = d_mod
+                    flag_modified(d, "proposed_modifications")
 
+        target_plan_id = plan.id
+        target_user_id = patient_user.id
         await session.commit()
-        session.expire_all()  # Force fresh load from DB to pick up item changes
-        full_plan = await PatientPlanRepository.get_plan_by_id(session, plan.id, patient_user.id)
+        session.expire_all()
+        full_plan = await PatientPlanRepository.get_plan_by_id(session, target_plan_id, target_user_id)
         return cls._format_plan_response(full_plan)
 
     # ── Approval, Lifecycle & Reminders ──────────────────────────────────────

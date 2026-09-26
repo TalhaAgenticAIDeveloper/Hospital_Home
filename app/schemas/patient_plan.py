@@ -166,7 +166,7 @@ class PlanDiscussionMessageResponse(BaseModel):
 class ApplyPlanModificationRequest(BaseModel):
     action: str = Field(default="accept", pattern=r"^(accept|reject)$")
     expected_version: int = Field(..., description="Optimistic locking version check")
-    modification: Optional[ProposedModificationSchema] = None
+    modification: Optional[Any] = None
 
 
 class LogActivityRequest(BaseModel):
