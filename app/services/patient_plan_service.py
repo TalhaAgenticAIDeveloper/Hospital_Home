@@ -418,6 +418,7 @@ class PatientPlanService:
         raw_input: str,
         retry_count: int = 0,
         allow_warning: bool = False,
+        is_skipped: bool = False,
     ) -> Any:
         """
         Intelligent Clinical Intake Verification Agent.
@@ -428,8 +429,20 @@ class PatientPlanService:
         - Extracts normalized values for valid answers.
         - Falls back to PlanValidator deterministic safety rules if AI call fails.
         """
-        clean_input = PlanValidator.sanitize_text(raw_input).strip()
+        clean_input = PlanValidator.sanitize_text(raw_input or "").strip()
         lowered = clean_input.lower()
+
+        # 0. User explicitly chose to skip, or input indicates skipping / uncertainty
+        if is_skipped or lowered in ("skip", "skipped", "pass", "i don't know", "idk", "not sure"):
+            from app.services.plan_validator import AnswerValidationResult
+            return AnswerValidationResult(
+                status="skipped",
+                message="Question skipped. Continuing with standard recommendations.",
+                normalized_value="Not provided (skipped)",
+                unit=None,
+                can_proceed=True,
+                extracted_fields={},
+            )
 
         # 1. User confirmed an advisory warning (e.g. age < 18) and opted to proceed
         if allow_warning:
@@ -447,7 +460,7 @@ class PatientPlanService:
             from app.services.plan_validator import AnswerValidationResult
             return AnswerValidationResult(
                 status="invalid",
-                message="Please enter your answer before continuing.",
+                message="Please enter your answer, or click 'Skip Question' to continue without answering.",
                 normalized_value=None,
                 unit=None,
                 can_proceed=False,
@@ -586,6 +599,10 @@ class PatientPlanService:
         if not question or question.goal_id != goal.id:
             raise NotFoundError("Question not found for this goal.")
 
+        raw_input_text = (payload.raw_input or "").strip()
+        if payload.is_skipped and not raw_input_text:
+            raw_input_text = "Skipped"
+
         # Run AI Verification Agent
         val_res = await cls._verify_answer_via_ai(
             goal_title=goal.title,
@@ -596,9 +613,10 @@ class PatientPlanService:
             question_type=question.question_type,
             expected_unit=question.unit,
             options=question.options.get("items") if isinstance(question.options, dict) else question.options,
-            raw_input=payload.raw_input,
+            raw_input=raw_input_text,
             retry_count=question.retry_count,
             allow_warning=payload.allow_warning,
+            is_skipped=payload.is_skipped,
         )
 
         if val_res.status in ("invalid", "clarification_needed"):
@@ -607,7 +625,7 @@ class PatientPlanService:
                 session=session,
                 goal_id=goal.id,
                 question_id=question.id,
-                raw_input=payload.raw_input,
+                raw_input=raw_input_text,
                 normalized_value=None,
                 unit=None,
                 is_skipped=False,
@@ -657,7 +675,7 @@ class PatientPlanService:
             session=session,
             goal_id=goal.id,
             question_id=question.id,
-            raw_input=payload.raw_input,
+            raw_input=raw_input_text,
             normalized_value=val_res.normalized_value,
             unit=val_res.unit,
             is_skipped=(val_res.status == "skipped"),

@@ -35,7 +35,7 @@ class CreateGoalRequest(BaseModel):
 
 class QuestionnaireAnswerRequest(BaseModel):
     question_id: uuid.UUID
-    raw_input: str = Field(..., max_length=2000, description="Raw user input response")
+    raw_input: Optional[str] = Field(default="", max_length=2000, description="Raw user input response")
     is_skipped: bool = Field(default=False, description="Flag indicating if the user explicitly chose to skip")
     allow_warning: bool = Field(default=False, description="Flag indicating user confirmed an advisory warning (e.g. age under 18)")
 
