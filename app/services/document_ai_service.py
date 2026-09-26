@@ -93,44 +93,20 @@ class DocumentAIService:
 
     @staticmethod
     async def _call_groq_api(messages: list, model: str) -> str:
-        """Call Groq OpenAI-compatible Chat Completions API using httpx."""
-        api_key = settings.groq_api_key
-        if not api_key:
-            raise ValidationError(
-                "Groq API key is not configured. Please set GROQ_API in backend .env."
-            )
+        """Call Groq OpenAI-compatible Chat Completions API via centralized Groq queue with 3x retries."""
+        from app.services.groq_queue_service import GroqPriority, groq_queue
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 500,
-        }
-
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-
-            if resp.status_code != 200:
-                err_text = resp.text
-                logger.error(f"Groq API error {resp.status_code}: {err_text}")
-                raise ValidationError(f"Groq AI service error ({resp.status_code}): {err_text[:200]}")
-
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise ValidationError("Groq AI returned an empty response.")
-
-            raw_content = choices[0].get("message", {}).get("content", "").strip()
-            # Clean <think>...</think> tags if reasoning model (e.g. Qwen, DeepSeek)
-            cleaned_content = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-            if "<think>" in cleaned_content and "</think>" not in cleaned_content:
-                cleaned_content = cleaned_content.split("<think>", 1)[0].strip()
-            return cleaned_content or raw_content
+        return await groq_queue.submit_chat_completion(
+            messages=messages,
+            model=model,
+            temperature=0.2,
+            max_tokens=500,
+            priority=GroqPriority.NORMAL,
+            caller="DocumentAIService",
+            timeout=60.0,
+            enqueue_retries=3,
+            max_retries=3,
+        )
 
     @classmethod
     async def summarize_patient_document(

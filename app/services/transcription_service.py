@@ -411,59 +411,18 @@ class TranscriptionService:
 
         timeout = settings.AI_WHISPER_TIMEOUT_SECONDS
 
-        # Retry once on timeout or rate limit
-        last_error = None
-        for attempt in range(2):
-            try:
-                logger.info(
-                    f"[WHISPER_CALL] file={filename} size_bytes={len(audio_bytes)} "
-                    f"model={settings.GROQ_WHISPER_MODEL} timeout={timeout}s attempt={attempt + 1}/2"
-                )
-                files = {
-                    "file": (filename, audio_bytes),
-                }
-                async with httpx.AsyncClient(timeout=float(timeout)) as client:
-                    response = await client.post(
-                        GROQ_WHISPER_URL,
-                        headers=headers,
-                        files=files,
-                        data=data,
-                    )
+        from app.services.groq_queue_service import GroqPriority, groq_queue
 
-                logger.info(f"[WHISPER_RESPONSE] file={filename} status_code={response.status_code}")
-
-                if response.status_code == 429:
-                    wait_time = 2 ** (attempt + 1)
-                    logger.warning(f"[WHISPER_RATE_LIMIT] file={filename} — Rate limit hit, waiting {wait_time}s")
-                    await asyncio.sleep(wait_time)
-                    continue
-
-                if response.status_code != 200:
-                    err_text = response.text[:500]
-                    logger.error(f"[WHISPER_API_ERROR] file={filename} status={response.status_code} error={err_text}")
-                    raise ValidationError(
-                        f"Groq Whisper API error ({response.status_code}): {err_text}"
-                    )
-
-                result = response.json()
-                segment_count = len(result.get('segments', []))
-                logger.info(
-                    f"[WHISPER_SUCCESS] file={filename} language={result.get('language', '?')} "
-                    f"segments={segment_count} text_length={len(result.get('text', ''))}"
-                )
-                return result
-
-            except httpx.TimeoutException as e:
-                last_error = e
-                if attempt < 1:
-                    logger.warning(f"[WHISPER_TIMEOUT] file={filename} — Timed out after {timeout}s, retrying...")
-                    continue
-                logger.error(f"[WHISPER_TIMEOUT_FINAL] file={filename} — Timed out after {timeout}s on final attempt")
-                raise ValidationError(
-                    f"Groq Whisper API timed out after {timeout}s"
-                ) from last_error
-
-        raise ValidationError("Whisper API failed after retries")
+        return await groq_queue.submit_transcription(
+            audio_path=audio_path,
+            model=settings.GROQ_WHISPER_MODEL,
+            language=language,
+            priority=GroqPriority.LOW,
+            caller=f"WhisperTranscription_{filename}",
+            timeout=float(timeout),
+            enqueue_retries=3,
+            max_retries=3,
+        )
 
     # ── Parsing & Interleaving ───────────────────────────────────────────
 

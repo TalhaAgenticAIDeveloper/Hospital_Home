@@ -133,45 +133,23 @@ class PatientReportExplainerService:
         model: Optional[str] = None,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        priority: int = 2,
+        caller: str = "PatientReportExplainerService",
     ) -> str:
-        """Execute chat completions call to Groq via httpx with token cleanup."""
-        api_key = settings.groq_api_key
-        if not api_key:
-            raise ValidationError(
-                "Groq API key is not configured. Please set GROQ_API or GROQ_API_KEY in backend .env."
-            )
+        """Execute chat completions call to Groq via centralized Groq queue with 3x retries."""
+        from app.services.groq_queue_service import groq_queue
 
-        model_name = model or settings.GROQ_MODEL or "llama-3.3-70b-versatile"
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-            if resp.status_code != 200:
-                err_text = resp.text
-                logger.error(f"Groq API error {resp.status_code}: {err_text}")
-                raise ValidationError(f"AI Service error ({resp.status_code}): {err_text[:200]}")
-
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise ValidationError("AI model returned an empty response.")
-
-            raw_content = choices[0].get("message", {}).get("content", "").strip()
-            # Clean reasoning <think> tags if Qwen/DeepSeek reasoning model
-            cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-            if "<think>" in cleaned and "</think>" not in cleaned:
-                cleaned = cleaned.split("<think>", 1)[0].strip()
-
-            return cleaned or raw_content
+        return await groq_queue.submit_chat_completion(
+            messages=messages,
+            model=model or settings.GROQ_MODEL or "llama-3.3-70b-versatile",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            priority=priority,
+            caller=caller,
+            timeout=90.0,
+            enqueue_retries=3,
+            max_retries=3,
+        )
 
     @classmethod
     def _ocr_image_bytes(cls, image_bytes: bytes) -> str:
@@ -450,12 +428,14 @@ class PatientReportExplainerService:
                 c = c[:500] + "..."
             llm_messages.append({"role": m.role, "content": c})
 
-        # 3. Call AI
+        # 3. Call AI with HIGH priority for interactive user chat
         ai_reply = await cls._call_groq_api(
             messages=llm_messages,
             model=settings.GROQ_MODEL,
             temperature=0.3,
             max_tokens=800,
+            priority=1,
+            caller="PatientReportChat",
         )
 
         # 4. Save AI reply to database

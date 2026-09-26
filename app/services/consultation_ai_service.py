@@ -195,84 +195,19 @@ class ConsultationAIService:
             {"role": "user", "content": user_content},
         ]
 
-        payload = {
-            "model": settings.GROQ_MODEL,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 4096,
-        }
+        from app.services.groq_queue_service import GroqPriority, groq_queue
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        timeout = float(settings.AI_LLM_TIMEOUT_SECONDS)
-        max_retries = settings.AI_LLM_MAX_RETRIES
-        last_error = None
-
-        for attempt in range(max_retries + 1):
-            try:
-                logger.info(
-                    f"[LLM_CALL] model={settings.GROQ_MODEL} timeout={timeout}s "
-                    f"attempt={attempt + 1}/{max_retries + 1} text_length={len(user_content)}"
-                )
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    resp = await client.post(
-                        GROQ_CHAT_URL, json=payload, headers=headers
-                    )
-
-                logger.info(f"[LLM_RESPONSE] status_code={resp.status_code}")
-
-                if resp.status_code == 429:
-                    wait_time = 2 ** (attempt + 1)
-                    logger.warning(f"LLM rate limit, waiting {wait_time}s (attempt {attempt + 1})")
-                    await asyncio.sleep(wait_time)
-                    continue
-
-                if resp.status_code != 200:
-                    err_text = resp.text[:500]
-                    raise ValidationError(
-                        f"Groq API error ({resp.status_code}): {err_text}"
-                    )
-
-                data = resp.json()
-                choices = data.get("choices", [])
-                if not choices:
-                    raise ValidationError("Groq returned empty response")
-
-                raw_content = choices[0].get("message", {}).get("content", "").strip()
-
-                # Clean <think> tags from reasoning models
-                cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-                if "<think>" in cleaned and "</think>" not in cleaned:
-                    cleaned = cleaned.split("<think>", 1)[0].strip()
-
-                final_content = cleaned or raw_content
-                logger.info(f"[LLM_SUCCESS] response_length={len(final_content)}")
-                return final_content
-
-            except httpx.TimeoutException as e:
-                last_error = e
-                if attempt < max_retries:
-                    wait_time = 2 ** (attempt + 1)
-                    logger.warning(f"[LLM_TIMEOUT] Timed out after {timeout}s, retrying in {wait_time}s (attempt {attempt + 1})")
-                    await asyncio.sleep(wait_time)
-                    continue
-                logger.error(f"[LLM_TIMEOUT_FINAL] All {max_retries + 1} attempts timed out")
-
-            except ValidationError:
-                raise
-
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries:
-                    logger.warning(f"[LLM_ERROR] attempt={attempt + 1} error={e}, retrying...")
-                    await asyncio.sleep(2 ** (attempt + 1))
-                    continue
-                logger.error(f"[LLM_ERROR_FINAL] All attempts failed: {e}")
-
-        raise ValidationError(f"LLM call failed after {max_retries + 1} attempts: {last_error}")
+        return await groq_queue.submit_chat_completion(
+            messages=messages,
+            model=settings.GROQ_MODEL,
+            temperature=0.1,
+            max_tokens=4096,
+            priority=GroqPriority.NORMAL,
+            caller="ConsultationAIExtraction",
+            timeout=float(settings.AI_LLM_TIMEOUT_SECONDS),
+            enqueue_retries=3,
+            max_retries=3,
+        )
 
     # ── JSON Parsing ─────────────────────────────────────────────────────
 

@@ -18,6 +18,7 @@ from app.core.logging import get_logger
 
 settings = get_settings()
 from app.services.reminder_scheduler import shutdown_scheduler, start_scheduler
+from app.services.groq_queue_service import groq_queue
 
 logger = get_logger(__name__)
 
@@ -34,8 +35,17 @@ async def lifespan(app: FastAPI):
         start_scheduler()
     except Exception as e:
         logger.warning(f"Could not start reminder scheduler on startup: {e}")
+    # Start centralized Groq queue worker
+    try:
+        await groq_queue.start_worker()
+    except Exception as e:
+        logger.warning(f"Could not start Groq queue worker on startup: {e}")
     yield
-    # Shutdown scheduler and database engine on shutdown
+    # Shutdown Groq queue worker, reminder scheduler, and database engine on shutdown
+    try:
+        await groq_queue.stop_worker()
+    except Exception as e:
+        logger.warning(f"Could not stop Groq queue worker on shutdown: {e}")
     try:
         shutdown_scheduler()
     except Exception as e:

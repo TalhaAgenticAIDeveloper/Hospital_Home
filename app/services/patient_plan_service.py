@@ -64,6 +64,14 @@ MAX_QUESTION_RETRIES = 3
 # ── Minimal Fallback Questions (used ONLY if AI question generation fails) ────
 FALLBACK_ESSENTIAL_QUESTIONS: List[Dict[str, Any]] = [
     {
+        "question_key": "current_weight",
+        "question_text": "What is your current weight?",
+        "question_type": "number",
+        "unit": "kg",
+        "is_required": True,
+        "help_text": "e.g., 70 kg",
+    },
+    {
         "question_key": "food_allergies",
         "question_text": "Do you have any food allergies or severe intolerances?",
         "question_type": "text",
@@ -109,55 +117,26 @@ class PatientPlanService:
         messages: list,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        priority: int = 2,
+        caller: str = "PatientPlanService",
     ) -> str:
-        """Invokes Groq LLM API with strict error handling, timeout, and token cleanup."""
-        api_key = settings.groq_api_key
-        if not api_key:
-            raise ValidationError(
-                "Groq API key is not configured. Please set GROQ_API or GROQ_API_KEY in backend .env."
-            )
+        """Invokes Groq LLM API via centralized Groq queue with 3x retries."""
+        from app.services.groq_queue_service import groq_queue
 
-        payload = {
-            "model": settings.GROQ_MODEL or "llama-3.3-70b-versatile",
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        # Explicit 45-second timeout
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            try:
-                resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-            except httpx.TimeoutException:
-                logger.error("Groq API timeout during plan operation")
-                raise ValidationError("AI service timed out. Your answers are safely preserved. Please try again.")
-            except httpx.RequestError as exc:
-                logger.error(f"Groq API request error: {exc}")
-                raise ValidationError("Could not connect to AI service. Please check your network and try again.")
-
-            if resp.status_code != 200:
-                logger.error(f"Groq API error ({resp.status_code}): {resp.text[:300]}")
-                raise ValidationError("The AI service is temporarily busy. Please try again in a few moments.")
-
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise ValidationError("AI model returned an empty response.")
-
-            raw_content = choices[0].get("message", {}).get("content", "").strip()
-            # Clean reasoning <think> tags if Qwen/DeepSeek reasoning model
-            cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-            if "<think>" in cleaned and "</think>" not in cleaned:
-                cleaned = cleaned.split("<think>", 1)[0].strip()
-
-            result = cleaned or raw_content
-            # Normalize unicode spaces and hyphens for Windows terminal and database safety
-            result = result.replace("\u202f", " ").replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "--").replace("\u00a0", " ")
-            return result
+        timeout_sec = 90.0 if max_tokens > 2500 else 60.0
+        result = await groq_queue.submit_chat_completion(
+            messages=messages,
+            model=settings.GROQ_MODEL or "llama-3.3-70b-versatile",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            priority=priority,
+            caller=caller,
+            timeout=timeout_sec,
+            enqueue_retries=3,
+            max_retries=3,
+        )
+        # Normalize unicode spaces and hyphens for Windows terminal and database safety
+        return result.replace("\u202f", " ").replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "--").replace("\u00a0", " ")
 
     # ── AI Question Generation ─────────────────────────────────────────────
 
@@ -230,7 +209,9 @@ class PatientPlanService:
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.3,
-                max_tokens=1536,
+                max_tokens=2500,
+                priority=1,
+                caller="PatientPlanQuestionGen",
             )
 
             # Extract JSON array from response using robust parser

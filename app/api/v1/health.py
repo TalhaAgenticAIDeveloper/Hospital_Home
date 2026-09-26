@@ -44,3 +44,15 @@ async def readiness(session: AsyncSession = Depends(get_db)) -> dict:
         return {"status": "ready", "database": "connected"}
     except Exception:
         return {"status": "not ready", "database": "disconnected"}
+
+
+@router.get(
+    "/health/groq-queue",
+    response_model=dict,
+    summary="Groq AI queue status and metrics",
+    description="Returns current queue depth, processed tasks, retries, and worker health.",
+)
+async def groq_queue_health() -> dict:
+    from app.services.groq_queue_service import groq_queue
+    return groq_queue.get_status()
+
