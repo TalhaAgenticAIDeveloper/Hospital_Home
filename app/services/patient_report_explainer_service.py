@@ -327,28 +327,14 @@ class PatientReportExplainerService:
         # 2. Generate structured layman AI explanation
         explanation = await cls.generate_explanation(report_text)
 
-        # 3. Save file to disk
-        upload_base = Path("uploads/patient_reports") / str(patient_user.id)
-        upload_base.mkdir(parents=True, exist_ok=True)
-        unique_id = uuid.uuid4().hex[:10]
-        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
-        stored_filename = f"{unique_id}_{safe_name}"
-        file_path = upload_base / stored_filename
-
-        try:
-            with open(file_path, "wb") as f:
-                f.write(file_bytes)
-            file_path_str = str(file_path)
-        except Exception as exc:
-            logger.warning(f"Could not save copy to disk: {exc}")
-            file_path_str = None
-
-        # 4. Create Session in PostgreSQL
+        # 3. Create Session in PostgreSQL
+        # We store the extracted text and AI explanation directly in the database.
+        # Storing raw files on disk is avoided to prevent server disk bloat and permission issues.
         report_session = PatientReportSession(
             patient_id=patient_user.id,
             filename=filename,
-            stored_filename=stored_filename if file_path_str else None,
-            file_path=file_path_str,
+            stored_filename=None,
+            file_path=None,
             file_size=len(file_bytes),
             mime_type=mime_type or "application/octet-stream",
             extraction_method=extraction_method,
