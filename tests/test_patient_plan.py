@@ -549,3 +549,107 @@ async def test_chat_medication_inquiry_polite_decline_and_natural_alternative(cl
         assert "cannot prescribe" in safe_content.lower()
         assert "natural alternatives" in safe_content.lower()
         assert "herbal" in safe_content.lower()
+
+
+# ── 6. Truncated JSON Repair & Alternative Decline Chaining Tests ───────────
+
+@pytest.mark.asyncio
+async def test_truncated_json_repair_and_decline_chaining(client: AsyncClient):
+    """
+    Verifies:
+    1. Truncated PROPOSED_MODIFICATION JSON (like the user experienced) is cleanly repaired and parsed.
+    2. Raw 'PROPOSED_MODIFICATION:' text is NEVER leaked into the chat message content.
+    3. Declining an alternative generates the NEXT alternative with status 'pending' (buttons active),
+       while marking the declined alternative as 'rejected'.
+    """
+    from app.services.patient_plan_service import PatientPlanService
+
+    # 1. Direct unit test of truncated JSON repair
+    truncated_llm_output = (
+        "I've swapped your Greek Yogurt & Almond Mix for a Chia Seed Pudding with Almond Milk. "
+        "It's about the same 400 kcal, slightly less protein but more fiber, keeping your daily surplus intact.\n\n"
+        'PROPOSED_MODIFICATION: {"action_type":"swap","item_id":"de3ba648-e903-46d9-800d-4f76222e71d8",'
+        '"original_title":"Greek Yogurt & Almond Mix","proposed_title":"Chia Seed Pudding with Almond Milk",'
+        '"proposed_description":"400 kcal, 12g protein, 45g carbs, 18g fat, 10g fiber","proposed_time":"15:30",'
+        '"proposed_category":"lunch","calories":400,"protein_g":12.0,"carbs_g":45.0,"fat_g":18.0,"fiber_g'
+    )
+    parsed_mod = PatientPlanService._parse_proposed_mod_from_text(truncated_llm_output)
+    assert parsed_mod is not None
+    assert parsed_mod["proposed_title"] == "Chia Seed Pudding with Almond Milk"
+    assert parsed_mod["status"] == "pending"
+    assert parsed_mod["calories"] == 400
+    assert parsed_mod["protein_g"] == 12.0
+
+    # 2. Integration test: Chat with plan using truncated LLM output
+    user = await create_and_login_patient(client, "decline_flow_user@example.com")
+    headers = {"Authorization": f"Bearer {user['access_token']}"}
+
+    goal_resp = await client.post(
+        "/api/v1/patient/plans/goals",
+        json={"category": "weight_loss", "title": "Lose 5 kg", "target_description": "Clean eating"},
+        headers=headers,
+    )
+    goal_id = goal_resp.json()["id"]
+
+    with patch(
+        "app.services.patient_plan_service.PatientPlanService._call_groq_api",
+        return_value=VALID_MOCK_PLAN_JSON,
+    ):
+        gen_resp = await client.post(f"/api/v1/patient/plans/goals/{goal_id}/generate", headers=headers)
+        plan_id = gen_resp.json()["id"]
+
+    # LLM returns truncated output
+    with patch(
+        "app.services.patient_plan_service.PatientPlanService._call_groq_api",
+        return_value=truncated_llm_output,
+    ):
+        chat_resp = await client.post(
+            f"/api/v1/patient/plans/{plan_id}/chat",
+            json={"message": "I don't like yogurt"},
+            headers=headers,
+        )
+        assert chat_resp.status_code == 200
+        chat_data = chat_resp.json()
+
+        # Protocol text MUST be stripped from content!
+        assert "PROPOSED_MODIFICATION:" not in chat_data["content"]
+        assert "Chia Seed Pudding" in chat_data["content"]
+
+        # Proposed modifications card MUST be parsed and pending!
+        assert chat_data["proposed_modifications"] is not None
+        assert chat_data["proposed_modifications"]["proposed_title"] == "Chia Seed Pudding with Almond Milk"
+        assert chat_data["proposed_modifications"]["status"] == "pending"
+
+    # 3. Test Declining the proposed alternative
+    next_alt_llm_output = (
+        "Understood! Here is another great option: Quinoa & Berry Bowl with Walnut crumble.\n\n"
+        'PROPOSED_MODIFICATION: {"action_type":"swap","original_title":"Greek Yogurt & Almond Mix",'
+        '"proposed_title":"Quinoa & Berry Bowl","proposed_description":"380 kcal, 14g protein",'
+        '"proposed_time":"15:30","proposed_category":"lunch","calories":380,"protein_g":14.0,"carbs_g":50.0,"fat_g":12.0}'
+    )
+    with patch(
+        "app.services.patient_plan_service.PatientPlanService._call_groq_api",
+        return_value=next_alt_llm_output,
+    ):
+        decline_resp = await client.post(
+            f"/api/v1/patient/plans/{plan_id}/modifications/apply",
+            json={"action": "reject", "expected_version": 1},
+            headers=headers,
+        )
+        assert decline_resp.status_code == 200
+        plan_data = decline_resp.json()
+
+        # Find the latest discussion with proposed_modifications
+        discs_with_mods = [d for d in plan_data["discussions"] if d.get("proposed_modifications")]
+        assert len(discs_with_mods) >= 2
+
+        # The prior modification must be rejected
+        first_mod_disc = discs_with_mods[-2]
+        assert first_mod_disc["proposed_modifications"]["status"] == "rejected"
+
+        # The NEW alternative must be pending (so buttons render in the frontend!)
+        new_alt_disc = discs_with_mods[-1]
+        assert new_alt_disc["proposed_modifications"]["status"] == "pending"
+        assert new_alt_disc["proposed_modifications"]["proposed_title"] == "Quinoa & Berry Bowl"
+        assert "PROPOSED_MODIFICATION:" not in new_alt_disc["content"]
+

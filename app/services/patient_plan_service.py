@@ -1001,23 +1001,54 @@ class PatientPlanService:
 
     @classmethod
     def _parse_proposed_mod_from_text(cls, text: str) -> Optional[Dict[str, Any]]:
-        """Extract and parse PROPOSED_MODIFICATION JSON block from LLM output."""
+        """Extract and parse PROPOSED_MODIFICATION JSON block from LLM output, with robust repair for truncated JSON."""
         if "PROPOSED_MODIFICATION:" not in text:
             return None
         parts = text.split("PROPOSED_MODIFICATION:", 1)
         mod_json_str = parts[1].strip()
 
+        # Clean think tags if reasoning model leaked
+        mod_json_str = re.sub(r"<think>.*?</think>", "", mod_json_str, flags=re.DOTALL).strip()
+        if "<think>" in mod_json_str:
+            mod_json_str = mod_json_str.split("<think>")[0].strip()
+
         # Strip markdown code fences if LLM wrapped JSON in ```json ... ```
         mod_json_str = re.sub(r"^```(?:json)?\s*", "", mod_json_str)
         mod_json_str = re.sub(r"\s*```\s*$", "", mod_json_str.strip())
 
-        # Try to extract JSON array or object
-        json_match = re.search(r"(\[[\s\S]*\]|\{[\s\S]*\})", mod_json_str)
-        if json_match:
-            mod_json_str = json_match.group(0)
+        parsed_mod = None
+        try:
+            parsed_mod = PlanValidator.extract_and_parse_json(mod_json_str)
+        except Exception:
+            # Fallback direct repair if extract_and_parse_json struggled with specific prefix
+            try:
+                first_brace = mod_json_str.find("{")
+                first_bracket = mod_json_str.find("[")
+                start_idx = 0
+                if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+                    start_idx = first_brace
+                elif first_bracket != -1:
+                    start_idx = first_bracket
+                candidate = mod_json_str[start_idx:].strip()
+
+                # Clean trailing cut-off keys/colons (e.g. ,"fiber_g or ,"fiber_g":)
+                candidate = re.sub(r',?\s*"[^"]*"?\s*:?\s*$', '', candidate)
+                candidate = re.sub(r',\s*$', '', candidate)
+                quote_count = candidate.count('"')
+                if quote_count % 2 != 0:
+                    candidate += '"'
+                candidate = candidate.rstrip(", \t\n\r")
+                open_braces = candidate.count("{") - candidate.count("}")
+                open_brackets = candidate.count("[") - candidate.count("]")
+                if open_braces > 0 or open_brackets > 0:
+                    candidate += ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
+                    candidate = re.sub(r",\s*([\]\}])", r"\1", candidate)
+                parsed_mod = json.loads(candidate)
+            except Exception as e:
+                logger.warning("Failed to parse PROPOSED_MODIFICATION JSON: %s", e)
+                return None
 
         try:
-            parsed_mod = json.loads(mod_json_str)
             if isinstance(parsed_mod, list):
                 mod_dict = {"status": "pending", "items": parsed_mod}
             elif isinstance(parsed_mod, dict):
@@ -1039,7 +1070,7 @@ class PatientPlanService:
                 else:
                     logger.warning("Proposed modification contained medication terms. Dropping modification.")
         except Exception as e:
-            logger.warning("Failed to parse PROPOSED_MODIFICATION JSON: %s", e)
+            logger.warning("Error processing parsed proposed modification: %s", e)
         return None
 
     @classmethod
@@ -1087,15 +1118,38 @@ class PatientPlanService:
         ]
 
         try:
-            ai_text = await cls._call_groq_api(messages, temperature=0.3, max_tokens=1800)
+            ai_text = await cls._call_groq_api(messages, temperature=0.3, max_tokens=2500)
         except Exception as e:
             logger.error("Error generating next alternative: %s", e)
             ai_text = f"Understood! I've noted that you don't like {declined_title}. Would you prefer another healthy option instead?"
 
+        # Clean think tags if reasoning model leaked
+        ai_text = re.sub(r"<think>.*?</think>", "", ai_text, flags=re.DOTALL).strip()
+        if "<think>" in ai_text:
+            ai_text = ai_text.split("<think>")[0].strip()
+
         # Parse proposed modification if present
         proposed_mod = cls._parse_proposed_mod_from_text(ai_text)
-        if proposed_mod and "PROPOSED_MODIFICATION:" in ai_text:
+        
+        # ALWAYS strip PROPOSED_MODIFICATION protocol text from user-facing message
+        if "PROPOSED_MODIFICATION:" in ai_text:
             ai_text = ai_text.split("PROPOSED_MODIFICATION:")[0].strip()
+
+        # If LLM failed to output JSON, synthesize a fallback proposed modification
+        # so the user ALWAYS gets the interactive card with Accept/Decline action buttons
+        if not proposed_mod:
+            proposed_mod = {
+                "action_type": "swap",
+                "original_title": original_title,
+                "proposed_title": f"Healthy Alternative for {original_title}",
+                "proposed_description": f"Tailored nutrient-dense alternative replacing {original_title}.",
+                "status": "pending",
+                "disliked_item_added": declined_title,
+            }
+
+        # Track disliked item in plan
+        if proposed_mod and proposed_mod.get("disliked_item_added"):
+            cls._add_disliked_item(plan, proposed_mod["disliked_item_added"])
 
         msg = PatientPlanDiscussion(
             plan_id=plan.id,
@@ -1353,6 +1407,21 @@ class PatientPlanService:
             action_type = pending_data.get("action_type", "swap")
             rejected_item = analysis.get("rejected_item") or prop_title
 
+            # If orig_title is missing from pending_data, resolve from item_id or target item
+            if not orig_title and pending_data:
+                item_id_str = pending_data.get("item_id")
+                if item_id_str:
+                    for it in plan.items:
+                        if str(it.id) == str(item_id_str):
+                            orig_title = it.title
+                            break
+                if not orig_title:
+                    target = cls._find_item_for_mod(plan, pending_data)
+                    if target:
+                        orig_title = target.title
+                    elif plan.items:
+                        orig_title = plan.items[0].title
+
             # Persist rejected alternative to disliked items so it won't be suggested again
             if rejected_item:
                 cls._add_disliked_item(plan, rejected_item)
@@ -1362,12 +1431,12 @@ class PatientPlanService:
                 cls._add_disliked_item(plan, pending_data["disliked_item_added"])
 
             # If user declined a suggested swap alternative, automatically suggest the next alternative
-            if action_type == "swap" and orig_title:
+            if (action_type == "swap" or orig_title) and (orig_title or plan.items):
                 alt_reply = await cls._generate_next_alternative_reply(
                     session=session,
                     plan=plan,
                     declined_title=rejected_item or prop_title or "this option",
-                    original_title=orig_title,
+                    original_title=orig_title or (plan.items[0].title if plan.items else "item"),
                 )
                 plan.discussions.append(alt_reply)
                 await session.commit()
@@ -1506,20 +1575,26 @@ class PatientPlanService:
             "   ]\n\n"
             "E) GENERAL QUESTIONS (e.g. 'why this food?', 'is brown rice good?', 'how much water should I drink?'):\n"
             "   Answer helpfully grounded in their plan. No modification needed.\n\n"
-            "Keep your replies concise and friendly (3-6 sentences). Always be practical and specific, never generic."
+            "Keep your replies concise and friendly (3-6 sentences). Always be practical and specific, never generic. "
+            "Keep reasoning minimal and output the PROPOSED_MODIFICATION JSON as a single compact line immediately following your message."
             f"{med_guidance}"
         )
 
         messages = [{"role": "system", "content": chat_system_prompt}] + conv_context
 
         try:
-            ai_response_text = await cls._call_groq_api(messages, temperature=0.3, max_tokens=1800)
+            ai_response_text = await cls._call_groq_api(messages, temperature=0.3, max_tokens=2500)
         except Exception as e:
             logger.error("Groq API error in discuss_plan: %s", e)
             if is_med_inquiry:
                 ai_response_text = PlanValidator.get_safe_natural_alternative_fallback()
             else:
                 ai_response_text = "I'm having trouble connecting right now. Please try asking again in a moment."
+
+        # Clean think tags if reasoning model leaked
+        ai_response_text = re.sub(r"<think>.*?</think>", "", ai_response_text, flags=re.DOTALL).strip()
+        if "<think>" in ai_response_text:
+            ai_response_text = ai_response_text.split("<think>")[0].strip()
 
         # Safety Check: Verify no prescription drugs or dosages slipped through the LLM response
         is_unsafe, flagged_drugs = PlanValidator.contains_blocked_medication(ai_response_text)
@@ -1532,7 +1607,9 @@ class PatientPlanService:
 
         # Parse proposed modification if present
         proposed_mod = cls._parse_proposed_mod_from_text(ai_response_text)
-        if proposed_mod and "PROPOSED_MODIFICATION:" in ai_response_text:
+        
+        # ALWAYS strip PROPOSED_MODIFICATION protocol text from user-facing message, even if parsing failed!
+        if "PROPOSED_MODIFICATION:" in ai_response_text:
             ai_response_text = ai_response_text.split("PROPOSED_MODIFICATION:")[0].strip()
 
         # Record any disliked item identified by LLM
@@ -1904,9 +1981,33 @@ class PatientPlanService:
                 pending_disc.proposed_modifications = p_mod
                 flag_modified(pending_disc, "proposed_modifications")
 
+            # CRITICAL: Mark ALL existing pending modifications in discussions as rejected FIRST,
+            # BEFORE generating the next alternative so the new alternative's pending status is NOT overwritten!
+            for d in plan.discussions:
+                if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
+                    d_mod = dict(d.proposed_modifications)
+                    d_mod["status"] = "rejected"
+                    d.proposed_modifications = d_mod
+                    flag_modified(d, "proposed_modifications")
+
             prop_title = pending_data.get("proposed_title") if pending_data else None
             orig_title = pending_data.get("original_title") if pending_data else None
             action_type = pending_data.get("action_type", "swap") if pending_data else "swap"
+
+            # If orig_title is not directly in pending_data, resolve it from item_id or target item
+            if not orig_title and pending_data:
+                item_id_str = pending_data.get("item_id")
+                if item_id_str:
+                    for it in plan.items:
+                        if str(it.id) == str(item_id_str):
+                            orig_title = it.title
+                            break
+                if not orig_title:
+                    target = cls._find_item_for_mod(plan, pending_data)
+                    if target:
+                        orig_title = target.title
+                    elif plan.items:
+                        orig_title = plan.items[0].title
 
             # Persist rejected alternative to disliked items so it won't be suggested again
             if prop_title:
@@ -1915,12 +2016,12 @@ class PatientPlanService:
                 cls._add_disliked_item(plan, pending_data["disliked_item_added"])
 
             # If user declined a suggested alternative swap, automatically suggest the NEXT alternative!
-            if action_type == "swap" and orig_title:
+            if (action_type == "swap" or orig_title) and (orig_title or plan.items):
                 alt_reply = await cls._generate_next_alternative_reply(
                     session=session,
                     plan=plan,
                     declined_title=prop_title or "this option",
-                    original_title=orig_title,
+                    original_title=orig_title or (plan.items[0].title if plan.items else "item"),
                 )
                 plan.discussions.append(alt_reply)
             else:
@@ -1931,14 +2032,6 @@ class PatientPlanService:
                 )
                 await PatientPlanRepository.add_discussion_message(session, reject_msg)
                 plan.discussions.append(reject_msg)
-
-            # Mark all pending modifications in discussions as resolved
-            for d in plan.discussions:
-                if d.proposed_modifications and d.proposed_modifications.get("status") == "pending":
-                    d_mod = dict(d.proposed_modifications)
-                    d_mod["status"] = "rejected"
-                    d.proposed_modifications = d_mod
-                    flag_modified(d, "proposed_modifications")
 
             target_plan_id = plan.id
             target_user_id = patient_user.id

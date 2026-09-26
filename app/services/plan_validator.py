@@ -211,6 +211,10 @@ class PlanValidator:
         except Exception:
             # 6. Attempt repair of unclosed strings / brackets for slightly truncated responses
             s = cleaned_json.strip()
+            # Remove trailing dangling incomplete keys, colons, or cut-off values (e.g. ,"fiber_g or ,"fiber_g":)
+            s = re.sub(r',?\s*"[^"]*"?\s*:?\s*$', '', s)
+            s = re.sub(r',\s*$', '', s)
+
             quote_count = s.count('"')
             if quote_count % 2 != 0:
                 s += '"'
@@ -220,7 +224,10 @@ class PlanValidator:
             if open_braces > 0 or open_brackets > 0:
                 s += ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
                 s = re.sub(r",\s*([\]\}])", r"\1", s)
-                return json.loads(s)
+                try:
+                    return json.loads(s)
+                except Exception:
+                    pass
             raise
 
     @classmethod
