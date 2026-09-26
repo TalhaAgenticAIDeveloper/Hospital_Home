@@ -714,6 +714,14 @@ class ConsultationAIService:
                     f"confidence={avg_confidence:.2f} elapsed_ms={elapsed_ms}"
                 )
 
+                # Auto-trigger consultation summary generation
+                try:
+                    from app.services.consultation_summary_service import ConsultationSummaryService
+                    await ConsultationSummaryService.generate_summary_from_transcript(meeting_id)
+                    logger.info(f"[SUMMARY_AUTO_TRIGGERED] meeting_id={meeting_id} — Summary generation completed")
+                except Exception as summary_err:
+                    logger.warning(f"[SUMMARY_AUTO_TRIGGER_WARN] meeting_id={meeting_id}: {summary_err}")
+
             except Exception as e:
                 logger.error(f"[EXTRACTION_FATAL_ERROR] meeting_id={meeting_id} extraction_id={extraction_id} — Pipeline CRASHED: {e}", exc_info=True)
                 try:

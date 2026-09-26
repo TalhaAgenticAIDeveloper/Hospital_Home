@@ -9,6 +9,7 @@ from app.api.v1.admin_doctors import router as admin_doctors_router
 from app.api.v1.admin_patients import router as admin_patients_router
 from app.api.v1.auth import router as auth_router
 from app.api.v1.consultation_ai import router as consultation_ai_router
+from app.api.v1.consultation_summaries import router as consultation_summaries_router
 from app.api.v1.doctor import router as doctor_router
 from app.api.v1.meetings import router as meetings_router
 from app.api.v1.patient import router as patient_router
@@ -56,6 +57,9 @@ api_v1_router.include_router(prescriptions_router)
 
 # Consultation AI — transcription, extraction, and approval
 api_v1_router.include_router(consultation_ai_router)
+
+# Consultation Summaries — patient visit history and doctor review
+api_v1_router.include_router(consultation_summaries_router)
 
 # Patient Medical Report Explainer & Interactive AI Chat (Patient only)
 api_v1_router.include_router(patient_report_explainer_router)
