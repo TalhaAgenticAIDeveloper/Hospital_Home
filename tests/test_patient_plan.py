@@ -848,4 +848,81 @@ async def test_intelligent_schedule_amendment_and_timeline_extension(client: Asy
         assert curr_goal_resp.json()["target_duration_weeks"] == 6
 
 
+@pytest.mark.asyncio
+async def test_plan_items_chronological_ordering_initial_and_after_modification(client: AsyncClient):
+    """Verify that schedule items are strictly stored and retrieved in chronological time order initially and after modifications."""
+    patient = await create_and_login_patient(client, "order_patient@example.com")
+    headers = {"Authorization": f"Bearer {patient['access_token']}"}
+
+    # 1. Create Goal
+    goal_resp = await client.post(
+        "/api/v1/patient/plans/goals",
+        json={
+            "title": "Healthy Routine",
+            "category": "fitness_mobility",
+            "target_description": "Keep schedule properly ordered.",
+            "timezone": "UTC",
+            "target_duration_weeks": 4,
+        },
+        headers=headers,
+    )
+    assert goal_resp.status_code == 201
+    goal_id = goal_resp.json()["id"]
+
+    # 2. Mock AI Plan with intentionally out-of-order items:
+    # 20:00 Dinner -> 07:00 Morning Hydration -> 13:00 Lunch -> 08:30 Breakfast
+    out_of_order_plan = json.dumps({
+        "title": "Ordered Routine Plan",
+        "summary": "Plan to test chronological ordering.",
+        "target_duration_weeks": 4,
+        "diet_guidelines": ["Eat well"],
+        "lifestyle_guidelines": ["Sleep well"],
+        "precautions": ["None"],
+        "schedule_items": [
+            {"time_of_day": "20:00", "category": "dinner", "title": "Dinner Salad", "description": "Light greens"},
+            {"time_of_day": "07:00", "category": "morning_routine", "title": "Morning Water", "description": "Hydrate"},
+            {"time_of_day": "13:00", "category": "lunch", "title": "Chicken Quinoa", "description": "Balanced lunch"},
+            {"time_of_day": "08:30", "category": "breakfast", "title": "Oats Bowl", "description": "Healthy oats"},
+        ]
+    })
+
+    with patch(
+        "app.services.patient_plan_service.PatientPlanService._call_groq_api",
+        return_value=out_of_order_plan,
+    ):
+        gen_resp = await client.post(
+            f"/api/v1/patient/plans/goals/{goal_id}/generate",
+            headers=headers,
+        )
+        assert gen_resp.status_code == 200
+        plan_data = gen_resp.json()
+        plan_id = plan_data["id"]
+
+        # Items must be stored and returned sorted: 07:00, 08:30, 13:00, 20:00
+        times = [i["time_of_day"] for i in plan_data["items"]]
+        assert times == ["07:00", "08:30", "13:00", "20:00"]
+        order_indices = [i["order_index"] for i in plan_data["items"]]
+        assert order_indices == [0, 1, 2, 3]
+
+    # 3. Apply modification: Add a mid-morning snack at 10:30 (should be inserted between 08:30 and 13:00)
+    add_mod = {
+        "action_type": "add",
+        "proposed_title": "Green Apple Snack",
+        "proposed_description": "Fresh sliced apple",
+        "proposed_time": "10:30",
+        "proposed_category": "snack",
+    }
+    apply_resp = await client.post(
+        f"/api/v1/patient/plans/{plan_id}/modifications/apply",
+        json={"action": "accept", "expected_version": 1, "modification": add_mod},
+        headers=headers,
+    )
+    assert apply_resp.status_code == 200
+    updated_plan = apply_resp.json()
+    active_times = [i["time_of_day"] for i in updated_plan["items"] if i["is_active"]]
+    assert active_times == ["07:00", "08:30", "10:30", "13:00", "20:00"]
+    active_indices = [i["order_index"] for i in updated_plan["items"] if i["is_active"]]
+    assert active_indices == [0, 1, 2, 3, 4]
+
+
 

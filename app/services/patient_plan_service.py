@@ -925,6 +925,11 @@ class PatientPlanService:
 
         # Persist Plan and Schedule Items in one transaction
         try:
+            # Sort schedule items chronologically by time_of_day before persisting
+            plan_payload.schedule_items.sort(
+                key=lambda x: cls._parse_time_minutes(getattr(x, "time_of_day", "")) if cls._parse_time_minutes(getattr(x, "time_of_day", "")) is not None else 9999
+            )
+
             plan = PatientPlan(
                 goal_id=goal.id,
                 patient_id=patient_user.id,
@@ -1027,6 +1032,27 @@ class PatientPlanService:
         h = minutes // 60
         m = minutes % 60
         return f"{h:02d}:{m:02d}"
+
+    @classmethod
+    def _reorder_plan_items(cls, plan: PatientPlan) -> None:
+        """
+        Sorts plan items chronologically by time_of_day and updates order_index (0, 1, 2, ...)
+        in place. Active items come first in chronological order, followed by inactive items.
+        """
+        if not getattr(plan, "items", None):
+            return
+
+        plan.items.sort(
+            key=lambda x: (
+                0 if getattr(x, "is_active", True) else 1,
+                cls._parse_time_minutes(getattr(x, "time_of_day", "")) if cls._parse_time_minutes(getattr(x, "time_of_day", "")) is not None else 9999,
+                getattr(x, "order_index", 0),
+            )
+        )
+
+        for idx, item in enumerate(plan.items):
+            item.order_index = idx
+            flag_modified(item, "order_index")
 
     @classmethod
     def _get_patient_schedule_boundaries(cls, plan: PatientPlan) -> Tuple[str, str, int, int]:
@@ -2447,6 +2473,9 @@ class PatientPlanService:
             pending_disc.proposed_modifications = p_mod
             flag_modified(pending_disc, "proposed_modifications")
 
+        # Re-sort all plan items chronologically and update order_index in database
+        cls._reorder_plan_items(plan)
+
         await session.flush()
         plan.version += 1
 
@@ -2936,6 +2965,16 @@ class PatientPlanService:
         plan: PatientPlan,
         today_logs: Optional[List[PatientPlanLog]] = None,
     ) -> PatientPlanDetailResponse:
+        # Sort items: active first, then chronologically by time_of_day, then by order_index
+        sorted_plan_items = sorted(
+            plan.items,
+            key=lambda item: (
+                0 if getattr(item, "is_active", True) else 1,
+                cls._parse_time_minutes(getattr(item, "time_of_day", "")) if cls._parse_time_minutes(getattr(item, "time_of_day", "")) is not None else 9999,
+                getattr(item, "order_index", 0),
+            ),
+        )
+
         items = [
             PlanItemSchema(
                 id=item.id,
@@ -2952,7 +2991,7 @@ class PatientPlanService:
                 fiber_g=item.fiber_g,
                 calories_burned=item.calories_burned,
             )
-            for item in plan.items
+            for item in sorted_plan_items
         ]
 
         discussions = [

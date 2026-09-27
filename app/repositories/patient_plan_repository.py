@@ -211,7 +211,26 @@ class PatientPlanRepository:
         session.add(plan)
         await session.flush()
 
-        for idx, item in enumerate(items):
+        def _parse_time_minutes(time_str: Optional[str]) -> int:
+            if not time_str or not isinstance(time_str, str):
+                return 9999
+            import re
+            m = re.match(r"^(\d{1,2}):(\d{2})$", time_str.strip())
+            if not m:
+                return 9999
+            h, m_val = int(m.group(1)), int(m.group(2))
+            return h * 60 + m_val if 0 <= h <= 23 and 0 <= m_val <= 59 else 9999
+
+        # Ensure items are ordered chronologically by time_of_day
+        sorted_items = sorted(
+            items,
+            key=lambda x: (
+                0 if getattr(x, "is_active", True) else 1,
+                _parse_time_minutes(getattr(x, "time_of_day", "")),
+            ),
+        )
+
+        for idx, item in enumerate(sorted_items):
             item.plan_id = plan.id
             item.order_index = idx
             session.add(item)
