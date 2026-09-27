@@ -29,6 +29,7 @@ async def setup_submitted_doctor(client: AsyncClient, email: str = "applicant@ex
         "full_name": "Dr. Sarah Connor",
         "father_name": "John Connor",
         "pmdc_registration_number": "PMDC-7788-S",
+        "consultation_fee": 1500.0,
         "phone_number": "+1122334455",
         "specialization": "Neurology",
         "years_of_experience": 8,

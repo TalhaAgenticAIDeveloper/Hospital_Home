@@ -12,12 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field
 class DoctorProfileUpdateRequest(BaseModel):
     """Request schema for updating doctor professional information."""
 
-    full_name: str = Field(..., min_length=2, max_length=255, description="Full name of the doctor")
-    father_name: str = Field(..., min_length=2, max_length=255, description="Father's name of the doctor")
-    pmdc_registration_number: str = Field(..., min_length=2, max_length=100, description="PMDC registration number")
+    full_name: Optional[str] = Field(None, max_length=255, description="Full name of the doctor")
+    father_name: Optional[str] = Field(None, max_length=255, description="Father's name of the doctor")
+    pmdc_registration_number: Optional[str] = Field(None, max_length=100, description="PMDC registration number")
+    consultation_fee: Optional[float] = Field(None, ge=0, description="Doctor consultation fee in PKR")
     phone_number: Optional[str] = Field(None, max_length=20, description="Contact phone number")
     specialization: Optional[str] = Field(None, max_length=255, description="Medical specialization")
-    license_number: Optional[str] = Field(None, max_length=100, description="Medical registration/license number")
     years_of_experience: Optional[int] = Field(None, ge=0, le=70, description="Years of professional experience")
     qualification: Optional[str] = Field(None, max_length=500, description="Educational and medical qualifications")
     bio: Optional[str] = Field(None, max_length=2000, description="Professional biography / summary")
@@ -35,9 +35,9 @@ class DoctorProfileResponse(BaseModel):
     full_name: Optional[str] = None
     father_name: Optional[str] = None
     pmdc_registration_number: Optional[str] = None
+    consultation_fee: Optional[float] = None
     phone_number: Optional[str] = None
     specialization: Optional[str] = None
-    license_number: Optional[str] = None
     years_of_experience: Optional[int] = None
     qualification: Optional[str] = None
     bio: Optional[str] = None

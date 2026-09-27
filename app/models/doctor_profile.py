@@ -64,8 +64,8 @@ class DoctorProfile(TimestampMixin, Base):
     specialization: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, default=None,
     )
-    license_number: Mapped[Optional[str]] = mapped_column(
-        String(100), nullable=True, default=None,
+    consultation_fee: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True, default=None,
     )
     years_of_experience: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True, default=None,

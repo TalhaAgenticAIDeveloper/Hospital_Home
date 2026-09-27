@@ -56,7 +56,7 @@ class PendingDoctorListItem(BaseModel):
     father_name: Optional[str] = None
     pmdc_registration_number: Optional[str] = None
     specialization: Optional[str] = None
-    license_number: Optional[str] = None
+    consultation_fee: Optional[float] = None
     years_of_experience: Optional[int] = None
     submitted_at: Optional[datetime] = None
     status: str
@@ -100,7 +100,7 @@ class PendingDoctorDetailResponse(BaseModel):
     pmdc_registration_number: Optional[str] = None
     phone_number: Optional[str] = None
     specialization: Optional[str] = None
-    license_number: Optional[str] = None
+    consultation_fee: Optional[float] = None
     years_of_experience: Optional[int] = None
     qualification: Optional[str] = None
     bio: Optional[str] = None
