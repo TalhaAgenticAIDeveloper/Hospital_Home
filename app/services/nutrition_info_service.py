@@ -65,10 +65,13 @@ EXERCISE QUERIES:
 COMPARISON QUERIES:
 - When asked to compare foods or exercises, present a clear side-by-side comparison.
 
+STRICT FORMATTING RULE:
+- NEVER use asterisks (*, **, ***) for bolding, bullet points, or styling anywhere in your response. Keep text plain and clean.
+
 OUTPUT FORMAT:
 Your response must have TWO parts separated by the marker `NUTRITION_DATA:`.
 
-Part 1: A friendly, natural language answer to the patient's question.
+Part 1: A friendly, natural language answer to the patient's question without any asterisks.
 Part 2: After `NUTRITION_DATA:` — a JSON array of nutrition breakdowns. Each item:
 {
   "item_name": "Food or exercise name",
@@ -251,9 +254,8 @@ class NutritionInfoService:
                 logger.warning("Failed to parse NUTRITION_DATA JSON: %s", e)
                 nutrition_data = None
 
-        # If answer is empty but we got data, provide a generic prefix
-        if not answer_text and nutrition_data:
-            answer_text = "Here is the nutritional information you requested:"
+        # Strip any markdown asterisks (*, **, ***)
+        answer_text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", answer_text).replace("*", "").strip()
 
         return answer_text, nutrition_data if nutrition_data else None
 

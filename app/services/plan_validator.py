@@ -780,10 +780,10 @@ class PlanValidator:
         return (
             "I cannot prescribe or recommend any medications, pharmaceuticals, or clinical treatments—for any prescription drugs, "
             "please consult your licensed physician or attending doctor.\n\n"
-            "However, if you are looking for safe and **natural alternatives**, here are evidence-based lifestyle approaches that can help:\n\n"
-            "🌿 **Hydration & Herbal Infusions**: Drinking warm water or herbal teas like ginger (for digestion and anti-inflammatory support), "
+            "However, if you are looking for safe and natural alternatives, here are evidence-based lifestyle approaches that can help:\n\n"
+            "🌿 Hydration & Herbal Infusions: Drinking warm water or herbal teas like ginger (for digestion and anti-inflammatory support), "
             "chamomile (for relaxation and restful sleep), or peppermint (for soothing physical tension).\n\n"
-            "🥗 **Nutrient-Rich Whole Foods**: Focus on wholesome, anti-inflammatory foods like berries, leafy greens, nuts, and healthy fats while minimizing processed sugars.\n\n"
-            "🧘 **Rest, Movement & Breathing**: Gentle daily stretching, deep diaphragmatic breathing, and maintaining consistent sleep routines can naturally ease stress and restore vitality.\n\n"
+            "🥗 Nutrient-Rich Whole Foods: Focus on wholesome, anti-inflammatory foods like berries, leafy greens, nuts, and healthy fats while minimizing processed sugars.\n\n"
+            "🧘 Rest, Movement & Breathing: Gentle daily stretching, deep diaphragmatic breathing, and maintaining consistent sleep routines can naturally ease stress and restore vitality.\n\n"
             "Would you like me to adjust any item in your daily routine to incorporate more of these natural wellness habits?"
         )

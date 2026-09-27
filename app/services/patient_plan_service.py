@@ -973,10 +973,10 @@ class PatientPlanService:
                 plan_id=created_plan.id,
                 role="assistant",
                 content=(
-                    f"Welcome to your personalized **{created_plan.title}**!\n\n"
+                    f"Welcome to your personalized {created_plan.title}!\n\n"
                     "Review your daily schedule and guidelines above. If you'd like to adjust any meal, "
                     "swap an ingredient, or shift your workout time, just ask here in the chat. "
-                    "When you're happy with the routine, click **Approve & Start Plan** to begin your daily journey!"
+                    "When you're happy with the routine, click 'Approve & Start Plan' to begin your daily journey!"
                 ),
             )
             await PatientPlanRepository.add_discussion_message(session, welcome_msg)
@@ -995,6 +995,407 @@ class PatientPlanService:
             raise ValidationError("A database error occurred while saving your plan. Please try again.")
 
     # ── Plan Discussions & Deterministic Refinement ──────────────────────────
+
+    @classmethod
+    def _clean_asterisks(cls, text: Optional[str]) -> str:
+        """Strips markdown bold/italic asterisks (*, **, ***) while keeping clean text."""
+        if not text:
+            return ""
+        # Strip markdown bold/italic markers while preserving the text inside
+        cleaned = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", str(text))
+        # Strip any remaining stray asterisks
+        cleaned = cleaned.replace("*", "")
+        return cleaned.strip()
+
+    @staticmethod
+    def _parse_time_minutes(time_str: Optional[str]) -> Optional[int]:
+        """Convert 'HH:MM' string into minutes from midnight (0 to 1439)."""
+        if not time_str or not isinstance(time_str, str):
+            return None
+        match = re.match(r"^(\d{1,2}):(\d{2})$", time_str.strip())
+        if not match:
+            return None
+        h, m = int(match.group(1)), int(match.group(2))
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h * 60 + m
+        return None
+
+    @staticmethod
+    def _format_time_minutes(minutes: int) -> str:
+        """Convert minutes from midnight into 'HH:MM' 24-hour format."""
+        minutes = minutes % 1440
+        h = minutes // 60
+        m = minutes % 60
+        return f"{h:02d}:{m:02d}"
+
+    @classmethod
+    def _get_patient_schedule_boundaries(cls, plan: PatientPlan) -> Tuple[str, str, int, int]:
+        """
+        Extracts patient wake-up time and bed time from intake questionnaire answers or schedule items.
+        Returns: (wake_str, bed_str, wake_minutes, bed_minutes).
+        """
+        wake_str: Optional[str] = None
+        bed_str: Optional[str] = None
+
+        # 1. Search goal questionnaire answers
+        if plan.goal and getattr(plan.goal, "questions", None) and getattr(plan.goal, "answers", None):
+            for q in plan.goal.questions:
+                q_key = (q.question_key or "").lower()
+                ans = next((a for a in plan.goal.answers if a.question_id == q.id and not a.is_skipped), None)
+                if not ans:
+                    continue
+                val = ans.normalized_value or ans.raw_input
+                if not val:
+                    continue
+                if "wake" in q_key:
+                    norm = PlanValidator.normalize_time(val)
+                    if norm:
+                        wake_str = norm
+                elif "bed" in q_key or "sleep" in q_key:
+                    norm = PlanValidator.normalize_time(val)
+                    if norm:
+                        bed_str = norm
+
+        # 2. Fallback to active schedule items
+        active_items = sorted(
+            [i for i in plan.items if i.is_active and i.time_of_day],
+            key=lambda x: cls._parse_time_minutes(x.time_of_day) or 0
+        )
+        if not wake_str and active_items:
+            morning_item = next((i for i in active_items if i.category in ("morning_routine", "breakfast")), None)
+            if morning_item:
+                wake_str = morning_item.time_of_day
+            else:
+                wake_str = active_items[0].time_of_day
+
+        if not bed_str and active_items:
+            night_item = next((i for i in reversed(active_items) if i.category in ("sleep_routine", "night_routine")), None)
+            if night_item:
+                bed_str = night_item.time_of_day
+            else:
+                bed_str = active_items[-1].time_of_day
+
+        # Safe defaults if no records found
+        if not wake_str:
+            wake_str = "07:00"
+        if not bed_str:
+            bed_str = "23:00"
+
+        wake_m = cls._parse_time_minutes(wake_str) or 420
+        bed_m = cls._parse_time_minutes(bed_str) or 1380
+        return wake_str, bed_str, wake_m, bed_m
+
+    @classmethod
+    def _is_time_within_awake_window(cls, time_str: str, wake_m: int, bed_m: int) -> bool:
+        """Determines if a given 'HH:MM' falls strictly during the patient's awake hours."""
+        t_m = cls._parse_time_minutes(time_str)
+        if t_m is None:
+            return False
+        if wake_m <= bed_m:
+            # Standard awake window (e.g., 07:00 to 23:00)
+            return wake_m <= t_m <= bed_m
+        else:
+            # Crosses midnight (e.g., wake 07:00, bed 01:00)
+            return t_m >= wake_m or t_m <= bed_m
+
+    @classmethod
+    def _build_occupied_schedule_context(
+        cls, plan: PatientPlan, exclude_item_id: Optional[uuid.UUID] = None
+    ) -> Tuple[str, str, str, int, int]:
+        """
+        Builds a comprehensive chronological schedule overview detailing occupied time slots,
+        sleep/wake boundaries, and clinical spacing rules for the LLM.
+        """
+        wake_str, bed_str, wake_m, bed_m = cls._get_patient_schedule_boundaries(plan)
+        active_items = [
+            i for i in plan.items
+            if i.is_active and (exclude_item_id is None or i.id != exclude_item_id)
+        ]
+        active_items.sort(key=lambda x: cls._parse_time_minutes(x.time_of_day) or 0)
+
+        occupied_lines = []
+        for it in active_items:
+            start_m = cls._parse_time_minutes(it.time_of_day)
+            if start_m is None:
+                continue
+            cat = (it.category or "").lower()
+            tit = (it.title or "").lower()
+            is_meal = any(w in (cat + " " + tit) for w in ("breakfast", "lunch", "dinner", "meal"))
+            is_workout = any(w in (cat + " " + tit) for w in ("walk", "workout", "exercise", "cardio", "gym", "jog", "run"))
+            dur = 45 if (is_meal or is_workout) else (20 if "snack" in cat or "tea" in tit else 30)
+            end_str = cls._format_time_minutes(start_m + dur)
+            tag = "Meal (digestion buffer required)" if is_meal else ("Workout / Physical Exercise" if is_workout else "Routine Activity")
+            occupied_lines.append(f"- {it.time_of_day} to {end_str} ({it.category}): {it.title} [{tag}] (ID: {it.id})")
+
+        schedule_text = "\n".join(occupied_lines) if occupied_lines else "No active items."
+        return schedule_text, wake_str, bed_str, wake_m, bed_m
+
+    @classmethod
+    def _find_intelligent_free_slot(
+        cls,
+        plan: PatientPlan,
+        category: str,
+        title: str,
+        preferred_time: Optional[str] = None,
+        exclude_item_id: Optional[uuid.UUID] = None,
+    ) -> str:
+        """
+        Intelligently resolves a collision-free, physiologically optimal time slot:
+        - Keeps activities strictly within the patient's wake/sleep window.
+        - Guarantees zero overlapping or identical timestamps.
+        - Prevents scheduling workouts at or immediately after meals (at least 45-60 min gap).
+        - Intelligently schedules evening walks/workouts before dinner (e.g. 18:00 or 18:30)
+          or 45+ minutes after dinner.
+        """
+        wake_str, bed_str, wake_m, bed_m = cls._get_patient_schedule_boundaries(plan)
+
+        # Collect occupied blocks: list of (start_m, end_m, is_meal, is_exercise, item_id, item_title)
+        occupied = []
+        for it in plan.items:
+            if not it.is_active or (exclude_item_id and it.id == exclude_item_id):
+                continue
+            m = cls._parse_time_minutes(it.time_of_day)
+            if m is None:
+                continue
+            cat = (it.category or "").lower()
+            tit = (it.title or "").lower()
+            is_meal = any(w in (cat + " " + tit) for w in ("breakfast", "lunch", "dinner", "meal"))
+            is_ex = any(w in (cat + " " + tit) for w in ("walk", "workout", "exercise", "cardio", "gym", "jog", "run"))
+            dur = 45 if (is_meal or is_ex) else (20 if "snack" in cat or "tea" in tit else 30)
+            occupied.append((m, m + dur, is_meal, is_ex, it.id, tit))
+
+        occupied.sort(key=lambda x: x[0])
+
+        combined_name = (category + " " + title).lower()
+        is_new_exercise = any(w in combined_name for w in ("walk", "walking", "jog", "workout", "exercise", "cardio", "gym", "run", "running", "yoga", "circuit"))
+        is_new_meal = any(w in combined_name for w in ("breakfast", "lunch", "dinner", "snack", "meal"))
+        new_duration = 45 if (is_new_exercise or is_new_meal) else 30
+
+        def is_slot_free(slot_start: int, slot_dur: int) -> bool:
+            slot_end = slot_start + slot_dur
+            # Boundary check
+            if not cls._is_time_within_awake_window(cls._format_time_minutes(slot_start), wake_m, bed_m):
+                return False
+            if not cls._is_time_within_awake_window(cls._format_time_minutes(slot_end), wake_m, bed_m):
+                return False
+
+            for occ_start, occ_end, occ_is_meal, occ_is_ex, _, _ in occupied:
+                # Direct overlap check with 15-minute minimum spacing buffer
+                if not (slot_end + 15 <= occ_start or slot_start >= occ_end + 15):
+                    return False
+                # Physiological rule: Exercise cannot be within 45 min after a meal or 15 min before a meal
+                if is_new_exercise and occ_is_meal:
+                    if not (slot_end + 15 <= occ_start or slot_start >= occ_end + 45):
+                        return False
+                if is_new_meal and occ_is_ex:
+                    if not (slot_end + 15 <= occ_start or slot_start >= occ_end + 15):
+                        return False
+            return True
+
+        pref_m = cls._parse_time_minutes(preferred_time) if preferred_time else None
+
+        # 1. If preferred_time was provided and is completely free and valid
+        if pref_m is not None and is_slot_free(pref_m, new_duration):
+            return cls._format_time_minutes(pref_m)
+
+        # 2. For workouts/walks: intelligently find evening or morning slot
+        if is_new_exercise:
+            # Check if evening was requested or preferred time is after 16:00
+            is_evening = (pref_m is not None and pref_m >= 960) or any(w in combined_name for w in ("evening", "sham", "night", "dinner"))
+
+            # Find dinner if present
+            dinner_occ = next((occ for occ in occupied if "dinner" in occ[5] or (occ[2] and occ[0] >= 1140)), None)
+
+            if is_evening or dinner_occ:
+                dinner_start = dinner_occ[0] if dinner_occ else 1200  # 20:00 default
+                # Candidate A: Pre-dinner evening walk (18:30 or 18:00 or 17:30)
+                for cand in (dinner_start - 90, dinner_start - 120, dinner_start - 150, 1110, 1080, 1050):
+                    if is_slot_free(cand, new_duration):
+                        return cls._format_time_minutes(cand)
+                # Candidate B: Post-dinner stroll (dinner_end + 45 min)
+                dinner_end = dinner_occ[1] if dinner_occ else (dinner_start + 45)
+                for cand in (dinner_end + 45, dinner_end + 60, dinner_end + 30):
+                    if cand + new_duration <= bed_m and is_slot_free(cand, new_duration):
+                        return cls._format_time_minutes(cand)
+            else:
+                # Morning workout candidates
+                breakfast_occ = next((occ for occ in occupied if "breakfast" in occ[5] or (occ[2] and occ[0] < 660)), None)
+                if breakfast_occ:
+                    b_start = breakfast_occ[0]
+                    # Pre-breakfast walk
+                    for cand in (b_start - 60, b_start - 75, wake_m + 15, wake_m + 30):
+                        if cand >= wake_m and is_slot_free(cand, new_duration):
+                            return cls._format_time_minutes(cand)
+                    # Post-breakfast walk
+                    b_end = breakfast_occ[1]
+                    for cand in (b_end + 60, b_end + 75):
+                        if is_slot_free(cand, new_duration):
+                            return cls._format_time_minutes(cand)
+
+        # 3. For general additions: search outward from preferred time or defaults
+        base_time = pref_m if pref_m is not None else (
+            510 if "breakfast" in combined_name else (
+                780 if "lunch" in combined_name else (
+                    1020 if "snack" in combined_name else (
+                        1200 if "dinner" in combined_name else (
+                            wake_m + 30 if "morning" in combined_name else (
+                                bed_m - 45 if "sleep" in combined_name or "night" in combined_name else 1080
+                            )
+                        )
+                    )
+                )
+            )
+        )
+
+        offsets = [0, 30, -30, 45, -45, 60, -60, 90, -90, 120, -120, 150, -150, 180, -180]
+        for off in offsets:
+            cand = base_time + off
+            if is_slot_free(cand, new_duration):
+                return cls._format_time_minutes(cand)
+
+        # 4. Fallback search through entire awake window in 15-minute steps
+        step_m = wake_m
+        while step_m + new_duration <= bed_m:
+            if is_slot_free(step_m, new_duration):
+                return cls._format_time_minutes(step_m)
+            step_m += 15
+
+        # Ultimate safe fallback clamped to awake window
+        safe_m = min(max(wake_m + 30, base_time), bed_m - new_duration)
+        return cls._format_time_minutes(safe_m)
+
+    @classmethod
+    def _resolve_schedule_conflicts(
+        cls, plan: PatientPlan, mod_data: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Deterministic Schedule Conflict Resolver Agent:
+        1. Guarantees zero overlapping / duplicate activity timestamps.
+        2. Enforces sleep/wake boundaries so items never leak outside awake window.
+        3. Enforces physiological safety: workouts separated from meals by >= 45-60 min.
+        4. Calculates goal timeline extension when activities/meals are removed.
+        5. Strips all asterisks (*, **, ***) from all strings.
+        """
+        if not mod_data or not isinstance(mod_data, dict):
+            return mod_data
+
+        wake_str, bed_str, wake_m, bed_m = cls._get_patient_schedule_boundaries(plan)
+        current_weeks = plan.target_duration_weeks or 4
+
+        # If mod_data contains multiple items
+        if "items" in mod_data and isinstance(mod_data["items"], list):
+            resolved_items = []
+            for sub_m in mod_data["items"]:
+                if isinstance(sub_m, dict):
+                    res_sub = cls._resolve_single_mod_item(plan, sub_m, wake_str, bed_str, wake_m, bed_m, current_weeks)
+                    resolved_items.append(res_sub)
+            mod_data["items"] = resolved_items
+            return mod_data
+
+        return cls._resolve_single_mod_item(plan, mod_data, wake_str, bed_str, wake_m, bed_m, current_weeks)
+
+    @classmethod
+    def _resolve_single_mod_item(
+        cls,
+        plan: PatientPlan,
+        m: Dict[str, Any],
+        wake_str: str,
+        bed_str: str,
+        wake_m: int,
+        bed_m: int,
+        current_weeks: int,
+    ) -> Dict[str, Any]:
+        """Resolves schedule boundaries, collisions, and duration impact for a single modification dict."""
+        action = m.get("action_type", "swap")
+
+        # ── 1. Handling Item Removal & Timeline Extension ──
+        if action == "remove":
+            # Check if adjusted_duration_weeks is configured
+            ext_weeks = m.get("adjusted_duration_weeks")
+            if not ext_weeks or int(ext_weeks) <= current_weeks:
+                m["adjusted_duration_weeks"] = current_weeks + 2
+
+            summary = m.get("impact_summary") or ""
+            if "duration" not in summary.lower() and "week" not in summary.lower():
+                m["impact_summary"] = (
+                    summary + f" Recommended plan timeline extended from {current_weeks} weeks to {m['adjusted_duration_weeks']} weeks."
+                ).strip()
+
+            # Clean all asterisks
+            for k in list(m.keys()):
+                if isinstance(m[k], str):
+                    m[k] = cls._clean_asterisks(m[k])
+            return m
+
+        # ── 2. Handling Add, Swap, Reschedule (Time Validation & Conflict Resolution) ──
+        target_item = cls._find_item_for_mod(plan, m)
+        exclude_id = target_item.id if target_item else None
+        prop_time = m.get("proposed_time")
+        prop_cat = m.get("proposed_category") or ""
+        prop_title = m.get("proposed_title") or ""
+
+        needs_adjustment = False
+        if not prop_time:
+            needs_adjustment = True
+        else:
+            norm_t = PlanValidator.normalize_time(prop_time)
+            if not norm_t:
+                needs_adjustment = True
+            elif not cls._is_time_within_awake_window(norm_t, wake_m, bed_m):
+                # Outside wake-sleep range!
+                logger.info("Schedule item outside awake window (%s outside %s-%s). Readjusting...", norm_t, wake_str, bed_str)
+                needs_adjustment = True
+            else:
+                prop_time = norm_t
+                t_m = cls._parse_time_minutes(norm_t)
+                combined = (prop_cat + " " + prop_title).lower()
+                is_workout = any(w in combined for w in ("walk", "walking", "jog", "workout", "exercise", "cardio", "gym", "run", "running", "yoga", "circuit"))
+
+                # Check collision with all other active items
+                for it in plan.items:
+                    if not it.is_active or (exclude_id and it.id == exclude_id):
+                        continue
+                    it_m = cls._parse_time_minutes(it.time_of_day)
+                    if it_m is None:
+                        continue
+                    # Identical time check
+                    if it_m == t_m:
+                        logger.info("Schedule collision detected: proposed %s matches active item %s (%s)", prop_time, it.title, it.time_of_day)
+                        needs_adjustment = True
+                        break
+                    # Workout near meal check
+                    it_is_meal = any(w in (it.category or "").lower() for w in ("breakfast", "lunch", "dinner")) or any(w in (it.title or "").lower() for w in ("breakfast", "lunch", "dinner"))
+                    if is_workout and it_is_meal:
+                        # Cannot be within 45 min after meal or 15 min before meal
+                        if it_m - 15 <= t_m <= it_m + 45:
+                            logger.info("Workout-meal conflict detected: proposed %s too close to meal %s at %s", prop_time, it.title, it.time_of_day)
+                            needs_adjustment = True
+                            break
+
+        if needs_adjustment:
+            resolved_slot = cls._find_intelligent_free_slot(
+                plan=plan,
+                category=prop_cat,
+                title=prop_title,
+                preferred_time=prop_time,
+                exclude_item_id=exclude_id,
+            )
+            logger.info("Schedule Conflict Resolver adjusted time: %s -> %s (category: %s, title: %s)", prop_time, resolved_slot, prop_cat, prop_title)
+            m["proposed_time"] = resolved_slot
+            summary = m.get("impact_summary") or ""
+            if "scheduled at" not in summary.lower() and "overlap" not in summary.lower():
+                m["impact_summary"] = (
+                    summary + f" Scheduled at {resolved_slot} to prevent overlap and maintain healthy meal spacing."
+                ).strip()
+        else:
+            m["proposed_time"] = prop_time
+
+        # Clean all asterisks from string fields
+        for k in list(m.keys()):
+            if isinstance(m[k], str):
+                m[k] = cls._clean_asterisks(m[k])
+
+        return m
 
     @classmethod
     def _add_disliked_item(cls, plan: PatientPlan, item_name: str) -> bool:
@@ -1216,7 +1617,8 @@ class PatientPlanService:
             f"   - The overall effect on their daily plan and health goal.\n"
             f"4. You MUST end your message with a PROPOSED_MODIFICATION JSON block. In 'proposed_title' and 'proposed_description', describe the EXACT meal, portion sizes, ingredients, and preparation:\n"
             f"   PROPOSED_MODIFICATION: {{\"action_type\": \"swap\", \"original_title\": \"{original_title}\", \"proposed_title\": \"<EXACT DISH NAME & PORTION>\", \"proposed_description\": \"<EXACT ingredients, preparation instructions, calories, and macro details>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 240, \"protein_g\": 16.0, \"carbs_g\": 22.0, \"fat_g\": 8.0, \"fiber_g\": 4.0, \"calories_burned\": null, \"impact_summary\": \"<effect on daily plan>\", \"disliked_item_added\": \"{declined_title}\"}}\n"
-            f"5. NO MEDICATIONS: strictly forbidden from mentioning medications."
+            f"5. NO MEDICATIONS: strictly forbidden from mentioning medications.\n"
+            f"6. NO ASTERISKS: strictly forbidden from using asterisks (*, **, ***) for bolding or emphasis anywhere."
         )
 
         messages = [
@@ -1263,14 +1665,20 @@ class PatientPlanService:
                 "disliked_item_added": declined_title,
             }
 
+        # Validate schedule collisions & boundaries
+        if proposed_mod:
+            proposed_mod = cls._resolve_schedule_conflicts(plan, proposed_mod)
+
         # Track disliked item in plan
         if proposed_mod and proposed_mod.get("disliked_item_added"):
             cls._add_disliked_item(plan, proposed_mod["disliked_item_added"])
 
+        clean_reply = cls._clean_asterisks(ai_text)
+
         msg = PatientPlanDiscussion(
             plan_id=plan.id,
             role="assistant",
-            content=ai_text,
+            content=clean_reply,
             proposed_modifications=proposed_mod,
         )
         return await PatientPlanRepository.add_discussion_message(session, msg)
@@ -1337,8 +1745,8 @@ class PatientPlanService:
             "ANALYZE CAREFULLY AND SELECT ONE OF THE FOLLOWING 6 INTENTS:\n\n"
             "1. 'CONFIRM_MODIFICATION':\n"
             "   - APPLIES ONLY IF there is an active pending modification waiting for confirmation.\n"
-            "   - The user accepts, agrees with, confirms, or approves applying the proposed change.\n"
-            "   - Examples (in English, Urdu, Roman Urdu, etc.): 'yes', 'confirm', 'apply', 'looks good', 'theek hai', 'haan kr do', 'done karo', 'yehi final karo', 'bilkul chalega', 'laga do bhai', 'sounds great do it', 'apply this', 'sure', 'approved'.\n\n"
+            "   - The user accepts, agrees with, confirms, or approves applying the proposed change (including agreeing to extend plan duration when removing an item).\n"
+            "   - Examples (in English, Urdu, Roman Urdu, etc.): 'yes', 'confirm', 'apply', 'looks good', 'theek hai', 'haan kr do', 'done karo', 'yehi final karo', 'bilkul chalega', 'laga do bhai', 'sounds great do it', 'apply this', 'sure', 'approved', 'theek hy barha do', 'theek hai barha do', 'haan duration barha do', 'extend it', 'yes extend it', 'adjust duration', 'ok extend', 'barha do', 'berha do'.\n\n"
             "2. 'REJECT_ALTERNATIVE':\n"
             "   - APPLIES ONLY IF there is an active pending modification.\n"
             "   - The user declines, dislikes, or rejects the suggested alternative and wants ANOTHER / DIFFERENT healthy option or suggestion.\n"
@@ -1385,7 +1793,7 @@ class PatientPlanService:
         # Safe fallback only if AI call fails
         lowered = clean_text.lower().strip()
         if pending_data:
-            if any(w in lowered for w in ("yes", "apply", "theek", "haan", "done", "confirm")):
+            if any(w in lowered for w in ("yes", "apply", "theek", "haan", "done", "confirm", "barha", "berha", "extend", "adjust")):
                 return {"intent": "CONFIRM_MODIFICATION", "rejected_item": None, "is_medication_inquiry": False}
             if any(w in lowered for w in ("keep", "rehne do", "original", "leave it")):
                 return {"intent": "CANCEL_KEEP_ORIGINAL", "rejected_item": None, "is_medication_inquiry": False}
@@ -1603,8 +2011,8 @@ class PatientPlanService:
                 plan_id=plan.id,
                 role="assistant",
                 content=(
-                    f"A patient can only have **one plan at a time**. Your current plan is configured for **{plan.title}**.\n\n"
-                    "If you would like to start a brand new plan with a different goal, please click **Cancel Plan** at the top of your dashboard. "
+                    f"A patient can only have one plan at a time. Your current plan is configured for '{plan.title}'.\n\n"
+                    "If you would like to start a brand new plan with a different goal, please click 'Cancel Plan' at the top of your dashboard. "
                     "This will completely clear your current plan from the database so you can start fresh with a new goal and questionnaire."
                 ),
             )
@@ -1617,17 +2025,17 @@ class PatientPlanService:
         # 4. Detect Medication Requests & Configure Safety Guidance
         is_med_inquiry = PlanValidator.is_medication_inquiry(clean_text)
 
-        # 5. LLM Follow-up Reasoning & Proposed Modification
-        schedule_summary = "\n".join(
-            f"- [{item.id}] {item.time_of_day} ({item.category}): {item.title} — {item.description}"
-            for item in plan.items if item.is_active
-        )
+        # 5. Build Comprehensive Schedule & Boundary Context
+        schedule_ctx, wake_str, bed_str, wake_m, bed_m = cls._build_occupied_schedule_context(plan)
+        current_weeks = plan.target_duration_weeks or 4
+        extended_weeks = current_weeks + 2
+
         recent_msgs = plan.discussions[-6:] if len(plan.discussions) > 6 else plan.discussions
 
         conv_context = []
         for m in recent_msgs:
             if m.role in ("user", "assistant"):
-                conv_context.append({"role": m.role, "content": m.content})
+                conv_context.append({"role": m.role, "content": cls._clean_asterisks(m.content)})
 
         # Guarantee the user's latest query is present at the end of the context
         if not conv_context or conv_context[-1]["role"] != "user" or conv_context[-1]["content"] != clean_text:
@@ -1650,18 +2058,32 @@ class PatientPlanService:
         chat_system_prompt = (
             "You are an empathetic, expert wellness assistant discussing the patient's daily health plan.\n\n"
             f"PLAN TITLE: {plan.title}\n"
-            f"SUMMARY: {plan.summary}\n\n"
-            f"CURRENT SCHEDULE:\n{schedule_summary}\n\n"
+            f"SUMMARY: {plan.summary}\n"
+            f"CURRENT PLAN DURATION: {current_weeks} Weeks\n\n"
+            f"PATIENT DAILY SCHEDULE BOUNDARIES:\n"
+            f"- Wake-Up Time: {wake_str}\n"
+            f"- Bed / Sleep Time: {bed_str}\n"
+            f"- Active Awake Window: Strictly between {wake_str} and {bed_str}. You are STRICTLY FORBIDDEN from scheduling any item during sleeping hours (outside {wake_str} to {bed_str}).\n\n"
+            f"CURRENT OCCUPIED DAILY SCHEDULE (MANDATORY NON-OVERLAPPING RESTRICTIONS):\n"
+            f"{schedule_ctx}\n\n"
             f"CURRENTLY DISLIKED / EXCLUDED ITEMS: {disliked_str}\n"
             "CRITICAL: You are strictly forbidden from suggesting any food, ingredient, or activity from this excluded list.\n\n"
-            "CRITICAL RULES:\n"
-            "1. NO MEDICATIONS: You are strictly forbidden from prescribing, recommending, or suggesting pharmaceutical drugs, pills, tablets, or clinical dosages.\n"
-            "2. POLITELY DECLINE & OFFER NATURAL ALTERNATIVES: If the patient asks for any medicine or prescription, politely decline by explaining that you cannot prescribe medications and advise them to consult a licensed doctor, and provide safe natural, dietary, and lifestyle alternatives instead.\n"
-            "3. Ground your explanations in their current plan.\n"
-            "4. STRICT LANGUAGE & SCRIPT RULES:\n"
+            "CRITICAL TIMING & PHYSIOLOGICAL COMPATIBILITY RULES:\n"
+            "1. NO DUPLICATE OR OVERLAPPING TIMINGS: You must NEVER schedule any item at the exact same time as an existing active item.\n"
+            "2. WORKOUT & MEAL COMPATIBILITY (PHYSIOLOGICAL DIGESTION GAP):\n"
+            "   - A workout, walk, jog, or cardio session must NEVER be placed at the same time as a meal (breakfast, lunch, or dinner).\n"
+            "   - Exercise immediately after a heavy meal causes gastrointestinal distress. Maintain at least 45 to 60 minutes digestion gap!\n"
+            "   - If the patient asks to add an evening walk or workout:\n"
+            "     * Schedule it BEFORE dinner (e.g. 18:00 or 18:30) so there is ample time before dinner. NEVER schedule it at dinner time!\n"
+            "     * Or if they specifically ask for a light post-dinner walk, schedule it at least 45 minutes after dinner starts (e.g., 20:45 or 21:00).\n"
+            "   - If the patient asks to add a morning walk or workout, schedule it before breakfast (e.g. 07:15 or 07:30) or at least 45 mins after breakfast.\n"
+            "3. NO MEDICATIONS: Strictly forbidden from prescribing or suggesting pharmaceutical drugs, pills, or clinical dosages.\n"
+            "4. STRICT FORMATTING & NO ASTERISKS RULE:\n"
+            "   - NEVER use asterisks (*, **, ***) for bolding, bullet points, or styling anywhere in your response or JSON values. Keep all text plain and clean.\n"
+            "5. STRICT LANGUAGE & SCRIPT RULES:\n"
             "   - If the patient writes in English, reply strictly in English.\n"
-            "   - If the patient writes in Urdu, Roman Urdu, or Hindi, reply STRICTLY in Roman Urdu (using Latin/English alphabet, e.g. 'Aap ke plan mein breakfast ko update kar diya gaya hai...').\n"
-            "   - NEVER write in traditional Urdu script (اردو رسم الخط / Arabic script). Absolutely NO Nastaliq/Arabic characters. Even if the patient writes in Urdu script, your response MUST be in Roman Urdu with English letters.\n\n"
+            "   - If the patient writes in Urdu, Roman Urdu, or Hindi, reply STRICTLY in Roman Urdu (using Latin/English alphabet, e.g. 'Aap ke plan mein walk add kar di gayi hai...').\n"
+            "   - NEVER write in traditional Urdu script (اردو رسم الخط / Arabic script). Absolutely NO Nastaliq/Arabic characters.\n\n"
             "HOW TO HANDLE DIFFERENT REQUEST TYPES:\n\n"
             "A) DISLIKING AN ITEM OR ASKING FOR AN ALTERNATIVE (e.g. 'I don't like banana', 'mujhe kela pasand nahi', 'replace eggs with vegetarian', 'change workout'):\n"
             "   1. Identify the disliked item and the corresponding schedule item.\n"
@@ -1671,32 +2093,45 @@ class PatientPlanService:
             "      - GOOD proposed_title: '2 Boiled Eggs with 1 Slice Whole-Wheat Toast & Sautéed Spinach', 'Oatmeal (1 cup) with Chia Seeds, Almonds & Honey', 'Lentil Soup (1.5 cups) with Steamed Broccoli'\n"
             "      - In proposed_description, explicitly state what to eat, ingredients, portions, preparation, calories, and macros so the patient knows exactly what to eat.\n"
             "   4. In your response, clearly provide:\n"
-            "      - Nutritional Comparison: What the original item provided (calories, protein, carbs, vitamins) vs. what the new alternative provides.\n"
+            "      - Nutritional Comparison: What the original item provided vs. what the new alternative provides.\n"
             "      - Plan Impact: How this swap affects their daily caloric intake, macro balance, and goal.\n"
             "   5. End your response with exactly ONE proposed modification in this format:\n"
             "      PROPOSED_MODIFICATION: {\"action_type\": \"swap\", \"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old>\", \"proposed_title\": \"<EXACT DISH & PORTION>\", \"proposed_description\": \"<EXACT ingredients, portions, preparation instructions, calories, and macros>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<morning_routine|breakfast|lunch|evening_activity|dinner|night_routine>\", \"calories\": 350, \"protein_g\": 15.0, \"carbs_g\": 45.0, \"fat_g\": 8.0, \"fiber_g\": 5.0, \"calories_burned\": null, \"impact_summary\": \"<summary of impact on daily plan>\", \"disliked_item_added\": \"<name of disliked item>\"}\n\n"
             "B) USER ASKING TO ADD AN ITEM (e.g. 'Add green tea at 4pm', 'Add 20 min walk', 'Can I add 15 almonds at 5pm?'):\n"
-            "   1. In proposed_title, state the exact tangible item/food and quantity (e.g. '15 Raw Almonds + 1 Cup Green Tea').\n"
-            "   2. Explain what nutrients this added item provides (calories, protein, carbs, fat, fiber) OR how many calories it burns (for workouts).\n"
-            "   3. Explain the overall effect on their daily plan and goals (e.g. caloric impact, hydration, energy).\n"
-            "   4. Ask if they want to confirm adding it, and end your response with:\n"
+            "   1. Choose a non-colliding time strictly within the patient's awake window that does NOT overlap with any existing item or meal.\n"
+            "   2. In proposed_title, state the exact tangible item/food and quantity (e.g. '30-Minute Brisk Evening Walk' or '15 Raw Almonds + 1 Cup Green Tea').\n"
+            "   3. Explain what nutrients this added item provides OR how many calories it burns (for workouts).\n"
+            "   4. Explain the overall effect on their daily plan and goals.\n"
+            "   5. Ask if they want to confirm adding it, and end your response with:\n"
             "      PROPOSED_MODIFICATION: {\"action_type\": \"add\", \"proposed_title\": \"<EXACT ITEM & QUANTITY>\", \"proposed_description\": \"<EXACT ingredients, portions, calories, and macros>\", \"proposed_time\": \"HH:MM\", \"proposed_category\": \"<category>\", \"calories\": 105, \"protein_g\": 4.0, \"carbs_g\": 3.0, \"fat_g\": 9.0, \"fiber_g\": 2.0, \"calories_burned\": null, \"impact_summary\": \"+105 kcal, 4g protein added to daily intake\"}\n\n"
-            "C) USER ASKING TO COMPLETELY REMOVE AN ITEM WITHOUT ALTERNATIVE (e.g. 'Remove evening snack completely', 'delete morning jog'):\n"
-            "   1. Explain clearly the consequences and overall impact on their plan (e.g. caloric deficit increase, potential fatigue, missing protein target).\n"
-            "   2. Ask if they are sure they want to remove it, and end your response with:\n"
-            "      PROPOSED_MODIFICATION: {\"action_type\": \"remove\", \"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old title>\", \"impact_summary\": \"Reduces daily intake by 220 kcal and 8g protein\"}\n\n"
+            "C) USER ASKING TO COMPLETELY REMOVE AN ITEM WITHOUT ALTERNATIVE (e.g. 'Remove evening snack completely', 'delete morning jog', 'remove workout'):\n"
+            "   1. CLINICAL PROGRESS & TIMELINE ASSESSMENT:\n"
+            f"      - Current plan duration: {current_weeks} weeks.\n"
+            "      - Removing an exercise, workout, or key meal reduces daily physical burn and slows down goal progression.\n"
+            f"      - With the remaining routine, achieving their goal will now take approximately {extended_weeks} weeks instead of {current_weeks} weeks.\n"
+            "   2. INFORM THE USER & OFFER TIMELINE ADJUSTMENT:\n"
+            "      - In English: Explain that removing this item reduces daily caloric burn / progress, and with the remaining routine, reaching their goal will now take approximately "
+            f"{extended_weeks} weeks instead of {current_weeks} weeks. Directly ask: 'Would you like to adjust your plan duration from {current_weeks} to {extended_weeks} weeks? "
+            "If you agree, please confirm (e.g., \"yes, extend it\" or \"confirm\") and I will update your duration.'\n"
+            "      - In Roman Urdu: Explain: 'Is item ko remove karne se aap ki daily progress aur calorie burn kam ho jayegi. "
+            f"Ab jo baqi routine reh gayi hai, us se aap ka yeh goal {current_weeks} weeks ki bajaye lagbhag {extended_weeks} weeks mein achieve hoga. "
+            f"Kya aap plan ki duration {current_weeks} se barha kar {extended_weeks} weeks karna chahte hain? "
+            "Agar aap ko manzoor hai to \"theek hai barha do\" ya \"confirm\" keh dein, hum duration update kar denge.'\n"
+            "   3. End your response with:\n"
+            f"      PROPOSED_MODIFICATION: {{\"action_type\": \"remove\", \"item_id\": \"<matching-item-uuid>\", \"original_title\": \"<old title>\", \"adjusted_duration_weeks\": {extended_weeks}, \"impact_summary\": \"Reduces daily burn/intake. Goal achievement timeline extended from {current_weeks} to {extended_weeks} weeks.\"}}\n\n"
             "D) SCHEDULE / LIFESTYLE CONSTRAINTS & UNAVAILABILITY (e.g. 'I work 9-5', 'I have no time between 10 am and 5 pm', 'I am busy from 10:00 to 17:00'):\n"
             "   1. Identify EVERY SINGLE schedule item currently scheduled within or overlapping that unavailable window.\n"
-            "   2. Reschedule ALL of those items to suitable times outside that window.\n"
+            "   2. Reschedule ALL of those items to suitable non-colliding times outside that window within awake hours.\n"
             "   3. In your chat message, clearly list each moved item: old time -> new time.\n"
-            "   4. YOU MUST output ALL of the adjusted items together in PROPOSED_MODIFICATION as a JSON array:\n"
+            "   4. Output ALL adjusted items together in PROPOSED_MODIFICATION as a JSON array:\n"
             "   PROPOSED_MODIFICATION: [\n"
             "     {\"item_id\": \"<uuid-1>\", \"original_title\": \"<title 1>\", \"proposed_title\": \"<new title 1>\", \"proposed_description\": \"<desc 1>\", \"proposed_time\": \"09:30\", \"proposed_category\": \"lunch\", \"action_type\": \"reschedule\", \"calories\": 450, \"protein_g\": 20.0, \"carbs_g\": 60.0, \"fat_g\": 12.0, \"fiber_g\": 6.0, \"calories_burned\": null},\n"
             "     {\"item_id\": \"<uuid-2>\", \"original_title\": \"<title 2>\", \"proposed_title\": \"<new title 2>\", \"proposed_description\": \"<desc 2>\", \"proposed_time\": \"18:00\", \"proposed_category\": \"evening_activity\", \"action_type\": \"reschedule\", \"calories\": null, \"protein_g\": null, \"carbs_g\": null, \"fat_g\": null, \"fiber_g\": null, \"calories_burned\": 200}\n"
             "   ]\n\n"
             "E) GENERAL QUESTIONS (e.g. 'why this food?', 'is brown rice good?', 'how much water should I drink?'):\n"
-            "   Answer helpfully grounded in their plan. No modification needed.\n\n"
-            "Keep your replies concise and friendly (3-6 sentences). Always be practical and specific, never generic. "
+            "   Answer helpfully grounded in their plan without any asterisks. No modification needed.\n\n"
+            "Keep your replies concise, friendly, and practical (3-6 sentences). Always be specific, never generic. "
+            "NEVER use asterisks (*, **, ***) in any part of your text or JSON. "
             "Keep reasoning minimal and output the PROPOSED_MODIFICATION JSON as a single compact line immediately following your message."
             f"{med_guidance}"
         )
@@ -1735,6 +2170,13 @@ class PatientPlanService:
             ai_response_text = ai_response_text[:match.start()].strip()
         elif "PROPOSED_MODIFICATION:" in ai_response_text:
             ai_response_text = ai_response_text.split("PROPOSED_MODIFICATION:")[0].strip()
+
+        # Schedule conflict and boundary resolution
+        if proposed_mod:
+            proposed_mod = cls._resolve_schedule_conflicts(plan, proposed_mod)
+
+        # Strip all asterisks (*, **, ***) from assistant reply
+        ai_response_text = cls._clean_asterisks(ai_response_text)
 
         # Record any disliked item identified by LLM
         if proposed_mod:
@@ -1908,7 +2350,7 @@ class PatientPlanService:
                 session.add(new_item)
                 plan.items.append(new_item)
 
-                changes_summaries.append(f"Added **{new_item.title}** at **{new_item.time_of_day}**")
+                changes_summaries.append(f"Added '{new_item.title}' at {new_item.time_of_day}")
                 revision_items.append({
                     "action": "add",
                     "new_title": new_item.title,
@@ -1918,7 +2360,7 @@ class PatientPlanService:
             elif action_type == "remove":
                 if item:
                     item.is_active = False
-                    changes_summaries.append(f"Removed **{item.title}** from your daily schedule")
+                    changes_summaries.append(f"Removed '{item.title}' from your daily schedule")
                     revision_items.append({
                         "action": "remove",
                         "item_id": str(item.id),
@@ -1961,8 +2403,8 @@ class PatientPlanService:
                     if "calories_burned" in m:
                         item.calories_burned = int(m["calories_burned"]) if m["calories_burned"] is not None else None
 
-                    time_change = f" moved from **{old_time}** to **{item.time_of_day}**" if old_time != item.time_of_day else ""
-                    changes_summaries.append(f"**{item.title}**{time_change}")
+                    time_change = f" moved from {old_time} to {item.time_of_day}" if old_time != item.time_of_day else ""
+                    changes_summaries.append(f"'{item.title}'{time_change}")
                     revision_items.append({
                         "action": "modify",
                         "item_id": str(item.id),
@@ -1971,6 +2413,26 @@ class PatientPlanService:
                         "previous_time": old_time,
                         "new_time": item.time_of_day,
                     })
+
+        # Check if duration adjustment was requested / proposed
+        if mod_data.get("adjusted_duration_weeks"):
+            try:
+                new_weeks = int(mod_data["adjusted_duration_weeks"])
+                old_weeks = plan.target_duration_weeks
+                if new_weeks > 0 and new_weeks != old_weeks:
+                    plan.target_duration_weeks = new_weeks
+                    flag_modified(plan, "target_duration_weeks")
+                    if plan.goal:
+                        plan.goal.target_duration_weeks = new_weeks
+                        flag_modified(plan.goal, "target_duration_weeks")
+                    changes_summaries.append(f"Adjusted plan duration from {old_weeks} to {new_weeks} weeks")
+                    revision_items.append({
+                        "action": "duration_update",
+                        "old_duration_weeks": old_weeks,
+                        "new_duration_weeks": new_weeks,
+                    })
+            except (ValueError, TypeError):
+                pass
 
         # Recalculate daily nutrition summary with updated items
         updated_summary = cls._calculate_daily_nutrition_summary(plan)
@@ -2001,11 +2463,13 @@ class PatientPlanService:
             snapshot=snapshot,
         )
 
-        if len(item_mod_pairs) == 1:
+        if len(changes_summaries) == 1:
             reply_content = f"✅ Done! I've updated your daily plan: {changes_summaries[0]} has been applied."
         else:
             items_list = "\n".join(f"- {s}" for s in changes_summaries)
-            reply_content = f"✅ Done! I've updated your daily plan with all {len(item_mod_pairs)} adjustments:\n{items_list}\nhave been successfully applied."
+            reply_content = f"✅ Done! I've updated your daily plan with all {len(changes_summaries)} adjustments:\n{items_list}\nhave been successfully applied."
+
+        reply_content = cls._clean_asterisks(reply_content)
 
         reply = PatientPlanDiscussion(
             plan_id=plan.id,

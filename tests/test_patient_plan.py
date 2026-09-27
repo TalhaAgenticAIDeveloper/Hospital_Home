@@ -680,3 +680,172 @@ async def test_concrete_food_alternatives_and_parser_flexibility():
     assert "kcal" in desc
 
 
+@pytest.mark.asyncio
+async def test_intelligent_schedule_amendment_and_timeline_extension(client: AsyncClient):
+    """Verify intelligent collision resolution, sleep bounds enforcement, timeline extension on removals, and asterisk removal."""
+    from app.services.patient_plan_service import PatientPlanService
+    from app.models.patient_plan import (
+        PatientPlan,
+        PatientPlanItem,
+        PatientGoal,
+        PatientGoalQuestion,
+        PatientGoalAnswer,
+    )
+
+    patient = await create_and_login_patient(client, "smart_sched_patient@example.com")
+    headers = {"Authorization": f"Bearer {patient['access_token']}"}
+
+    # 1. Asterisk stripping test
+    dirty_text = "**Hello!** Here is your *new* routine:\n- **Walk**: 30 mins\n- **Dinner**: 20:00"
+    clean_text = PatientPlanService._clean_asterisks(dirty_text)
+    assert "*" not in clean_text
+    assert "**" not in clean_text
+    assert "Hello!" in clean_text
+    assert "Walk: 30 mins" in clean_text
+
+    # 2. Mock plan with awake window 07:00 - 23:00, dinner at 20:00
+    q_wake = PatientGoalQuestion(id=uuid.uuid4(), question_key="wake_up_time", question_text="Wake")
+    q_bed = PatientGoalQuestion(id=uuid.uuid4(), question_key="bed_time", question_text="Bed")
+    ans_wake = PatientGoalAnswer(id=uuid.uuid4(), question=q_wake, normalized_value="07:00", raw_input="07:00")
+    ans_bed = PatientGoalAnswer(id=uuid.uuid4(), question=q_bed, normalized_value="23:00", raw_input="23:00")
+
+    goal = PatientGoal(
+        id=uuid.uuid4(),
+        patient_id=uuid.uuid4(),
+        category="weight_management",
+        target_description="Lose weight",
+        target_duration_weeks=4,
+        answers=[ans_wake, ans_bed]
+    )
+    plan = PatientPlan(
+        id=uuid.uuid4(),
+        patient_id=goal.patient_id,
+        goal_id=goal.id,
+        goal=goal,
+        title="Test Weight Loss Plan",
+        target_duration_weeks=4,
+        status="ready",
+        items=[
+            PatientPlanItem(id=uuid.uuid4(), time_of_day="07:30", category="morning_routine", title="Morning Stretch", is_active=True),
+            PatientPlanItem(id=uuid.uuid4(), time_of_day="08:30", category="breakfast", title="Oatmeal", is_active=True),
+            PatientPlanItem(id=uuid.uuid4(), time_of_day="13:00", category="lunch", title="Grilled Chicken Lunch", is_active=True),
+            PatientPlanItem(id=uuid.uuid4(), time_of_day="20:00", category="dinner", title="Dinner Salad", is_active=True),
+        ]
+    )
+
+    # 3. Test Conflict Resolver: Adding walk at exactly 20:00 (dinner time collision)
+    mod_collision = {
+        "action_type": "add",
+        "proposed_title": "Evening Brisk Walk",
+        "proposed_time": "20:00",
+        "proposed_category": "workout",
+        "proposed_description": "30 mins walking"
+    }
+    resolved = PatientPlanService._resolve_schedule_conflicts(plan, mod_collision)
+    # The resolved time must NOT be 20:00 (which is dinner)
+    assert resolved["proposed_time"] != "20:00"
+    # Should be spaced away from dinner (e.g. 18:30 before dinner or after dinner)
+    resolved_time = resolved["proposed_time"]
+    assert resolved_time in ["18:30", "19:00", "20:45", "21:00"]
+
+    # 4. Test Sleep Window Resolver: Adding activity at 03:00 (during sleep hours)
+    mod_sleep = {
+        "action_type": "add",
+        "proposed_title": "Deep Breathing",
+        "proposed_time": "03:00",
+        "proposed_category": "lifestyle",
+        "proposed_description": "Relaxation"
+    }
+    resolved_sleep = PatientPlanService._resolve_schedule_conflicts(plan, mod_sleep)
+    # Must be shifted into awake window (>= 07:00 and <= 23:00)
+    hour = int(resolved_sleep["proposed_time"].split(":")[0])
+    assert 7 <= hour <= 23
+
+    # 5. Test Item Removal and Timeline Extension Calculation
+    workout_item = PatientPlanItem(id=uuid.uuid4(), time_of_day="18:00", category="workout", title="30 min Evening Cardio", is_active=True)
+    plan.items.append(workout_item)
+    mod_remove = {
+        "action_type": "remove",
+        "original_title": "30 min Evening Cardio",
+        "item_id": str(workout_item.id)
+    }
+    resolved_remove = PatientPlanService._resolve_schedule_conflicts(plan, mod_remove)
+    # Must recommend duration extension from 4 to 6 weeks
+    assert resolved_remove.get("adjusted_duration_weeks") == 6
+    assert "to 6 weeks" in resolved_remove["impact_summary"]
+
+    # 6. Test End-to-End Chat & Apply with Duration Extension
+    goal_resp = await client.post(
+        "/api/v1/patient/plans/goals",
+        json={
+            "title": "Timeline Extension Goal",
+            "category": "weight_management",
+            "target_description": "Target weight loss over 4 weeks",
+            "timezone": "Asia/Karachi",
+            "target_duration_weeks": 4,
+            "answers": [
+                {"question_id": "wake_up_time", "answer": "07:00 AM"},
+                {"question_id": "bed_time", "answer": "11:00 PM"},
+                {"question_id": "medical_conditions", "answer": "None"}
+            ]
+        },
+        headers=headers,
+    )
+    assert goal_resp.status_code == 201
+    g_id = goal_resp.json()["id"]
+
+    with patch(
+        "app.services.patient_plan_service.PatientPlanService._call_groq_api",
+        return_value=VALID_MOCK_PLAN_JSON,
+    ):
+        gen_resp = await client.post(f"/api/v1/patient/plans/goals/{g_id}/generate", headers=headers)
+        assert gen_resp.status_code == 200
+        real_plan = gen_resp.json()
+        p_id = real_plan["id"]
+        assert real_plan["target_duration_weeks"] == 4
+
+        # Ask to remove the workout
+        remove_llm_reply = (
+            "I can remove the evening walk. Since this lowers your daily calorie burn, "
+            "it will take about 6 weeks instead of 4 weeks to reach your goal. "
+            "Kya aap duration 6 weeks karna chahenge?\n\n"
+            'PROPOSED_MODIFICATION: {"action_type":"remove","original_title":"Brisk Evening Walk","adjusted_duration_weeks":6}'
+        )
+        with patch(
+            "app.services.patient_plan_service.PatientPlanService._call_groq_api",
+            return_value=remove_llm_reply,
+        ):
+            chat_resp = await client.post(
+                f"/api/v1/patient/plans/{p_id}/chat",
+                json={"message": "remove evening walk"},
+                headers=headers,
+            )
+            assert chat_resp.status_code == 200
+            chat_data = chat_resp.json()
+            assert chat_data["proposed_modifications"] is not None
+            assert chat_data["proposed_modifications"]["action_type"] == "remove"
+            assert chat_data["proposed_modifications"]["adjusted_duration_weeks"] == 6
+            # Assert no asterisks in chat response
+            assert "*" not in chat_data["content"]
+
+        # Accept the modification
+        apply_resp = await client.post(
+            f"/api/v1/patient/plans/{p_id}/modifications/apply",
+            json={"action": "accept", "expected_version": 1, "modification": chat_data["proposed_modifications"]},
+            headers=headers,
+        )
+        assert apply_resp.status_code == 200
+        applied_plan = apply_resp.json()
+        # Verify plan duration is updated to 6 weeks!
+        assert applied_plan["target_duration_weeks"] == 6
+        assert applied_plan["version"] == 2
+        # Verify evening walk was deactivated
+        assert not any(i["title"] == "Brisk Evening Walk" for i in applied_plan["items"] if i["is_active"])
+
+        # Verify underlying goal duration was also updated to 6 weeks
+        curr_goal_resp = await client.get("/api/v1/patient/plans/goals/current", headers=headers)
+        assert curr_goal_resp.status_code == 200
+        assert curr_goal_resp.json()["target_duration_weeks"] == 6
+
+
+
