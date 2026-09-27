@@ -925,4 +925,64 @@ async def test_plan_items_chronological_ordering_initial_and_after_modification(
     assert active_indices == [0, 1, 2, 3, 4]
 
 
+def test_normalize_item_category_intelligent_resolution():
+    """Verify intelligent category resolution for schedule items based on time, title, and macros."""
+    from app.services.patient_plan_service import PatientPlanService
+
+    # 1. 08:30 Peanut Butter Banana Smoothie mistakenly labelled as evening_activity -> Breakfast
+    cat1 = PatientPlanService.normalize_item_category(
+        category="evening_activity",
+        time_of_day="08:30",
+        title="Peanut Butter Banana Smoothie",
+        description="Blend 250ml milk with banana and peanut butter",
+        calories=470,
+    )
+    assert cat1 == "breakfast"
+
+    # 2. 12:00 Chickpea & Quinoa Salad -> Lunch
+    cat2 = PatientPlanService.normalize_item_category(
+        category="lunch",
+        time_of_day="12:00",
+        title="Chickpea & Quinoa Salad",
+        calories=600,
+    )
+    assert cat2 == "lunch"
+
+    # 3. 15:30 Whole-Wheat Pita with Hummus & Apple mistakenly labelled as evening_activity -> Afternoon Snack
+    cat3 = PatientPlanService.normalize_item_category(
+        category="evening_activity",
+        time_of_day="15:30",
+        title="Whole-Wheat Pita with Hummus & Apple",
+        calories=235,
+    )
+    assert cat3 == "afternoon_snack"
+
+    # 4. 18:00 Brisk Evening Walk -> Workout
+    cat4 = PatientPlanService.normalize_item_category(
+        category="evening_activity",
+        time_of_day="18:00",
+        title="Brisk Evening Walk",
+        calories_burned=220,
+    )
+    assert cat4 == "workout"
+
+    # 5. 20:00 Light Vegetable Soup & Lentils -> Dinner
+    cat5 = PatientPlanService.normalize_item_category(
+        category="dinner",
+        time_of_day="20:00",
+        title="Light Vegetable Soup & Lentils",
+        calories=350,
+    )
+    assert cat5 == "dinner"
+
+    # 6. 22:30 Wind-Down & Screen Dimming -> Sleep Routine
+    cat6 = PatientPlanService.normalize_item_category(
+        category="sleep_routine",
+        time_of_day="22:30",
+        title="Wind-Down & Screen Dimming",
+    )
+    assert cat6 == "sleep_routine"
+
+
+
 

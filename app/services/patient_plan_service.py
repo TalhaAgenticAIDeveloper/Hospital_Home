@@ -832,6 +832,16 @@ class PatientPlanService:
             "- For meals: mention calories, protein, and how it contributes to a caloric surplus (for weight gain) or deficit (for weight loss), e.g., 'Provides 450 kcal and 25g protein, creating a healthy +300 kcal surplus to support lean muscle gain' or 'Provides 280 kcal and 20g protein, creating a 350 kcal deficit to promote gradual fat loss while keeping you energized'.\n"
             "- For exercises: mention estimated calories burned and expected loss/burn impact, e.g., 'Burns approx 220 kcal, directly contributing to your daily fat loss deficit'.\n\n"
             "You MUST also provide a 'daily_nutrition_summary' object with aggregate totals.\n\n"
+            "CATEGORY RULES:\n"
+            "- Use 'breakfast' for morning meals or smoothies (07:00-09:30).\n"
+            "- Use 'morning_snack' for mid-morning snacks or fruits (10:00-11:30).\n"
+            "- Use 'lunch' for midday meals (12:00-14:00).\n"
+            "- Use 'afternoon_snack' for afternoon snacks, shakes, or fruit (15:00-17:30).\n"
+            "- Use 'dinner' for evening dinner meals (18:30-21:00).\n"
+            "- Use 'evening_snack' for late-evening or bedtime light snacks (21:00+).\n"
+            "- Use 'workout' for physical exercise, walking, gym, or sports.\n"
+            "- Use 'morning_routine', 'sleep_routine', or 'hydration' for non-food wellness activities.\n"
+            "- NEVER assign 'evening_activity' or evening labels to morning or afternoon items!\n\n"
             "JSON SCHEMA REQUIREMENT:\n"
             "{\n"
             '  "title": "Title of the Personalized Plan",\n'
@@ -843,7 +853,7 @@ class PatientPlanService:
             '  "schedule_items": [\n'
             '    {\n'
             '      "time_of_day": "HH:MM",\n'
-            '      "category": "morning_routine | breakfast | workout | lunch | evening_activity | dinner | sleep_routine",\n'
+            '      "category": "morning_routine | breakfast | morning_snack | lunch | afternoon_snack | workout | dinner | evening_snack | sleep_routine | hydration",\n'
             '      "title": "Specific dish or activity with portion (e.g. 2 Boiled Eggs with Whole-Wheat Toast & Spinach)",\n'
             '      "description": "Exact ingredients, portions, preparation, and goal/caloric details",\n'
             '      "calories": 350,\n'
@@ -947,7 +957,14 @@ class PatientPlanService:
             items = [
                 PatientPlanItem(
                     time_of_day=item.time_of_day,
-                    category=item.category,
+                    category=cls.normalize_item_category(
+                        category=item.category,
+                        time_of_day=item.time_of_day,
+                        title=item.title,
+                        description=item.description,
+                        calories=item.calories,
+                        calories_burned=item.calories_burned,
+                    ),
                     title=PlanValidator.sanitize_text(item.title, 255),
                     description=PlanValidator.sanitize_text(item.description, 1000),
                     order_index=idx,
@@ -1053,6 +1070,100 @@ class PatientPlanService:
         for idx, item in enumerate(plan.items):
             item.order_index = idx
             flag_modified(item, "order_index")
+
+    @classmethod
+    def normalize_item_category(
+        cls,
+        category: Optional[str],
+        time_of_day: Optional[str],
+        title: str = "",
+        description: str = "",
+        calories: Optional[int] = None,
+        calories_burned: Optional[int] = None,
+    ) -> str:
+        """
+        Intelligently normalizes item category based on time of day, food/exercise content,
+        and title/description to prevent nonsensical labels (e.g. 'evening_activity' at 8:30 AM).
+        """
+        cat_lower = (category or "").strip().lower()
+        title_lower = (title or "").lower()
+        desc_lower = (description or "").lower()
+
+        minutes = cls._parse_time_minutes(time_of_day)
+
+        # 1. Workout / Exercise detection
+        exercise_keywords = (
+            "walk", "run", "jog", "workout", "exercise", "stretch", "mobility",
+            "yoga", "hiit", "gym", "cardio", "pilates", "swimming", "cycling", "pushup"
+        )
+        is_exercise = (
+            (calories_burned is not None and calories_burned > 0) or
+            any(k in title_lower for k in exercise_keywords)
+        )
+        if is_exercise:
+            return "workout"
+
+        # 2. Hydration detection
+        if ("water" in title_lower or "hydrate" in title_lower or "hydration" in title_lower) and (calories is None or calories < 50):
+            return "hydration"
+
+        # 3. Sleep / Wind-down routine detection
+        sleep_keywords = ("sleep", "bed", "wind-down", "wind down", "dimming", "relax", "meditation")
+        if any(k in title_lower for k in sleep_keywords) and (calories is None or calories < 50):
+            return "sleep_routine"
+
+        # 4. Check if it's a food / meal / snack item
+        has_calories = calories is not None and calories > 0
+        food_keywords = (
+            "smoothie", "breakfast", "lunch", "dinner", "snack", "salad", "oats", "oatmeal",
+            "egg", "bread", "toast", "pita", "hummus", "chicken", "meat", "rice", "curry",
+            "soup", "yogurt", "shake", "apple", "banana", "fruit", "nuts", "protein", "meal"
+        )
+        is_food = has_calories or any(k in title_lower for k in food_keywords)
+
+        if is_food:
+            if minutes is not None:
+                if minutes < 600:  # Before 10:00 AM
+                    return "breakfast"
+                elif minutes < 705:  # 10:00 AM to 11:45 AM
+                    return "morning_snack"
+                elif minutes < 885:  # 11:45 AM to 2:45 PM
+                    return "lunch"
+                elif minutes < 1080:  # 2:45 PM to 6:00 PM
+                    return "afternoon_snack"
+                elif minutes < 1290:  # 6:00 PM to 9:30 PM
+                    return "dinner"
+                else:  # After 9:30 PM
+                    return "evening_snack"
+            else:
+                if "breakfast" in title_lower or "morning" in title_lower:
+                    return "breakfast"
+                elif "lunch" in title_lower:
+                    return "lunch"
+                elif "dinner" in title_lower:
+                    return "dinner"
+                return "afternoon_snack"
+
+        # 5. Non-food lifestyle routines based on time
+        if minutes is not None:
+            if minutes < 660:  # Before 11:00 AM
+                return "morning_routine"
+            elif minutes < 1080:  # 11:00 AM to 6:00 PM
+                return "midday_routine"
+            elif minutes < 1290:  # 6:00 PM to 9:30 PM
+                return "evening_routine"
+            else:
+                return "sleep_routine"
+
+        # 6. Fallback if category was already clean
+        if cat_lower in {
+            "breakfast", "morning_snack", "lunch", "afternoon_snack",
+            "dinner", "evening_snack", "workout", "sleep_routine",
+            "morning_routine", "evening_routine", "hydration"
+        }:
+            return cat_lower
+
+        return "morning_routine" if (minutes and minutes < 720) else "evening_routine"
 
     @classmethod
     def _get_patient_schedule_boundaries(cls, plan: PatientPlan) -> Tuple[str, str, int, int]:
@@ -2340,7 +2451,11 @@ class PatientPlanService:
         pending_disc: Optional[PatientPlanDiscussion] = None,
     ) -> PatientPlanDiscussion:
         """Internal helper to apply approved modifications (swap, add, remove, reschedule) with atomic versioning."""
-        valid_categories = {"morning_routine", "breakfast", "lunch", "evening_activity", "dinner", "night_routine", "snack", "exercise", "hydration"}
+        valid_categories = {
+            "morning_routine", "breakfast", "morning_snack", "lunch", "afternoon_snack",
+            "dinner", "evening_snack", "night_routine", "sleep_routine", "snack",
+            "workout", "exercise", "hydration", "midday_routine", "evening_routine"
+        }
         changes_summaries = []
         revision_items = []
 
@@ -2354,9 +2469,14 @@ class PatientPlanService:
 
             if action_type == "add":
                 # Create a new scheduled plan item
-                proposed_cat = m.get("proposed_category", "general")
-                if proposed_cat not in valid_categories:
-                    proposed_cat = "snack"
+                proposed_cat = cls.normalize_item_category(
+                    category=m.get("proposed_category"),
+                    time_of_day=m.get("proposed_time") or "12:00",
+                    title=m.get("proposed_title") or "New Activity",
+                    description=m.get("proposed_description") or "",
+                    calories=int(m["calories"]) if m.get("calories") is not None else None,
+                    calories_burned=int(m["calories_burned"]) if m.get("calories_burned") is not None else None,
+                )
 
                 new_item = PatientPlanItem(
                     plan_id=plan.id,
@@ -2411,9 +2531,15 @@ class PatientPlanService:
                         logger.info("Updating item time: %s -> %s", old_time, proposed_time)
 
                     proposed_category = m.get("proposed_category")
-                    if proposed_category and proposed_category.lower() in valid_categories:
-                        item.category = proposed_category.lower()
-                        logger.info("Updating item category: %s -> %s", old_category, proposed_category)
+                    item.category = cls.normalize_item_category(
+                        category=proposed_category or item.category,
+                        time_of_day=item.time_of_day,
+                        title=item.title,
+                        description=item.description,
+                        calories=int(m["calories"]) if "calories" in m and m["calories"] is not None else item.calories,
+                        calories_burned=int(m["calories_burned"]) if "calories_burned" in m and m["calories_burned"] is not None else item.calories_burned,
+                    )
+                    logger.info("Updating item category: %s -> %s", old_category, item.category)
 
                     # Update nutritional metadata if present in modification
                     if "calories" in m:
@@ -2979,7 +3105,14 @@ class PatientPlanService:
             PlanItemSchema(
                 id=item.id,
                 time_of_day=item.time_of_day,
-                category=item.category,
+                category=cls.normalize_item_category(
+                    category=item.category,
+                    time_of_day=item.time_of_day,
+                    title=item.title,
+                    description=item.description,
+                    calories=item.calories,
+                    calories_burned=item.calories_burned,
+                ),
                 title=item.title,
                 description=item.description,
                 order_index=item.order_index,

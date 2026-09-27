@@ -703,7 +703,10 @@ class PlanValidator:
                 errors.append(f"Plan contains unrealistic or unsafe claim: '{phrase}'.")
 
         # 5. Nutritional data sanity checks
-        food_categories = {"breakfast", "lunch", "dinner", "snack", "evening_activity"}
+        food_categories = {
+            "breakfast", "lunch", "dinner", "snack",
+            "morning_snack", "afternoon_snack", "evening_snack", "evening_activity",
+        }
         exercise_categories = {"workout", "exercise"}
 
         for item in payload.schedule_items:
