@@ -14,7 +14,7 @@ import asyncio
 import base64
 import time
 import uuid
-from typing import Any, Callable, Coroutine, Optional
+from typing import Any, Callable, Coroutine, Optional, Tuple
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -49,11 +49,13 @@ class GeminiLiveSession:
         self.on_transcript = on_transcript   # async callback(segment_dict)
 
         self._session = None
+        self._cm = None
         self._client = None
         self._receive_task: Optional[asyncio.Task] = None
         self._connected = False
         self._session_start_time: float = 0.0
         self._chunk_count = 0
+        self._last_interim_text: Optional[str] = None
 
     async def connect(self) -> bool:
         """
@@ -87,10 +89,12 @@ class GeminiLiveSession:
                 f"room={self.room_id} role={self.role} user={self.user_id}"
             )
 
-            self._session = await self._client.aio.live.connect(
+            # live.connect returns an AsyncGeneratorContextManager; enter it to get session
+            self._cm = self._client.aio.live.connect(
                 model=model,
                 config=config,
             )
+            self._session = await self._cm.__aenter__()
 
             # The context manager returned a session object we can use
             self._connected = True
@@ -165,33 +169,45 @@ class GeminiLiveSession:
                         if not self._connected:
                             break
 
-                        text = self._extract_text(response)
-                        if text and text.strip():
-                            elapsed = time.time() - self._session_start_time
-                            segment = {
-                                "id": f"{self.role}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
-                                "speaker": self.role,
-                                "participant": self.role,
-                                "speakerName": self.speaker_name,
-                                "text": text.strip(),
-                                "is_final": True,
-                                "timestamp": round(elapsed, 2),
-                                "start_time": round(elapsed, 2),
-                                "lang": "auto",
-                            }
+                        result = self._extract_text(response)
+                        if result is None:
+                            continue
 
-                            logger.info(
-                                f"[GEMINI_LIVE] Transcription: room={self.room_id} "
-                                f"[{self.role.upper()}] \"{text.strip()}\" "
-                                f"at {elapsed:.1f}s"
+                        text, is_final = result
+                        if not text or not text.strip():
+                            continue
+
+                        if is_final:
+                            self._last_interim_text = None
+                        else:
+                            self._last_interim_text = text.strip()
+
+                        elapsed = time.time() - self._session_start_time
+                        segment = {
+                            "id": f"{self.role}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
+                            "speaker": self.role,
+                            "participant": self.role,
+                            "speakerName": self.speaker_name,
+                            "text": text.strip(),
+                            "is_final": is_final,
+                            "timestamp": round(elapsed, 2),
+                            "start_time": round(elapsed, 2),
+                            "lang": "auto",
+                        }
+
+                        log_tag = "FINAL" if is_final else "INTERIM"
+                        logger.info(
+                            f"[GEMINI_LIVE] Transcription [{log_tag}]: room={self.room_id} "
+                            f"[{self.role.upper()}] \"{text.strip()}\" "
+                            f"at {elapsed:.1f}s"
+                        )
+
+                        try:
+                            await self.on_transcript(segment)
+                        except Exception as cb_err:
+                            logger.warning(
+                                f"[GEMINI_LIVE] Callback error: {cb_err}"
                             )
-
-                            try:
-                                await self.on_transcript(segment)
-                            except Exception as cb_err:
-                                logger.warning(
-                                    f"[GEMINI_LIVE] Callback error: {cb_err}"
-                                )
 
                 except StopAsyncIteration:
                     # Session receive iterator ended — Gemini closed the stream
@@ -210,6 +226,27 @@ class GeminiLiveSession:
                     )
                     await asyncio.sleep(0.5)
 
+            # Flush any uncommitted interim segment as final before exiting
+            if self._last_interim_text:
+                pending_text = self._last_interim_text
+                self._last_interim_text = None
+                elapsed = time.time() - self._session_start_time
+                segment = {
+                    "id": f"{self.role}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
+                    "speaker": self.role,
+                    "participant": self.role,
+                    "speakerName": self.speaker_name,
+                    "text": pending_text,
+                    "is_final": True,
+                    "timestamp": round(elapsed, 2),
+                    "start_time": round(elapsed, 2),
+                    "lang": "auto",
+                }
+                try:
+                    await self.on_transcript(segment)
+                except Exception as cb_err:
+                    logger.warning(f"[GEMINI_LIVE] Callback flush error: {cb_err}")
+
         except asyncio.CancelledError:
             logger.debug(
                 f"[GEMINI_LIVE] Receive loop cancelled: room={self.room_id} "
@@ -223,28 +260,41 @@ class GeminiLiveSession:
             )
 
     @staticmethod
-    def _extract_text(response: Any) -> Optional[str]:
+    def _extract_text(response: Any) -> Optional[Tuple[str, bool]]:
         """
         Extract transcription text from a Gemini Live API response.
 
+        Returns a tuple (text, is_final) where:
+        - text: the transcribed text
+        - is_final: True if this is a committed/final transcription, False for interim
+
+        Returns None if no text could be extracted.
+
         The response structure can vary:
-        - response.server_content.input_transcription.text  (what user said)
-        - response.server_content.model_turn.parts[0].text  (model output)
+        - response.server_content.input_transcription.text       (final transcription)
+        - response.server_content.interim_input_transcription.text (partial/interim)
+        - response.server_content.model_turn.parts[0].text       (model output)
         - response.text  (convenience accessor)
         - response.data  (raw string data)
         """
         try:
-            # Primary: input audio transcription (what the user said)
             sc = getattr(response, "server_content", None)
             if sc:
-                # Input transcription (user's speech → text)
+                # 1. Final input transcription (user's speech → text, committed)
                 it = getattr(sc, "input_transcription", None)
                 if it:
                     text = getattr(it, "text", None)
                     if text and text.strip():
-                        return text.strip()
+                        return (text.strip(), True)
 
-                # Model turn (model's text response)
+                # 2. Interim input transcription (partial, real-time preview)
+                iit = getattr(sc, "interim_input_transcription", None)
+                if iit:
+                    text = getattr(iit, "text", None)
+                    if text and text.strip():
+                        return (text.strip(), False)
+
+                # 3. Model turn (model's text response — treat as final)
                 mt = getattr(sc, "model_turn", None)
                 if mt:
                     parts = getattr(mt, "parts", None)
@@ -252,16 +302,19 @@ class GeminiLiveSession:
                         for part in parts:
                             text = getattr(part, "text", None)
                             if text and text.strip():
-                                return text.strip()
+                                return (text.strip(), True)
 
-            # Convenience accessors
-            text = getattr(response, "text", None)
-            if text and text.strip():
-                return text.strip()
+            # 4. Convenience accessors (treat as final)
+            try:
+                text = getattr(response, "text", None)
+                if text and text.strip():
+                    return (text.strip(), True)
+            except Exception:
+                pass
 
             data = getattr(response, "data", None)
             if data and isinstance(data, str) and data.strip():
-                return data.strip()
+                return (data.strip(), True)
 
         except Exception:
             pass
@@ -281,7 +334,7 @@ class GeminiLiveSession:
                 pass
             self._receive_task = None
 
-        # Close the Gemini session
+        # Close the Gemini session and context manager
         if self._session:
             try:
                 await self._session.close()
@@ -290,6 +343,15 @@ class GeminiLiveSession:
                     f"[GEMINI_LIVE] Session close notice: {e}"
                 )
             self._session = None
+
+        if self._cm:
+            try:
+                await self._cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.debug(
+                    f"[GEMINI_LIVE] Context manager exit notice: {e}"
+                )
+            self._cm = None
 
         elapsed = time.time() - self._session_start_time if self._session_start_time else 0
         logger.info(

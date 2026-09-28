@@ -85,7 +85,7 @@ Return valid JSON matching this exact schema. No markdown, no commentary, no exp
   "follow_ups": [{"follow_up_date": null, "follow_up_period": "1 week", "instructions": "..."}],
   "doctor_instructions": [{"category": "diet|activity|hydration|rest|monitoring|precaution|lifestyle|other", "instruction_text": "..."}],
   "uncertain_items": [{"field": "medication|diagnosis|symptom|test", "extracted_value": "...", "confidence": 0.3, "reason": "...", "evidence": null}],
-  "consultation_summary": "Brief 2-3 sentence summary of the consultation."
+  "consultation_summary": "Comprehensive summary of EVERYTHING discussed during the consultation — include greetings, personal talk, the patient's complaints, what the doctor said, any medications discussed, diet/exercise/lifestyle advice, follow-up instructions, and any other topics covered. If the conversation was casual or non-medical, still summarize what was discussed. Write in the same language used in the consultation (English, Urdu, or mixed). This should be at least 3-5 sentences covering the entire conversation from start to finish."
 }"""
 
 

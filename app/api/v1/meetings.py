@@ -473,8 +473,9 @@ async def gemini_live_transcription_websocket(
         }
         await signaling_manager.broadcast(room_id, broadcast_data)
 
-        # Also persist to in-memory transcript buffer (same as before)
-        signaling_manager._append_transcript_segment(room_id, segment)
+        # Only persist committed/final segments to the transcript buffer
+        if segment.get("is_final", True):
+            signaling_manager._append_transcript_segment(room_id, segment)
 
     # 5. Create Gemini Live session
     gemini_session = await gemini_transcription_manager.create_session(
