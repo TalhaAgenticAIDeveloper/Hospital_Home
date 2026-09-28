@@ -8,6 +8,7 @@ Provides:
 - Speaker-labeled structured transcript generation.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -194,13 +195,23 @@ class TranscriptionService:
         """
         from app.core.database import async_session_maker
 
+        logger.info(f"[PIPELINE_START] meeting_id={meeting_id} — Transcription pipeline starting")
+
         async with async_session_maker() as session:
             try:
                 transcript = await ConsultationAIRepository.get_transcript_by_meeting_id(
                     session, meeting_id
                 )
                 if not transcript:
+                    logger.warning(f"[PIPELINE_ABORT] meeting_id={meeting_id} — No transcript record found in DB, aborting")
                     return
+
+                logger.info(
+                    f"[PIPELINE_STEP_1] meeting_id={meeting_id} — Transcript record loaded. "
+                    f"doctor_audio={transcript.doctor_audio_path or 'NONE'} "
+                    f"patient_audio={transcript.patient_audio_path or 'NONE'} "
+                    f"current_status={transcript.transcription_status}"
+                )
 
                 start_time = time.time()
 
@@ -209,33 +220,60 @@ class TranscriptionService:
 
                 # Transcribe doctor audio
                 if transcript.doctor_audio_path and os.path.exists(transcript.doctor_audio_path):
+                    file_size = os.path.getsize(transcript.doctor_audio_path)
+                    logger.info(
+                        f"[PIPELINE_STEP_2a] meeting_id={meeting_id} — Calling Whisper API for DOCTOR audio. "
+                        f"path={transcript.doctor_audio_path} size_bytes={file_size}"
+                    )
                     try:
                         doctor_result = await cls._call_whisper_api(transcript.doctor_audio_path)
                         transcript.doctor_raw_transcription = json.dumps(doctor_result, ensure_ascii=False)
                         doctor_segments = cls._parse_whisper_segments(doctor_result, "doctor")
+                        logger.info(
+                            f"[PIPELINE_STEP_2a_DONE] meeting_id={meeting_id} — Doctor Whisper done. "
+                            f"segments={len(doctor_segments)} language={doctor_result.get('language', 'unknown')}"
+                        )
                     except Exception as e:
-                        logger.error(f"Doctor transcription failed: {e}")
+                        logger.error(f"[PIPELINE_FAIL] meeting_id={meeting_id} — Doctor transcription FAILED: {e}", exc_info=True)
                         transcript.transcription_status = "failed"
                         transcript.error_message = f"Doctor audio transcription failed: {str(e)[:500]}"
                         await session.commit()
                         return
+                else:
+                    logger.info(f"[PIPELINE_STEP_2a_SKIP] meeting_id={meeting_id} — No doctor audio file found, skipping")
 
                 # Transcribe patient audio
                 if transcript.patient_audio_path and os.path.exists(transcript.patient_audio_path):
+                    file_size = os.path.getsize(transcript.patient_audio_path)
+                    logger.info(
+                        f"[PIPELINE_STEP_2b] meeting_id={meeting_id} — Calling Whisper API for PATIENT audio. "
+                        f"path={transcript.patient_audio_path} size_bytes={file_size}"
+                    )
                     try:
                         patient_result = await cls._call_whisper_api(transcript.patient_audio_path)
                         transcript.patient_raw_transcription = json.dumps(patient_result, ensure_ascii=False)
                         patient_segments = cls._parse_whisper_segments(patient_result, "patient")
+                        logger.info(
+                            f"[PIPELINE_STEP_2b_DONE] meeting_id={meeting_id} — Patient Whisper done. "
+                            f"segments={len(patient_segments)} language={patient_result.get('language', 'unknown')}"
+                        )
                     except Exception as e:
-                        logger.error(f"Patient transcription failed: {e}")
+                        logger.error(f"[PIPELINE_FAIL] meeting_id={meeting_id} — Patient transcription FAILED: {e}", exc_info=True)
                         transcript.transcription_status = "failed"
                         transcript.error_message = f"Patient audio transcription failed: {str(e)[:500]}"
                         await session.commit()
                         return
+                else:
+                    logger.info(f"[PIPELINE_STEP_2b_SKIP] meeting_id={meeting_id} — No patient audio file found, skipping")
 
                 # Interleave by timestamp
                 interleaved = cls._interleave_transcripts(doctor_segments, patient_segments)
                 transcript.structured_transcript = interleaved
+
+                logger.info(
+                    f"[PIPELINE_STEP_3] meeting_id={meeting_id} — Interleaved transcript built. "
+                    f"total_segments={len(interleaved)}"
+                )
 
                 # Generate human-readable full text
                 full_text = cls._generate_full_text(interleaved)
@@ -256,15 +294,78 @@ class TranscriptionService:
                 await session.commit()
 
                 logger.info(
-                    f"transcription_completed: meeting_id={meeting_id} "
+                    f"[PIPELINE_STEP_4_COMPLETE] meeting_id={meeting_id} — Transcription pipeline COMPLETED. "
                     f"doctor_segments={len(doctor_segments)} "
                     f"patient_segments={len(patient_segments)} "
                     f"total_segments={len(interleaved)} "
+                    f"full_text_length={len(full_text)} "
                     f"elapsed_ms={elapsed_ms}"
                 )
 
+                # ── Auto-chain AI Clinical Extraction ────────────────────────
+                # If audio was transcribed with speech segments, automatically trigger
+                # the clinical extraction pipeline in the background so the draft prescription
+                # is ready for the doctor without requiring manual clicks.
+                if meeting and interleaved and len(interleaved) > 0:
+                    try:
+                        from app.models.consultation_ai_extraction import ConsultationAIExtraction
+                        from app.services.consultation_ai_service import ConsultationAIService
+
+                        # Check if extraction was already generated or is active
+                        existing_extraction = await ConsultationAIRepository.get_latest_extraction(
+                            session, meeting_id
+                        )
+                        if not existing_extraction or existing_extraction.status in ("failed", "cancelled"):
+                            logger.info(
+                                f"[PIPELINE_STEP_5a] meeting_id={meeting_id} — Creating extraction record for auto-chain. "
+                                f"existing_extraction={'NONE' if not existing_extraction else existing_extraction.status}"
+                            )
+                            next_version = await ConsultationAIRepository.get_next_extraction_version(
+                                session, meeting_id
+                            )
+                            extraction = ConsultationAIExtraction(
+                                meeting_id=meeting_id,
+                                transcript_id=transcript.id,
+                                doctor_id=meeting.doctor_id,
+                                patient_id=meeting.patient_id,
+                                version=next_version,
+                                status="processing",
+                                llm_model_used=settings.GROQ_MODEL,
+                            )
+                            extraction = await ConsultationAIRepository.create_extraction(session, extraction)
+                            await session.commit()
+
+                            logger.info(
+                                f"[PIPELINE_STEP_5b] meeting_id={meeting_id} — Auto-chain extraction INITIATED. "
+                                f"extraction_id={extraction.id} version={next_version} — "
+                                f"Launching background LLM task now"
+                            )
+
+                            # Run extraction LLM pipeline in the background
+                            # IMPORTANT: Do NOT await — the LLM call can take 90s+
+                            # with retries, which would block the transcription
+                            # pipeline and cause the frontend to appear stuck.
+                            asyncio.create_task(
+                                ConsultationAIService.run_extraction_pipeline(meeting_id, extraction.id)
+                            )
+                        else:
+                            logger.info(
+                                f"[PIPELINE_STEP_5_SKIP] meeting_id={meeting_id} — Extraction already exists "
+                                f"(status={existing_extraction.status}), skipping auto-chain"
+                            )
+                    except Exception as auto_ex_err:
+                        logger.error(
+                            f"[PIPELINE_STEP_5_ERROR] meeting_id={meeting_id} — Auto-chain extraction setup FAILED: {auto_ex_err}",
+                            exc_info=True,
+                        )
+                else:
+                    logger.info(
+                        f"[PIPELINE_STEP_5_NO_SEGMENTS] meeting_id={meeting_id} — "
+                        f"No interleaved segments ({len(interleaved) if interleaved else 0}), skipping auto-chain extraction"
+                    )
+
             except Exception as e:
-                logger.error(f"Transcription pipeline error for meeting {meeting_id}: {e}")
+                logger.error(f"[PIPELINE_FATAL_ERROR] meeting_id={meeting_id} — Pipeline CRASHED: {e}", exc_info=True)
                 try:
                     transcript = await ConsultationAIRepository.get_transcript_by_meeting_id(
                         session, meeting_id
@@ -289,6 +390,7 @@ class TranscriptionService:
         """
         api_key = settings.groq_api_key
         if not api_key:
+            logger.error(f"[WHISPER_ERROR] No Groq API key configured! Check GROQ_API or GROQ_API_KEY env var.")
             raise ValidationError("Groq API key is not configured.")
 
         headers = {
@@ -309,46 +411,18 @@ class TranscriptionService:
 
         timeout = settings.AI_WHISPER_TIMEOUT_SECONDS
 
-        # Retry once on timeout or rate limit
-        last_error = None
-        for attempt in range(2):
-            try:
-                files = {
-                    "file": (filename, audio_bytes),
-                }
-                async with httpx.AsyncClient(timeout=float(timeout)) as client:
-                    response = await client.post(
-                        GROQ_WHISPER_URL,
-                        headers=headers,
-                        files=files,
-                        data=data,
-                    )
+        from app.services.groq_queue_service import GroqPriority, groq_queue
 
-                if response.status_code == 429:
-                    wait_time = 2 ** (attempt + 1)
-                    logger.warning(f"Whisper rate limit hit, waiting {wait_time}s")
-                    import asyncio
-                    await asyncio.sleep(wait_time)
-                    continue
-
-                if response.status_code != 200:
-                    err_text = response.text[:500]
-                    raise ValidationError(
-                        f"Groq Whisper API error ({response.status_code}): {err_text}"
-                    )
-
-                return response.json()
-
-            except httpx.TimeoutException as e:
-                last_error = e
-                if attempt < 1:
-                    logger.warning(f"Whisper timeout, retrying... (attempt {attempt + 1})")
-                    continue
-                raise ValidationError(
-                    f"Groq Whisper API timed out after {timeout}s"
-                ) from last_error
-
-        raise ValidationError("Whisper API failed after retries")
+        return await groq_queue.submit_transcription(
+            audio_path=audio_path,
+            model=settings.GROQ_WHISPER_MODEL,
+            language=language,
+            priority=GroqPriority.LOW,
+            caller=f"WhisperTranscription_{filename}",
+            timeout=float(timeout),
+            enqueue_retries=3,
+            max_retries=3,
+        )
 
     # ── Parsing & Interleaving ───────────────────────────────────────────
 

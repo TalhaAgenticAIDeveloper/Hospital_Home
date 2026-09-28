@@ -133,45 +133,23 @@ class PatientReportExplainerService:
         model: Optional[str] = None,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        priority: int = 2,
+        caller: str = "PatientReportExplainerService",
     ) -> str:
-        """Execute chat completions call to Groq via httpx with token cleanup."""
-        api_key = settings.groq_api_key
-        if not api_key:
-            raise ValidationError(
-                "Groq API key is not configured. Please set GROQ_API or GROQ_API_KEY in backend .env."
-            )
+        """Execute chat completions call to Groq via centralized Groq queue with 3x retries."""
+        from app.services.groq_queue_service import groq_queue
 
-        model_name = model or settings.GROQ_MODEL or "llama-3.3-70b-versatile"
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-            if resp.status_code != 200:
-                err_text = resp.text
-                logger.error(f"Groq API error {resp.status_code}: {err_text}")
-                raise ValidationError(f"AI Service error ({resp.status_code}): {err_text[:200]}")
-
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise ValidationError("AI model returned an empty response.")
-
-            raw_content = choices[0].get("message", {}).get("content", "").strip()
-            # Clean reasoning <think> tags if Qwen/DeepSeek reasoning model
-            cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-            if "<think>" in cleaned and "</think>" not in cleaned:
-                cleaned = cleaned.split("<think>", 1)[0].strip()
-
-            return cleaned or raw_content
+        return await groq_queue.submit_chat_completion(
+            messages=messages,
+            model=model or settings.GROQ_MODEL or "llama-3.3-70b-versatile",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            priority=priority,
+            caller=caller,
+            timeout=90.0,
+            enqueue_retries=3,
+            max_retries=3,
+        )
 
     @classmethod
     def _ocr_image_bytes(cls, image_bytes: bytes) -> str:
@@ -349,28 +327,14 @@ class PatientReportExplainerService:
         # 2. Generate structured layman AI explanation
         explanation = await cls.generate_explanation(report_text)
 
-        # 3. Save file to disk
-        upload_base = Path("uploads/patient_reports") / str(patient_user.id)
-        upload_base.mkdir(parents=True, exist_ok=True)
-        unique_id = uuid.uuid4().hex[:10]
-        safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
-        stored_filename = f"{unique_id}_{safe_name}"
-        file_path = upload_base / stored_filename
-
-        try:
-            with open(file_path, "wb") as f:
-                f.write(file_bytes)
-            file_path_str = str(file_path)
-        except Exception as exc:
-            logger.warning(f"Could not save copy to disk: {exc}")
-            file_path_str = None
-
-        # 4. Create Session in PostgreSQL
+        # 3. Create Session in PostgreSQL
+        # We store the extracted text and AI explanation directly in the database.
+        # Storing raw files on disk is avoided to prevent server disk bloat and permission issues.
         report_session = PatientReportSession(
             patient_id=patient_user.id,
             filename=filename,
-            stored_filename=stored_filename if file_path_str else None,
-            file_path=file_path_str,
+            stored_filename=None,
+            file_path=None,
             file_size=len(file_bytes),
             mime_type=mime_type or "application/octet-stream",
             extraction_method=extraction_method,
@@ -450,12 +414,14 @@ class PatientReportExplainerService:
                 c = c[:500] + "..."
             llm_messages.append({"role": m.role, "content": c})
 
-        # 3. Call AI
+        # 3. Call AI with HIGH priority for interactive user chat
         ai_reply = await cls._call_groq_api(
             messages=llm_messages,
             model=settings.GROQ_MODEL,
             temperature=0.3,
             max_tokens=800,
+            priority=1,
+            caller="PatientReportChat",
         )
 
         # 4. Save AI reply to database

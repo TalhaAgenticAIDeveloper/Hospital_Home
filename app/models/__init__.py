@@ -3,6 +3,7 @@ Models package — import all models here so Alembic can discover them.
 """
 
 from app.models.consultation_ai_extraction import ConsultationAIExtraction
+from app.models.consultation_summary import ConsultationSummary
 from app.models.consultation_transcript import ConsultationTranscript
 from app.models.doctor_availability import DoctorAvailability
 from app.models.doctor_rating import DoctorRating
@@ -42,6 +43,7 @@ __all__ = [
     "AdminRefreshToken",
     "ConsultationTranscript",
     "ConsultationAIExtraction",
+    "ConsultationSummary",
     "DoctorProfile",
     "DoctorAvailability",
     "DoctorRating",

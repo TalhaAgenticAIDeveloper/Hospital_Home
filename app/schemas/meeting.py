@@ -76,6 +76,7 @@ class DoctorDirectoryItemResponse(BaseModel):
     qualification: Optional[str] = None
     years_of_experience: Optional[int] = None
     bio: Optional[str] = None
+    consultation_fee: Optional[float] = None
     available_slots_count: int = 0
     average_rating: Optional[float] = None
     total_ratings: int = 0

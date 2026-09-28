@@ -65,10 +65,13 @@ EXERCISE QUERIES:
 COMPARISON QUERIES:
 - When asked to compare foods or exercises, present a clear side-by-side comparison.
 
+STRICT FORMATTING RULE:
+- NEVER use asterisks (*, **, ***) for bolding, bullet points, or styling anywhere in your response. Keep text plain and clean.
+
 OUTPUT FORMAT:
 Your response must have TWO parts separated by the marker `NUTRITION_DATA:`.
 
-Part 1: A friendly, natural language answer to the patient's question.
+Part 1: A friendly, natural language answer to the patient's question without any asterisks.
 Part 2: After `NUTRITION_DATA:` — a JSON array of nutrition breakdowns. Each item:
 {
   "item_name": "Food or exercise name",
@@ -251,9 +254,8 @@ class NutritionInfoService:
                 logger.warning("Failed to parse NUTRITION_DATA JSON: %s", e)
                 nutrition_data = None
 
-        # If answer is empty but we got data, provide a generic prefix
-        if not answer_text and nutrition_data:
-            answer_text = "Here is the nutritional information you requested:"
+        # Strip any markdown asterisks (*, **, ***)
+        answer_text = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", answer_text).replace("*", "").strip()
 
         return answer_text, nutrition_data if nutrition_data else None
 
@@ -266,47 +268,17 @@ class NutritionInfoService:
         temperature: float = 0.2,
         max_tokens: int = 1500,
     ) -> str:
-        """Invokes Groq LLM API with error handling and token cleanup."""
-        api_key = settings.groq_api_key
-        if not api_key:
-            raise ValidationError(
-                "Groq API key is not configured. Please set GROQ_API or GROQ_API_KEY in backend .env."
-            )
+        """Invokes Groq LLM API via centralized Groq queue with 3x retries."""
+        from app.services.groq_queue_service import GroqPriority, groq_queue
 
-        payload = {
-            "model": settings.GROQ_MODEL or "llama-3.3-70b-versatile",
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient(timeout=45.0) as client:
-            try:
-                resp = await client.post(GROQ_CHAT_COMPLETIONS_URL, json=payload, headers=headers)
-            except httpx.TimeoutException:
-                logger.error("Groq API timeout in NutritionInfoService")
-                raise ValidationError("AI service timed out. Please try again.")
-            except httpx.RequestError as exc:
-                logger.error(f"Groq API request error: {exc}")
-                raise ValidationError("Could not connect to AI service. Please try again.")
-
-            if resp.status_code != 200:
-                logger.error(f"Groq API error ({resp.status_code}): {resp.text[:300]}")
-                raise ValidationError("The AI service is temporarily busy. Please try again.")
-
-            data = resp.json()
-            choices = data.get("choices", [])
-            if not choices:
-                raise ValidationError("AI model returned an empty response.")
-
-            raw_content = choices[0].get("message", {}).get("content", "").strip()
-            # Clean reasoning <think> tags if Qwen/DeepSeek reasoning model
-            cleaned = re.sub(r"<think>.*?</think>", "", raw_content, flags=re.DOTALL).strip()
-            if "<think>" in cleaned and "</think>" not in cleaned:
-                cleaned = cleaned.split("<think>", 1)[0].strip()
-
-            return cleaned or raw_content
+        return await groq_queue.submit_chat_completion(
+            messages=messages,
+            model=settings.GROQ_MODEL or "llama-3.3-70b-versatile",
+            temperature=temperature,
+            max_tokens=max_tokens,
+            priority=GroqPriority.HIGH,
+            caller="NutritionInfoService",
+            timeout=45.0,
+            enqueue_retries=3,
+            max_retries=3,
+        )

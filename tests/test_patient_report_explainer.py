@@ -137,3 +137,74 @@ async def test_patient_report_explainer_lifecycle(client: AsyncClient):
     # 7. Verify session is gone
     check_del = await client.get(f"/api/v1/patient/reports/sessions/{session_id}", headers=patient_headers)
     assert check_del.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_groq_queue_vision_auto_routing():
+    """Verify that any request containing image_url payload automatically isolates candidate models to vision models."""
+    from app.services.groq_queue_service import groq_queue
+    from unittest.mock import MagicMock
+
+    vision_payload = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "OCR this image"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc123mock"}},
+            ],
+        }
+    ]
+
+    recorded_models = []
+
+    # Mock httpx.AsyncClient.post to record the models attempted
+    async def mock_post(url, json=None, headers=None):
+        recorded_models.append(json.get("model"))
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "Test OCR Result: Hemoglobin 13.5 g/dL"}}]
+        }
+        mock_resp.text = "OK"
+        return mock_resp
+
+    with patch("httpx.AsyncClient.post", side_effect=mock_post):
+        # Even if caller passes a text model, vision auto-routing must override it to vision model
+        res = await groq_queue.submit_chat_completion(
+            messages=vision_payload,
+            model="openai/gpt-oss-120b",  # Text-only model passed intentionally
+        )
+        assert res == "Test OCR Result: Hemoglobin 13.5 g/dL"
+        assert len(recorded_models) >= 1
+        # None of the recorded models should be text-only models
+        for m in recorded_models:
+            assert m != "openai/gpt-oss-120b", f"Text-only model {m} was erroneously called for vision payload!"
+            assert m != "openai/gpt-oss-20b", f"Text-only model {m} was erroneously called for vision payload!"
+            assert "qwen" in m or "vision" in m, f"Candidate model {m} is not vision-capable!"
+
+
+@pytest.mark.asyncio
+async def test_image_extraction_calls_vision_model():
+    """Verify that uploading an image or scanned document invokes the vision pipeline and returns vision_ocr."""
+    from app.services.patient_report_explainer_service import PatientReportExplainerService
+    from PIL import Image
+
+    # Create dummy image
+    img = Image.new("RGB", (60, 60), color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    png_bytes = buf.getvalue()
+
+    with patch(
+        "app.services.patient_report_explainer_service.PatientReportExplainerService._call_groq_api",
+        return_value="Extracted text from lab image: Platelets 250,000 /uL (Normal)",
+    ) as mock_groq:
+        text, method = await PatientReportExplainerService.extract_report_content(png_bytes, "lab_report.png")
+        assert method == "vision_ocr"
+        assert "Platelets 250,000" in text
+        assert mock_groq.called
+        call_kwargs = mock_groq.call_args.kwargs
+        # Verify model passed is settings.groq_scan_model
+        assert "qwen" in call_kwargs.get("model", "") or "vision" in call_kwargs.get("model", "")
+
+

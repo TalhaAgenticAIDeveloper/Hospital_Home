@@ -51,9 +51,11 @@ async def create_active_doctor(client: AsyncClient, email: str = "doc_doc@exampl
         "/api/v1/doctor/profile",
         json={
             "full_name": "Dr. Sarah Ahmed",
+            "father_name": "Ahmed Khan",
             "specialization": "Cardiologist",
-            "license_number": f"LIC-{uuid.uuid4().hex[:6].upper()}",
-            "experience_years": 10,
+            "pmdc_registration_number": f"PMDC-{uuid.uuid4().hex[:6].upper()}",
+            "consultation_fee": 2500.0,
+            "years_of_experience": 10,
             "bio": "Experienced cardiologist",
         },
         headers=headers,

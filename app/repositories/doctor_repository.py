@@ -130,7 +130,6 @@ class DoctorRepository:
                     DoctorProfile.pmdc_registration_number.ilike(term),
                     User.email.ilike(term),
                     DoctorProfile.specialization.ilike(term),
-                    DoctorProfile.license_number.ilike(term),
                 )
             )
 

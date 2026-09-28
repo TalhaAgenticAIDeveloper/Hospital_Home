@@ -50,9 +50,9 @@ class DoctorService:
             full_name=profile.full_name,
             father_name=profile.father_name,
             pmdc_registration_number=profile.pmdc_registration_number,
+            consultation_fee=profile.consultation_fee,
             phone_number=profile.phone_number,
             specialization=profile.specialization,
-            license_number=profile.license_number or profile.pmdc_registration_number,
             years_of_experience=profile.years_of_experience,
             qualification=profile.qualification,
             bio=profile.bio,
@@ -65,22 +65,45 @@ class DoctorService:
     async def update_profile(
         session: AsyncSession, user: User, data: DoctorProfileUpdateRequest
     ) -> DoctorProfileResponse:
-        """Update doctor's mandatory verification and professional information."""
+        """
+        Update doctor's profile information.
+        
+        Once a doctor's account is approved (UserStatus.ACTIVE), their legal
+        credentials (full_name, father_name, pmdc_registration_number) become permanently
+        locked/fixed and cannot be edited.
+        The consultation_fee, bio, specialization, experience, and contact details
+        remain fully editable at all times.
+        """
         profile = await DoctorService.get_or_create_profile(session, user)
 
-        # 3 Mandatory Fields
-        profile.full_name = data.full_name.strip()
-        profile.father_name = data.father_name.strip()
-        profile.pmdc_registration_number = data.pmdc_registration_number.strip()
-        # Keep license_number in sync with PMDC number for legacy callers
-        profile.license_number = data.pmdc_registration_number.strip()
+        # Regulatory credentials: only editable BEFORE approval
+        if user.status != UserStatus.ACTIVE:
+            if data.full_name and data.full_name.strip():
+                profile.full_name = data.full_name.strip()
+            if data.father_name and data.father_name.strip():
+                profile.father_name = data.father_name.strip()
+            if data.pmdc_registration_number and data.pmdc_registration_number.strip():
+                profile.pmdc_registration_number = data.pmdc_registration_number.strip()
+        else:
+            logger.info(
+                f"Doctor {user.id} is ACTIVE/approved. Full name, father name, and PMDC number remain locked."
+            )
 
-        # Optional Fields
-        profile.phone_number = data.phone_number.strip() if data.phone_number else None
-        profile.specialization = data.specialization.strip() if data.specialization else None
-        profile.years_of_experience = data.years_of_experience
-        profile.qualification = data.qualification.strip() if data.qualification else None
-        profile.bio = data.bio.strip() if data.bio else None
+        # Consultation fee is always editable
+        if data.consultation_fee is not None:
+            profile.consultation_fee = data.consultation_fee
+
+        # Professional & Contact Fields (always editable)
+        if data.phone_number is not None:
+            profile.phone_number = data.phone_number.strip() if data.phone_number.strip() else None
+        if data.specialization is not None:
+            profile.specialization = data.specialization.strip() if data.specialization.strip() else None
+        if data.years_of_experience is not None:
+            profile.years_of_experience = data.years_of_experience
+        if data.qualification is not None:
+            profile.qualification = data.qualification.strip() if data.qualification.strip() else None
+        if data.bio is not None:
+            profile.bio = data.bio.strip() if data.bio.strip() else None
 
         await session.commit()
         logger.info(f"Doctor profile updated for user_id={user.id} pmdc={profile.pmdc_registration_number}")
@@ -94,13 +117,13 @@ class DoctorService:
         """
         Submit the completed profile for SaaS Admin review.
 
-        Validates that the 3 mandatory fields (Full Name, Father Name, PMDC Registration Number)
+        Validates that all 4 mandatory fields (Full Name, Father Name, PMDC Registration Number, Consultation Fee)
         are provided. No document upload is required.
         If previously rejected, resets status to PENDING and clears feedback.
         """
         profile = await DoctorService.get_or_create_profile(session, user)
 
-        # Validate 3 mandatory fields
+        # Validate 4 mandatory fields
         missing_fields = []
         if not profile.full_name or not profile.full_name.strip():
             missing_fields.append("Full Name")
@@ -108,6 +131,8 @@ class DoctorService:
             missing_fields.append("Father Name")
         if not profile.pmdc_registration_number or not profile.pmdc_registration_number.strip():
             missing_fields.append("PMDC Registration Number")
+        if profile.consultation_fee is None or profile.consultation_fee < 0:
+            missing_fields.append("Consultation Fee")
 
         if missing_fields:
             raise ValidationError(
@@ -142,7 +167,7 @@ class DoctorService:
             if profile.submitted_at:
                 msg = "Your application is currently under review by our administration team."
             else:
-                msg = "Please complete your mandatory profile details (Full Name, Father Name, PMDC Registration Number) to submit your application."
+                msg = "Please complete your mandatory profile details (Full Name, Father Name, PMDC Registration Number, Consultation Fee) to submit your application."
         elif user.status == UserStatus.REJECTED:
             msg = "Your application was rejected. Please review the feedback below, update your details, and re-submit."
         elif user.status == UserStatus.SUSPENDED:

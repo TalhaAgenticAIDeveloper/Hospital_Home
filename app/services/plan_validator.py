@@ -8,6 +8,7 @@ Implements multi-layer clinical and business rule validation:
 - Plan safety checks (strict prescription medication blocker, allergy conflict scanner, schedule sanity)
 """
 
+import json
 import math
 import re
 from dataclasses import dataclass
@@ -153,6 +154,81 @@ class PlanValidator:
         clean = text.replace("\x00", "").strip()
         # Truncate to maximum allowed length defensively
         return clean[:max_length]
+
+    @classmethod
+    def extract_and_parse_json(cls, raw_text: str) -> Any:
+        """
+        Robust JSON extractor and parser for LLM responses.
+        Handles:
+        - Markdown fences (```json ... ``` or ``` ...)
+        - Surrounding preambles and post-scripts
+        - Unicode non-breaking characters (\u202f, \u00a0, \u2011, \u2013, \u2014)
+        - Smart quotes (\u201c, \u201d, \u2018, \u2019)
+        - Trailing commas before closing braces/brackets
+        - Incomplete/truncated brackets repair
+        """
+        if not raw_text or not raw_text.strip():
+            raise ValueError("AI response was empty.")
+
+        # 1. Clean think tags if reasoning model leaked
+        cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
+        if "<think>" in cleaned and "</think>" not in cleaned:
+            cleaned = cleaned.split("<think>", 1)[0].strip()
+        text = cleaned or raw_text
+
+        # 2. Normalize problematic unicode characters
+        text = text.replace("\u202f", " ").replace("\u00a0", " ").replace("\u200b", "")
+        text = text.replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
+        text = text.replace("\u201c", '"').replace("\u201d", '"')
+        text = text.replace("\u2018", "'").replace("\u2019", "'")
+
+        # 3. Extract code fence if present
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+        candidate = fence_match.group(1).strip() if fence_match else text.strip()
+
+        # 4. Find outermost object { ... } or array [ ... ]
+        first_brace = candidate.find("{")
+        last_brace = candidate.rfind("}")
+        first_bracket = candidate.find("[")
+        last_bracket = candidate.rfind("]")
+
+        if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+            if last_brace != -1 and last_brace > first_brace:
+                candidate = candidate[first_brace : last_brace + 1]
+            else:
+                candidate = candidate[first_brace:]
+        elif first_bracket != -1:
+            if last_bracket != -1 and last_bracket > first_bracket:
+                candidate = candidate[first_bracket : last_bracket + 1]
+            else:
+                candidate = candidate[first_bracket:]
+
+        # 5. Strip trailing commas
+        cleaned_json = re.sub(r",\s*([\]\}])", r"\1", candidate)
+
+        try:
+            return json.loads(cleaned_json)
+        except Exception:
+            # 6. Attempt repair of unclosed strings / brackets for slightly truncated responses
+            s = cleaned_json.strip()
+            # Remove trailing dangling incomplete keys, colons, or cut-off values (e.g. ,"fiber_g or ,"fiber_g":)
+            s = re.sub(r',?\s*"[^"]*"?\s*:?\s*$', '', s)
+            s = re.sub(r',\s*$', '', s)
+
+            quote_count = s.count('"')
+            if quote_count % 2 != 0:
+                s += '"'
+            s = s.rstrip(", \t\n\r")
+            open_braces = s.count("{") - s.count("}")
+            open_brackets = s.count("[") - s.count("]")
+            if open_braces > 0 or open_brackets > 0:
+                s += ("]" * max(0, open_brackets)) + ("}" * max(0, open_braces))
+                s = re.sub(r",\s*([\]\}])", r"\1", s)
+                try:
+                    return json.loads(s)
+                except Exception:
+                    pass
+            raise
 
     @classmethod
     def check_for_prompt_injection(cls, text: str) -> bool:
@@ -344,7 +420,9 @@ class PlanValidator:
             if "weight" in question_key:
                 # Check missing unit ambiguity
                 if not unit:
-                    if 20 <= val <= 350:
+                    if expected_unit and any(u in expected_unit.lower() for u in ("kg", "lb", "pound", "kilo")):
+                        unit = "lb" if ("lb" in expected_unit.lower() or "pound" in expected_unit.lower()) else "kg"
+                    elif 20 <= val <= 350:
                         return AnswerValidationResult(
                             status="clarification_needed",
                             message=f"Is that {int(val) if val.is_integer() else val} kg or {int(val) if val.is_integer() else val} lb?",
@@ -409,6 +487,10 @@ class PlanValidator:
 
                 if unit == "m":
                     val_cm = round(val * 100, 1)
+                elif unit in ("ft", "feet"):
+                    val_cm = round(val * 30.48, 1)
+                elif unit in ("in", "inch", "inches"):
+                    val_cm = round(val * 2.54, 1)
                 else:
                     val_cm = round(val, 1)
 
@@ -443,6 +525,15 @@ class PlanValidator:
                         can_proceed=False,
                         extracted_fields={},
                     )
+                if age_val < 18:
+                    return AnswerValidationResult(
+                        status="warning",
+                        message="We recommend you to be at least 18 years old before following an independent wellness regimen. If you still wish to continue, you may proceed.",
+                        normalized_value=str(age_val),
+                        unit="years",
+                        can_proceed=False,
+                        extracted_fields={"age": age_val},
+                    )
                 return AnswerValidationResult(
                     status="valid",
                     message=None,
@@ -451,6 +542,19 @@ class PlanValidator:
                     can_proceed=True,
                     extracted_fields={"age": age_val},
                 )
+
+            # Generic numeric question handler (e.g. water intake, steps, hours, or any AI numeric question)
+            final_unit = unit or expected_unit
+            val_display = f"{int(val)}" if val.is_integer() else f"{val}"
+            norm_str = f"{val_display} {final_unit}".strip() if final_unit else val_display
+            return AnswerValidationResult(
+                status="valid",
+                message=None,
+                normalized_value=norm_str,
+                unit=final_unit,
+                can_proceed=True,
+                extracted_fields={question_key: norm_str},
+            )
 
         # 4. Time Question Handling
         if question_type == "time" or "time" in question_key:
@@ -500,10 +604,10 @@ class PlanValidator:
             multi_extracted["age"] = int(a_match.group(1))
 
         # Default text question
-        if len(clean_input) < 2:
+        if len(clean_input) < 1:
             return AnswerValidationResult(
                 status="invalid",
-                message="Answer is too short. Please provide a little more detail.",
+                message="Please enter an answer before continuing.",
                 normalized_value=None,
                 unit=None,
                 can_proceed=False,
@@ -599,7 +703,10 @@ class PlanValidator:
                 errors.append(f"Plan contains unrealistic or unsafe claim: '{phrase}'.")
 
         # 5. Nutritional data sanity checks
-        food_categories = {"breakfast", "lunch", "dinner", "snack", "evening_activity"}
+        food_categories = {
+            "breakfast", "lunch", "dinner", "snack",
+            "morning_snack", "afternoon_snack", "evening_snack", "evening_activity",
+        }
         exercise_categories = {"workout", "exercise"}
 
         for item in payload.schedule_items:
@@ -676,10 +783,10 @@ class PlanValidator:
         return (
             "I cannot prescribe or recommend any medications, pharmaceuticals, or clinical treatments—for any prescription drugs, "
             "please consult your licensed physician or attending doctor.\n\n"
-            "However, if you are looking for safe and **natural alternatives**, here are evidence-based lifestyle approaches that can help:\n\n"
-            "🌿 **Hydration & Herbal Infusions**: Drinking warm water or herbal teas like ginger (for digestion and anti-inflammatory support), "
+            "However, if you are looking for safe and natural alternatives, here are evidence-based lifestyle approaches that can help:\n\n"
+            "🌿 Hydration & Herbal Infusions: Drinking warm water or herbal teas like ginger (for digestion and anti-inflammatory support), "
             "chamomile (for relaxation and restful sleep), or peppermint (for soothing physical tension).\n\n"
-            "🥗 **Nutrient-Rich Whole Foods**: Focus on wholesome, anti-inflammatory foods like berries, leafy greens, nuts, and healthy fats while minimizing processed sugars.\n\n"
-            "🧘 **Rest, Movement & Breathing**: Gentle daily stretching, deep diaphragmatic breathing, and maintaining consistent sleep routines can naturally ease stress and restore vitality.\n\n"
+            "🥗 Nutrient-Rich Whole Foods: Focus on wholesome, anti-inflammatory foods like berries, leafy greens, nuts, and healthy fats while minimizing processed sugars.\n\n"
+            "🧘 Rest, Movement & Breathing: Gentle daily stretching, deep diaphragmatic breathing, and maintaining consistent sleep routines can naturally ease stress and restore vitality.\n\n"
             "Would you like me to adjust any item in your daily routine to incorporate more of these natural wellness habits?"
         )

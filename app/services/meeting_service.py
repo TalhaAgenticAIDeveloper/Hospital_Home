@@ -189,6 +189,7 @@ class MeetingService:
                     years_of_experience=profile.years_of_experience if profile else None,
                     bio=profile.bio if profile else None,
                     available_slots_count=count,
+                    consultation_fee=profile.consultation_fee if profile else None,
                     average_rating=profile.average_rating if profile else None,
                     total_ratings=profile.total_ratings if profile else 0,
                 )
