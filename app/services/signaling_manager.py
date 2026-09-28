@@ -256,7 +256,7 @@ class SignalingManager:
                     transcript = ConsultationTranscript(
                         meeting_id=meeting.id,
                         transcription_status=status_val,
-                        transcription_model="live-web-speech",
+                        transcription_model="live-gemini",
                         structured_transcript=segments,
                         full_text=full_text,
                     )
@@ -264,7 +264,7 @@ class SignalingManager:
                 else:
                     transcript.structured_transcript = segments
                     transcript.full_text = full_text
-                    transcript.transcription_model = "live-web-speech"
+                    transcript.transcription_model = "live-gemini"
                     if is_final or transcript.transcription_status != "completed":
                         transcript.transcription_status = status_val
 

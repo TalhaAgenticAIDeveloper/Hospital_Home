@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     GROQ_SCAN_MODEL: Optional[str] = None
     GROQ_WHISPER_MODEL: str = "whisper-large-v3-turbo"
 
+    # ── Gemini Live Transcription ────────────────────────────────────────
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-3.5-transcribe-live"
+
     # ── Consultation AI Configuration ────────────────────────────────────
     CONSULTATION_AUDIO_DIR: str = "uploads/consultation_audio"
     CONSULTATION_MAX_AUDIO_SIZE_MB: int = 25

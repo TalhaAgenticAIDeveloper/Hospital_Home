@@ -1,8 +1,9 @@
 """
 API endpoints for Doctor Availability, Patient Booking, 1-to-1 Meetings,
-WebRTC Signaling, and Bilingual Transcription delivery.
+WebRTC Signaling, Bilingual Transcription delivery, and Gemini Live Transcription.
 """
 
+import base64
 import uuid
 from typing import List, Optional
 
@@ -383,3 +384,164 @@ async def meeting_signaling_websocket(
     except Exception as e:
         logger.warning(f"WebSocket error in room {room_id}: {e}")
         signaling_manager.disconnect(websocket, room_id)
+
+
+# ── WebSocket Route: Gemini Live Transcription (Audio → Text) ────────────────
+
+@router.websocket("/ws/transcribe/{room_id}")
+async def gemini_live_transcription_websocket(
+    websocket: WebSocket,
+    room_id: str,
+    token: Optional[str] = Query(None),
+):
+    """
+    WebSocket endpoint for Gemini-powered live speech-to-text transcription.
+
+    Each participant (doctor/patient) connects here alongside the signaling WS.
+    The frontend streams raw PCM audio chunks (16-bit, 16kHz, mono) as base64-encoded
+    messages. The backend forwards them to Google's Gemini 3.5 Transcribe Live model
+    and broadcasts the transcribed text to both participants via the signaling WebSocket.
+
+    Protocol:
+        Client → Server (JSON):
+            {"type": "audio", "data": "<base64-encoded-PCM-chunk>"}
+            {"type": "stop"}   (optional graceful shutdown)
+
+        Server → Client (JSON):
+            {"type": "transcription-ready"}   (session connected to Gemini)
+            {"type": "transcription-error", "message": "..."}
+            {"type": "transcription-closed"}
+
+    Transcribed text is broadcast via the signaling WS as `transcript-segment` messages
+    (same format as Web Speech API used before), so the existing frontend rendering
+    and backend persistence work unchanged.
+    """
+    import json
+    from app.services.gemini_live_transcription_service import gemini_transcription_manager
+
+    # 1. Authenticate via JWT Query Param
+    if not token:
+        await websocket.close(code=4001, reason="Authentication token missing")
+        return
+
+    try:
+        payload = decode_token(token)
+        user_id_str = payload.get("sub")
+        token_type = payload.get("type")
+        if not user_id_str or token_type != "access":
+            await websocket.close(code=4001, reason="Invalid token")
+            return
+        user_id = uuid.UUID(user_id_str)
+    except Exception:
+        await websocket.close(code=4001, reason="Authentication token validation failed")
+        return
+
+    # 2. Authorize Meeting Room & Retrieve Participant Role
+    async with async_session_maker() as session:
+        meeting = await MeetingRepository.get_meeting_by_room_id(session, room_id)
+        if not meeting:
+            await websocket.close(code=4004, reason="Meeting room does not exist")
+            return
+
+        if user_id != meeting.doctor_id and user_id != meeting.patient_id:
+            logger.warning(f"Unauthorized transcription WS access by {user_id} on room {room_id}")
+            await websocket.close(code=4003, reason="Unauthorized access to meeting room")
+            return
+
+        role = "doctor" if user_id == meeting.doctor_id else "patient"
+        doctor_profile = meeting.doctor.doctor_profile if meeting.doctor else None
+        if role == "doctor":
+            speaker_name = f"Dr. {doctor_profile.full_name}" if doctor_profile and doctor_profile.full_name else "Doctor"
+        else:
+            patient_profile = meeting.patient.patient_profile if meeting.patient else None
+            speaker_name = patient_profile.full_name if patient_profile and patient_profile.full_name else meeting.patient.email
+
+    # 3. Accept WebSocket connection
+    await websocket.accept()
+    logger.info(
+        f"[GEMINI_TRANSCRIPTION_WS] Connected: room={room_id} role={role} "
+        f"user={user_id} speaker={speaker_name}"
+    )
+
+    # 4. Define callback: when Gemini transcribes text, broadcast it via signaling WS
+    async def on_gemini_transcript(segment: dict):
+        """Broadcast transcribed segment to both participants via signaling manager."""
+        # Broadcast as transcript-segment (same format as Web Speech API)
+        broadcast_data = {
+            "type": "transcript-segment",
+            **segment,
+        }
+        await signaling_manager.broadcast(room_id, broadcast_data)
+
+        # Also persist to in-memory transcript buffer (same as before)
+        signaling_manager._append_transcript_segment(room_id, segment)
+
+    # 5. Create Gemini Live session
+    gemini_session = await gemini_transcription_manager.create_session(
+        room_id=room_id,
+        user_id=str(user_id),
+        role=role,
+        speaker_name=speaker_name,
+        on_transcript=on_gemini_transcript,
+    )
+
+    if not gemini_session:
+        await websocket.send_text(json.dumps({
+            "type": "transcription-error",
+            "message": "Failed to connect to Gemini Live transcription. Check server logs.",
+        }))
+        await websocket.close(code=4500, reason="Gemini session initialization failed")
+        return
+
+    # Notify client that transcription is ready
+    await websocket.send_text(json.dumps({"type": "transcription-ready"}))
+
+    # 6. Audio Streaming Loop
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+
+            try:
+                data = json.loads(raw_text)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = data.get("type")
+
+            if msg_type == "audio":
+                # Decode base64 PCM audio data and stream to Gemini
+                audio_b64 = data.get("data")
+                if audio_b64:
+                    try:
+                        audio_bytes = base64.b64decode(audio_b64)
+                        await gemini_session.send_audio(audio_bytes)
+                    except Exception as decode_err:
+                        logger.debug(
+                            f"[GEMINI_TRANSCRIPTION_WS] Audio decode error: {decode_err}"
+                        )
+
+            elif msg_type == "stop":
+                logger.info(
+                    f"[GEMINI_TRANSCRIPTION_WS] Client requested stop: "
+                    f"room={room_id} role={role}"
+                )
+                break
+
+    except WebSocketDisconnect:
+        logger.info(
+            f"[GEMINI_TRANSCRIPTION_WS] Client disconnected: "
+            f"room={room_id} role={role}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"[GEMINI_TRANSCRIPTION_WS] Error in audio loop: "
+            f"room={room_id} role={role} error={e}"
+        )
+    finally:
+        # Cleanup Gemini session
+        await gemini_transcription_manager.close_session(room_id, str(user_id))
+        logger.info(
+            f"[GEMINI_TRANSCRIPTION_WS] Session cleaned up: "
+            f"room={room_id} role={role}"
+        )
+
